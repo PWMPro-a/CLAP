@@ -24,31 +24,67 @@ func resetCodexRefreshGroupForTest() {
 	codexRefreshGroup = singleflight.Group{}
 }
 
-func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
-	var calls int32
-	auth := &CodexAuth{
-		httpClient: &http.Client{
-			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				atomic.AddInt32(&calls, 1)
-				return &http.Response{
-					StatusCode: http.StatusBadRequest,
-					Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant","code":"refresh_token_reused"}`)),
-					Header:     make(http.Header),
-					Request:    req,
-				}, nil
-			}),
+func TestRefreshTokensWithRetry_TerminalFailuresOnlyAttemptOnce(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		marker     string
+	}{
+		{
+			name:       "refresh token reused",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":"invalid_grant","code":"refresh_token_reused"}`,
+			marker:     "refresh_token_reused",
+		},
+		{
+			name:       "refresh token invalidated",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":{"message":"Your session has ended. Please log in again.","code":"refresh_token_invalidated"}}`,
+			marker:     "refresh_token_invalidated",
+		},
+		{
+			name:       "token invalidated",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":{"code":"token_invalidated"}}`,
+			marker:     "token_invalidated",
+		},
+		{
+			name:       "account deactivated",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":{"code":"account_deactivated"}}`,
+			marker:     "account_deactivated",
 		},
 	}
 
-	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", 3)
-	if err == nil {
-		t.Fatalf("expected error for non-retryable refresh failure")
-	}
-	if !strings.Contains(strings.ToLower(err.Error()), "refresh_token_reused") {
-		t.Fatalf("expected refresh_token_reused in error, got: %v", err)
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("expected 1 refresh attempt, got %d", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int32
+			auth := &CodexAuth{
+				httpClient: &http.Client{
+					Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+						atomic.AddInt32(&calls, 1)
+						return &http.Response{
+							StatusCode: tt.statusCode,
+							Body:       io.NopCloser(strings.NewReader(tt.body)),
+							Header:     make(http.Header),
+							Request:    req,
+						}, nil
+					}),
+				},
+			}
+
+			_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", 3)
+			if err == nil {
+				t.Fatalf("expected terminal refresh failure")
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), tt.marker) {
+				t.Fatalf("expected %s in error, got: %v", tt.marker, err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("expected 1 refresh attempt, got %d", got)
+			}
+		})
 	}
 }
 

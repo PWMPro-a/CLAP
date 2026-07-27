@@ -61,7 +61,28 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 	}
 
 	for index, item := range items {
-		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType == "message" {
+			itemIDResult := item.Get("id")
+			itemID := strings.TrimSpace(itemIDResult.String())
+			// Historical Responses transcripts can contain item_* IDs on message
+			// items. Codex rejects that specific shape and expects a msg_* ID (or
+			// no ID for an input message). Keep other message ID formats intact;
+			// callers may rely on them for replay correlation.
+			if itemIDResult.Exists() && strings.HasPrefix(itemID, "item_") {
+				nextItem, err := sjson.Delete(item.Raw, "id")
+				if err != nil {
+					helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid message id at input[%d]: %v", provider, index, err)
+					keep(item.Raw)
+					continue
+				}
+				startRebuild(index)
+				keep(nextItem)
+				helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid historical message id at input[%d] item_id=%q", provider, index, itemID)
+				continue
+			}
+		}
+		if itemType != "reasoning" {
 			keep(item.Raw)
 			continue
 		}

@@ -37,6 +37,28 @@ type CodexAuth struct {
 
 var codexRefreshGroup singleflight.Group
 
+type terminalRefreshError struct {
+	cause error
+}
+
+func (e *terminalRefreshError) Error() string {
+	if e == nil || e.cause == nil {
+		return "terminal token refresh failure"
+	}
+	return e.cause.Error()
+}
+
+func (e *terminalRefreshError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *terminalRefreshError) TerminalCredentialFailure() bool {
+	return e != nil
+}
+
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
 func NewCodexAuth(cfg *config.Config) *CodexAuth {
@@ -315,7 +337,7 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 		}
 		if isNonRetryableRefreshErr(err) {
 			log.Warnf("Token refresh attempt %d failed with non-retryable error: %v", attempt+1, err)
-			return nil, err
+			return nil, &terminalRefreshError{cause: err}
 		}
 
 		lastErr = err
@@ -330,7 +352,19 @@ func isNonRetryableRefreshErr(err error) bool {
 		return false
 	}
 	raw := strings.ToLower(err.Error())
-	return strings.Contains(raw, "refresh_token_reused")
+	for _, marker := range []string{
+		"refresh_token_reused",
+		"refresh_token_invalidated",
+		"token_invalidated",
+		"invalid_grant",
+		"account_deactivated",
+		"session has ended",
+	} {
+		if strings.Contains(raw, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.

@@ -45,6 +45,28 @@ func (e unauthorizedRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth
 	return nil, errors.New("token refresh failed with status 401: invalid_grant")
 }
 
+type terminalCredentialTestError struct{}
+
+func (terminalCredentialTestError) Error() string { return "refresh_token_invalidated" }
+
+func (terminalCredentialTestError) TerminalCredentialFailure() bool { return true }
+
+type terminalRefreshTestExecutor struct {
+	schedulerProviderTestExecutor
+}
+
+func (e terminalRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	return nil, terminalCredentialTestError{}
+}
+
+type inactiveTokenTestError struct{}
+
+func (inactiveTokenTestError) Error() string {
+	return `{"error":{"message":"Personal access token owner is inactive.","code":"biscuit_baker_service_auth_credential_error_status"}}`
+}
+
+func (inactiveTokenTestError) StatusCode() int { return http.StatusForbidden }
+
 func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
@@ -87,6 +109,85 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 	}
 	if _, shouldSchedule := nextRefreshCheckAt(now, updated, time.Second); shouldSchedule {
 		t.Fatal("expected unauthorized auth to be removed from the auto-refresh schedule")
+	}
+}
+
+func TestManager_TerminalRefreshFailureDisablesAuth(t *testing.T) {
+	ctx := context.Background()
+	store := &requestPrepareStore{}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(terminalRefreshTestExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
+	})
+
+	auth := &Auth{
+		ID:       "terminal-refresh",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email": "x@example.com",
+		},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %q after refresh", auth.ID)
+	}
+	if !updated.Disabled || updated.Status != StatusDisabled || !updated.Unavailable {
+		t.Fatalf("terminal auth state = disabled:%t status:%s unavailable:%t", updated.Disabled, updated.Status, updated.Unavailable)
+	}
+	if got, _ := updated.Metadata["disabled"].(bool); !got {
+		t.Fatalf("metadata disabled = %#v, want true", updated.Metadata["disabled"])
+	}
+	if updated.StatusMessage != "credential invalidated" {
+		t.Fatalf("StatusMessage = %q, want credential invalidated", updated.StatusMessage)
+	}
+	if manager.shouldRefresh(updated, time.Now()) {
+		t.Fatal("terminal auth should not remain in auto-refresh schedule")
+	}
+	if got := store.saveCount.Load(); got != 1 {
+		t.Fatalf("terminal auth persistence calls = %d, want 1", got)
+	}
+	persisted := store.lastAuth()
+	if persisted == nil || !persisted.Disabled || persisted.Status != StatusDisabled {
+		t.Fatalf("persisted terminal auth = %#v, want disabled", persisted)
+	}
+}
+
+func TestManager_InactiveTokenExecutionFailureDisablesAuth(t *testing.T) {
+	ctx := context.Background()
+	store := &requestPrepareStore{}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	auth := &Auth{
+		ID:       "inactive-token",
+		Provider: "codex",
+		Metadata: map[string]any{"email": "x@example.com"},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	resultErr := resultErrorFromError(inactiveTokenTestError{})
+	if resultErr.Code != terminalCredentialErrorCode {
+		t.Fatalf("result error code = %q, want %q", resultErr.Code, terminalCredentialErrorCode)
+	}
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5.6-sol",
+		Error:    resultErr,
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || !updated.Disabled || updated.Status != StatusDisabled {
+		t.Fatalf("inactive token auth = %#v, want disabled", updated)
+	}
+	if got := store.saveCount.Load(); got != 1 {
+		t.Fatalf("inactive token persistence calls = %d, want 1", got)
 	}
 }
 

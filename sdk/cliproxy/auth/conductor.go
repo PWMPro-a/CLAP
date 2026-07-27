@@ -3735,13 +3735,30 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
 		auth.recordRecentRequest(now, result.Success)
-		if result.Success {
+		terminalCredential := !result.Success && isTerminalCredentialResultError(result.Error)
+		if terminalCredential {
+			auth.Disabled = true
+			auth.Unavailable = true
+			auth.Status = StatusDisabled
+			auth.StatusMessage = "credential invalidated"
+			auth.LastError = cloneError(result.Error)
+			auth.NextRefreshAfter = time.Time{}
+			auth.NextRetryAfter = time.Time{}
+			auth.UpdatedAt = now
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata["disabled"] = true
+		} else if result.Success {
 			auth.Success++
 		} else {
 			auth.Failed++
 		}
 
-		if result.Success {
+		if terminalCredential {
+			// The whole credential is permanently unusable. Do not let the normal
+			// per-model cooldown path overwrite StatusDisabled below.
+		} else if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
@@ -4127,6 +4144,10 @@ func isRequestScopedError(err error) bool {
 	return ok && requestErr != nil && requestErr.IsRequestScoped()
 }
 
+func isTerminalCredentialResultError(err *Error) bool {
+	return err != nil && strings.EqualFold(strings.TrimSpace(err.Code), terminalCredentialErrorCode)
+}
+
 func resultErrorFromError(err error) *Error {
 	if err == nil {
 		return nil
@@ -4140,6 +4161,10 @@ func resultErrorFromError(err error) *Error {
 	}
 	if resultErr.HTTPStatus == 0 {
 		resultErr.HTTPStatus = statusCodeFromError(err)
+	}
+	if isTerminalCredentialFailure(err) {
+		resultErr.Code = terminalCredentialErrorCode
+		resultErr.Retryable = false
 	}
 	if isRequestScopedError(err) || isRequestInvalidError(err) {
 		resultErr.Code = requestScopedErrorCode
@@ -6263,11 +6288,25 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	now := time.Now()
 	if err != nil {
 		unauthorized := isUnauthorizedError(err)
+		terminal := isTerminalCredentialFailure(err)
 		shouldReschedule := false
+		var persistAuth *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.LastError = refreshErrorFromError(err)
-			if unauthorized {
+			if terminal {
+				current.Disabled = true
+				current.Unavailable = true
+				current.Status = StatusDisabled
+				current.StatusMessage = "credential invalidated"
+				current.NextRefreshAfter = time.Time{}
+				current.NextRetryAfter = time.Time{}
+				if current.Metadata == nil {
+					current.Metadata = make(map[string]any)
+				}
+				current.Metadata["disabled"] = true
+				persistAuth = current.Clone()
+			} else if unauthorized {
 				current.NextRefreshAfter = time.Time{}
 				current.Unavailable = true
 				current.Status = StatusError
@@ -6276,12 +6315,17 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			}
 			m.auths[id] = current
-			shouldReschedule = true
+			shouldReschedule = !terminal
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
 		}
 		m.mu.Unlock()
+		if persistAuth != nil {
+			if errPersist := m.persist(context.WithoutCancel(ctx), persistAuth); errPersist != nil {
+				log.Warnf("persist terminal credential failure for %s (%s): %v", auth.Provider, auth.ID, errPersist)
+			}
+		}
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		}
@@ -6322,6 +6366,34 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		return saved, nil
 	}
 	return updated.Clone(), nil
+}
+
+func isTerminalCredentialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	type terminalCredentialFailure interface {
+		error
+		TerminalCredentialFailure() bool
+	}
+	terminalErr, ok := errors.AsType[terminalCredentialFailure](err)
+	if ok && terminalErr != nil && terminalErr.TerminalCredentialFailure() {
+		return true
+	}
+	raw := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"refresh_token_reused",
+		"refresh_token_invalidated",
+		"token_invalidated",
+		"account_deactivated",
+		"personal access token owner is inactive",
+		"biscuit_baker_service_auth_credential_error_status",
+	} {
+		if strings.Contains(raw, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

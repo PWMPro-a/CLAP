@@ -1,6 +1,9 @@
 package auth
 
-const requestScopedErrorCode = "request_scoped"
+const (
+	requestScopedErrorCode      = "request_scoped"
+	terminalCredentialErrorCode = "credential_invalidated"
+)
 
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
