@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,39 +16,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
-func TestCodexStatelessWebsocketSessionPoolReusesIdleSlotsAndBoundsBusySlots(t *testing.T) {
-	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
-	exec := &CodexWebsocketsExecutor{store: store}
-
-	first, locked := exec.acquireStatelessSession("auth\x00url\x00proxy")
-	if !locked || first == nil {
-		t.Fatal("first stateless session was not acquired")
-	}
-	first.reqMu.Unlock()
-
-	reused, locked := exec.acquireStatelessSession("auth\x00url\x00proxy")
-	if !locked || reused != first {
-		t.Fatal("idle stateless session was not reused")
-	}
-	reused.reqMu.Unlock()
-
-	busy := make([]*codexWebsocketSession, 0, codexStatelessWebsocketPoolSlots)
-	for i := 0; i < codexStatelessWebsocketPoolSlots; i++ {
-		sess, acquired := exec.acquireStatelessSession("auth\x00url\x00proxy")
-		if !acquired || sess == nil {
-			t.Fatalf("slot %d was not acquired", i)
-		}
-		busy = append(busy, sess)
-	}
-	if sess, acquired := exec.acquireStatelessSession("auth\x00url\x00proxy"); acquired || sess != nil {
-		t.Fatal("busy stateless pool exceeded its slot limit")
-	}
-	for _, sess := range busy {
-		sess.reqMu.Unlock()
-	}
-}
-
-func TestCodexWebsocketsExecuteStreamReusesStatelessHTTPSSESession(t *testing.T) {
+func TestCodexWebsocketsExecuteStreamUsesIsolatedHTTPSSEConnections(t *testing.T) {
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,14 +26,12 @@ func TestCodexWebsocketsExecuteStreamReusesStatelessHTTPSSESession(t *testing.T)
 			return
 		}
 		defer conn.Close()
-		handshakes.Add(1)
-		for i := 0; i < 2; i++ {
-			if _, _, errRead := conn.ReadMessage(); errRead != nil {
-				return
-			}
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"hello"}`))
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
+		connectionID := handshakes.Add(1)
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
 		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.output_text.delta","delta":"connection-%d"}`, connectionID)))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`, connectionID)))
 	}))
 	defer server.Close()
 
@@ -84,30 +52,41 @@ func TestCodexWebsocketsExecuteStreamReusesStatelessHTTPSSESession(t *testing.T)
 	opts := cliproxyexecutor.Options{
 		SourceFormat:   sdktranslator.FromString("openai-response"),
 		ResponseFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "shared-untrusted-session-id",
+		},
 	}
 
+	outputs := make([]string, 0, 2)
 	for attempt := 0; attempt < 2; attempt++ {
 		result, errExecute := exec.ExecuteStream(nil, auth, req, opts)
 		if errExecute != nil {
 			t.Fatalf("ExecuteStream() attempt %d error = %v", attempt, errExecute)
 		}
-		gotChunk := false
+		var output strings.Builder
 		for chunk := range result.Chunks {
 			if chunk.Err != nil {
 				t.Fatalf("stream attempt %d error chunk = %v", attempt, chunk.Err)
 			}
-			gotChunk = gotChunk || len(chunk.Payload) > 0
+			output.Write(chunk.Payload)
 		}
-		if !gotChunk {
+		if output.Len() == 0 {
 			t.Fatalf("stream attempt %d produced no payload", attempt)
 		}
+		outputs = append(outputs, output.String())
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
-	for handshakes.Load() < 1 && time.Now().Before(deadline) {
+	for handshakes.Load() < 2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := handshakes.Load(); got != 1 {
-		t.Fatalf("upstream handshakes = %d, want 1 for two sequential SSE requests", got)
+	if got := handshakes.Load(); got != 2 {
+		t.Fatalf("upstream handshakes = %d, want 2 for two isolated SSE requests", got)
+	}
+	if !strings.Contains(outputs[0], "connection-1") {
+		t.Fatalf("first SSE response did not contain its connection payload: %s", outputs[0])
+	}
+	if !strings.Contains(outputs[1], "connection-2") || strings.Contains(outputs[1], "connection-1") {
+		t.Fatalf("second SSE response was not isolated from the first connection: %s", outputs[1])
 	}
 }
