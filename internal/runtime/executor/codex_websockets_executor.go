@@ -39,6 +39,9 @@ const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
+	// Stateless HTTP SSE requests reuse a bounded set of upstream connections.
+	// Keeping several slots avoids serializing unrelated requests on one socket.
+	codexStatelessWebsocketPoolSlots = 8
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -52,8 +55,9 @@ type CodexWebsocketsExecutor struct {
 }
 
 type codexWebsocketSessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]*codexWebsocketSession
+	mu        sync.Mutex
+	sessions  map[string]*codexWebsocketSession
+	stateless map[string][]*codexWebsocketSession
 }
 
 var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
@@ -633,14 +637,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
 	sessionLocked := false
-	// Only a real downstream WebSocket may own a reusable upstream session.
-	// HTTP/SSE stays request-scoped even if untrusted metadata contains a session ID.
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && executionSessionID != "" {
+	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		if sess != nil {
 			sess.reqMu.Lock()
 			sessionLocked = true
 		}
+	} else if !cliproxyexecutor.DownstreamWebsocket(ctx) {
+		// HTTP SSE has no long-lived downstream execution session, but it can
+		// still reuse an upstream Codex WebSocket handshake. If all slots are
+		// busy, keep the existing one-shot behavior instead of queueing here.
+		poolKey := codexStatelessWebsocketPoolKey(auth, e.cfg, authID, wsURL)
+		sess, sessionLocked = e.acquireStatelessSession(poolKey)
 	}
 	unlockSession := func() {
 		if sess != nil && sessionLocked {
@@ -1660,6 +1668,60 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	return sess
 }
 
+func codexStatelessWebsocketPoolKey(auth *cliproxyauth.Auth, cfg *config.Config, authID, wsURL string) string {
+	authID = strings.TrimSpace(authID)
+	wsURL = strings.TrimSpace(wsURL)
+	if authID == "" || wsURL == "" {
+		return ""
+	}
+	proxyURL := ""
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+	return authID + "\x00" + wsURL + "\x00" + proxyURL
+}
+
+// acquireStatelessSession reserves an idle pooled session and returns it with
+// reqMu already held. A nil result means all slots are busy; callers may then
+// use a one-shot connection rather than queueing indefinitely.
+func (e *CodexWebsocketsExecutor) acquireStatelessSession(poolKey string) (*codexWebsocketSession, bool) {
+	if e == nil || strings.TrimSpace(poolKey) == "" {
+		return nil, false
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	if store == nil {
+		return nil, false
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.stateless == nil {
+		store.stateless = make(map[string][]*codexWebsocketSession)
+	}
+	pool := store.stateless[poolKey]
+	for _, sess := range pool {
+		if sess != nil && sess.reqMu.TryLock() {
+			return sess, true
+		}
+	}
+	if len(pool) >= codexStatelessWebsocketPoolSlots {
+		return nil, false
+	}
+	sess := &codexWebsocketSession{
+		sessionID:            "stateless-" + uuid.NewString(),
+		upstreamDisconnectCh: make(chan error, 1),
+	}
+	sess.reqMu.Lock()
+	store.stateless[poolKey] = append(pool, sess)
+	return sess, true
+}
+
 func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
 	sess := e.getOrCreateSession(sessionID)
 	if sess == nil {
@@ -1983,6 +2045,14 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 	for sessionID, sess := range store.sessions {
 		items = append(items, sessionItem{sessionID: sessionID, sess: sess})
 	}
+	statelessMatches := make([]*codexWebsocketSession, 0)
+	for poolKey, pool := range store.stateless {
+		if !strings.HasPrefix(poolKey, authID+"\x00") {
+			continue
+		}
+		delete(store.stateless, poolKey)
+		statelessMatches = append(statelessMatches, pool...)
+	}
 	store.mu.Unlock()
 
 	matches := make([]sessionItem, 0)
@@ -1998,7 +2068,7 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 			matches = append(matches, items[i])
 		}
 	}
-	if len(matches) == 0 {
+	if len(matches) == 0 && len(statelessMatches) == 0 {
 		return
 	}
 
@@ -2017,12 +2087,15 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 	for i := range toClose {
 		closeCodexWebsocketSession(toClose[i], reason)
 	}
+	for i := range statelessMatches {
+		closeCodexWebsocketSession(statelessMatches[i], reason)
+	}
 }
 
 // CodexAutoExecutor routes Codex requests to the websocket transport when the
 // selected auth enables it. Non-streaming requests remain on HTTP; streaming
 // HTTP SSE requests are converted from upstream websocket events by the
-// websocket executor using a request-scoped upstream connection.
+// websocket executor and benefit from its connection pool.
 type CodexAutoExecutor struct {
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
@@ -2077,7 +2150,7 @@ func codexWebsocketStreamEnabled(auth *cliproxyauth.Auth, opts cliproxyexecutor.
 	}
 	// The OpenAI image adapter owns multipart handling and large image payloads;
 	// keep those requests on its HTTP path instead of sending them through the
-	// Responses WebSocket transport.
+	// pooled Responses WebSocket transport.
 	return !isCodexOpenAIImageRequest(opts)
 }
 
