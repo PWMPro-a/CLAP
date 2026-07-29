@@ -105,14 +105,13 @@ type codexWebsocketSession struct {
 }
 
 type codexWebsocketRequestState struct {
-	conn                     *websocket.Conn
-	requestKey               string
-	ch                       chan codexWebsocketRead
-	done                     <-chan struct{}
-	cancel                   context.CancelFunc
-	createdSeen              bool
-	terminalSeen             bool
-	usedUnidentifiedFallback bool
+	conn         *websocket.Conn
+	requestKey   string
+	ch           chan codexWebsocketRead
+	done         <-chan struct{}
+	cancel       context.CancelFunc
+	createdSeen  bool
+	terminalSeen bool
 }
 
 type codexWebsocketRouteTombstone struct {
@@ -286,9 +285,9 @@ func (s *codexWebsocketSession) clearCodexActiveByChannel(conn *websocket.Conn, 
 	return false
 }
 
-func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload []byte) (chan codexWebsocketRead, <-chan struct{}, bool, bool) {
+func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload []byte) (chan codexWebsocketRead, <-chan struct{}, bool) {
 	if s == nil || conn == nil {
-		return nil, nil, false, false
+		return nil, nil, false
 	}
 	eventType := codexWebsocketPayloadEventType(payload)
 	terminal := codexWebsocketEventIsTerminal(eventType)
@@ -306,13 +305,13 @@ func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload 
 			state = s.activeRequests[requestKey]
 		}
 		if state == nil {
-			return nil, nil, terminal, false
+			return nil, nil, terminal
 		}
 	}
 	if state == nil {
 		for _, responseID := range responseIDs {
 			if !s.completedResponses[responseID].IsZero() {
-				return nil, nil, terminal, false
+				return nil, nil, terminal
 			}
 			if key := s.responseToRequest[responseID]; key != "" {
 				state = s.activeRequests[key]
@@ -325,7 +324,7 @@ func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload 
 	if state == nil {
 		for _, itemID := range itemIDs {
 			if !s.completedItems[itemID].IsZero() {
-				return nil, nil, terminal, false
+				return nil, nil, terminal
 			}
 			if key := s.itemToRequest[itemID]; key != "" {
 				state = s.activeRequests[key]
@@ -337,16 +336,16 @@ func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload 
 	}
 
 	if state == nil && codexWebsocketPayloadHasStrictRouteID(payload) {
-		return nil, nil, terminal, false
+		return nil, nil, terminal
 	}
 	if state == nil {
 		state = s.singleActiveCodexRequestForConnLocked(conn)
 		if state == nil || state.terminalSeen {
-			return nil, nil, terminal, false
+			return nil, nil, terminal
 		}
 	}
 	if state.conn != conn || state.terminalSeen {
-		return nil, nil, terminal, false
+		return nil, nil, terminal
 	}
 	if eventType == "response.created" {
 		state.createdSeen = true
@@ -357,11 +356,10 @@ func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload 
 	for _, itemID := range itemIDs {
 		s.itemToRequest[itemID] = state.requestKey
 	}
-	invalidateAfterSend := false
 	if terminal {
 		state.terminalSeen = true
 	}
-	return state.ch, state.done, terminal, invalidateAfterSend
+	return state.ch, state.done, terminal
 }
 
 func (s *codexWebsocketSession) ensureCodexRouteMapsLocked() {
@@ -1368,7 +1366,7 @@ func buildCodexWebsocketRequestBodyWithRequestKey(body []byte, requestKey string
 	// active session is already serialized by reqMu, so response_id/item_id
 	// mappings plus tombstones are enough to prevent stale event leakage.
 	_ = requestKey
-	return buildCodexWebsocketRequestBody(body)
+	return stripCodexWebsocketRequestKey(buildCodexWebsocketRequestBody(body))
 }
 
 func stripCodexWebsocketRequestKey(payload []byte) []byte {
@@ -2316,21 +2314,11 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			continue
 		}
 
-		ch, done, terminal, invalidateAfterSend := sess.routeCodexPayload(conn, payload)
+		ch, done, _ := sess.routeCodexPayload(conn, payload)
 		if ch == nil {
 			continue
 		}
 		event := codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}
-		if terminal && invalidateAfterSend {
-			invalidate := func() {
-				e.invalidateUpstreamConn(sess, conn, "unidentified_routing", nil)
-			}
-			invalidated := sendTerminalWebsocketRead(ch, done, event, invalidate)
-			if !invalidated {
-				invalidate()
-			}
-			return
-		}
 		select {
 		case ch <- event:
 		case <-done:
