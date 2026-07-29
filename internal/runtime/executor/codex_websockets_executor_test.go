@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -39,144 +38,6 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
-	}
-}
-
-func TestBuildCodexWebsocketRequestBodyWithRequestKeyDoesNotLeakInternalKey(t *testing.T) {
-	body := []byte(`{"model":"gpt-5-codex","metadata":{"client":"keep","_cliproxy_ws_request_key":"client-supplied"},"input":"hello"}`)
-
-	wsReqBody := buildCodexWebsocketRequestBodyWithRequestKey(body, "req-key-1")
-
-	if got := gjson.GetBytes(wsReqBody, "metadata.client").String(); got != "keep" {
-		t.Fatalf("metadata.client = %q, want keep; payload=%s", got, wsReqBody)
-	}
-	if gjson.GetBytes(wsReqBody, "metadata."+codexWebsocketRequestKeyMetadataName).Exists() {
-		t.Fatalf("internal request key leaked upstream: %s", wsReqBody)
-	}
-
-	clean := stripCodexWebsocketRequestKey([]byte(`{"type":"response.created","metadata":{"_cliproxy_ws_request_key":"top"},"response":{"id":"resp-1","metadata":{"_cliproxy_ws_request_key":"nested","client":"visible"}}}`))
-	if gjson.GetBytes(clean, "metadata."+codexWebsocketRequestKeyMetadataName).Exists() {
-		t.Fatalf("top-level request key leaked: %s", clean)
-	}
-	if gjson.GetBytes(clean, "response.metadata."+codexWebsocketRequestKeyMetadataName).Exists() {
-		t.Fatalf("response request key leaked: %s", clean)
-	}
-	if got := gjson.GetBytes(clean, "response.metadata.client").String(); got != "visible" {
-		t.Fatalf("response metadata client = %q, want visible; payload=%s", got, clean)
-	}
-}
-
-func TestCodexWebsocketRoutesByRequestKeyAndDropsCompletedStaleEvents(t *testing.T) {
-	sess := &codexWebsocketSession{}
-	conn := &websocket.Conn{}
-
-	firstCh, firstKey := sess.activateCodexRequest(conn, "request-1")
-	ch, _, terminal := sess.routeCodexPayload(conn, []byte(`{"type":"response.created","response":{"id":"resp-1","metadata":{"_cliproxy_ws_request_key":"request-1"}}}`))
-	if ch != firstCh || terminal {
-		t.Fatalf("created route = {%p %v}, want first channel non-terminal", ch, terminal)
-	}
-	ch, _, terminal = sess.routeCodexPayload(conn, []byte(`{"type":"response.output_item.added","response_id":"resp-1","item":{"id":"item-1"}}`))
-	if ch != firstCh || terminal {
-		t.Fatalf("item route = {%p %v}, want first channel non-terminal", ch, terminal)
-	}
-	ch, _, terminal = sess.routeCodexPayload(conn, []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[]}}`))
-	if ch != firstCh || !terminal {
-		t.Fatalf("completed route = {%p %v}, want first channel terminal", ch, terminal)
-	}
-	if !sess.clearCodexRequest(conn, firstKey, firstCh) {
-		t.Fatal("first request was not cleared")
-	}
-
-	secondCh, _ := sess.activateCodexRequest(conn, "request-2")
-	ch, _, _ = sess.routeCodexPayload(conn, []byte(`{"type":"response.output_text.delta","response_id":"resp-1","item_id":"item-1","delta":"stale"}`))
-	if ch != nil {
-		t.Fatalf("stale first response event routed to active request channel %p", ch)
-	}
-	ch, _, terminal = sess.routeCodexPayload(conn, []byte(`{"type":"response.created","response":{"id":"resp-2","metadata":{"_cliproxy_ws_request_key":"request-2"}}}`))
-	if ch != secondCh || terminal {
-		t.Fatalf("second created route = {%p %v}, want second channel non-terminal", ch, terminal)
-	}
-}
-
-func TestCodexWebsocketDropsUnknownResponseIDInsteadOfFallback(t *testing.T) {
-	sess := &codexWebsocketSession{}
-	conn := &websocket.Conn{}
-	readCh, _ := sess.activateCodexRequest(conn, "request-current")
-
-	ch, _, terminal := sess.routeCodexPayload(conn, []byte(`{"type":"response.output_text.delta","response_id":"resp-unknown","item_id":"item-unknown","delta":"stale"}`))
-	if ch != nil || terminal {
-		t.Fatalf("unknown routed delta = {%p %v}, want dropped non-terminal", ch, terminal)
-	}
-
-	ch, _, terminal = sess.routeCodexPayload(conn, []byte(`{"type":"response.created","response":{"id":"resp-current"}}`))
-	if ch != readCh || terminal {
-		t.Fatalf("created without request key = {%p %v}, want active channel fallback", ch, terminal)
-	}
-}
-
-func TestCodexWebsocketRouteTombstonesStayBoundedUnderBurst(t *testing.T) {
-	sess := &codexWebsocketSession{}
-	conn := &websocket.Conn{}
-
-	for i := 0; i < codexWebsocketRouteMaxTombstones+128; i++ {
-		requestKey := fmt.Sprintf("request-burst-%d", i)
-		responseID := fmt.Sprintf("response-burst-%d", i)
-		itemID := fmt.Sprintf("item-burst-%d", i)
-		ch, _ := sess.activateCodexRequest(conn, requestKey)
-		if routed, _, _ := sess.routeCodexPayload(conn, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"metadata":{"_cliproxy_ws_request_key":%q}}}`, responseID, requestKey))); routed != ch {
-			t.Fatalf("created route for %s did not use active channel", requestKey)
-		}
-		if routed, _, _ := sess.routeCodexPayload(conn, []byte(fmt.Sprintf(`{"type":"response.output_item.added","response_id":%q,"item":{"id":%q}}`, responseID, itemID))); routed != ch {
-			t.Fatalf("item route for %s did not use active channel", requestKey)
-		}
-		if !sess.clearCodexRequest(conn, requestKey, ch) {
-			t.Fatalf("request %s was not cleared", requestKey)
-		}
-	}
-
-	sess.routeMu.Lock()
-	total := sess.codexRouteTombstoneCountLocked()
-	orderLen := len(sess.tombstoneOrder)
-	sess.routeMu.Unlock()
-	if total > codexWebsocketRouteMaxTombstones {
-		t.Fatalf("tombstone count = %d, want <= %d", total, codexWebsocketRouteMaxTombstones)
-	}
-	if orderLen > codexWebsocketRouteMaxTombstones {
-		t.Fatalf("tombstone order length = %d, want <= %d", orderLen, codexWebsocketRouteMaxTombstones)
-	}
-
-	currentCh, _ := sess.activateCodexRequest(conn, "request-current-after-burst")
-	if routed, _, terminal := sess.routeCodexPayload(conn, []byte(`{"type":"response.output_text.delta","response_id":"response-burst-0","item_id":"item-burst-0","delta":"old"}`)); routed != nil || terminal {
-		t.Fatalf("evicted old strict route event = {%p %v}, want dropped", routed, terminal)
-	}
-	if routed, _, terminal := sess.routeCodexPayload(conn, []byte(`{"type":"response.output_text.delta","delta":"legacy-current"}`)); routed != currentCh || terminal {
-		t.Fatalf("legacy event route = {%p %v}, want current channel", routed, terminal)
-	}
-}
-
-func TestCodexWebsocketUnidentifiedFallbackDoesNotInvalidateSingleActiveRequest(t *testing.T) {
-	sess := &codexWebsocketSession{}
-	conn := &websocket.Conn{}
-	readCh, _ := sess.activateCodexRequest(conn, "request-unidentified")
-
-	ch, _, terminal := sess.routeCodexPayload(conn, []byte(`{"type":"response.output_text.delta","delta":"legacy"}`))
-	if ch != readCh || terminal {
-		t.Fatalf("unidentified delta route = {%p %v}, want active channel non-terminal", ch, terminal)
-	}
-	ch, _, terminal = sess.routeCodexPayload(conn, []byte(`{"type":"response.completed","response":{"id":"resp-legacy","output":[]}}`))
-	if ch != readCh || !terminal {
-		t.Fatalf("unidentified terminal route = {%p %v}, want active channel terminal", ch, terminal)
-	}
-}
-
-func TestCodexWebsocketRoutesUnidentifiedErrorToSingleActiveRequest(t *testing.T) {
-	sess := &codexWebsocketSession{}
-	conn := &websocket.Conn{}
-	readCh, _ := sess.activateCodexRequest(conn, "request-error")
-
-	ch, _, terminal := sess.routeCodexPayload(conn, []byte(`{"type":"error","error":{"message":"bad metadata"}}`))
-	if ch != readCh || !terminal {
-		t.Fatalf("unidentified error route = {%p %v}, want active channel terminal", ch, terminal)
 	}
 }
 
@@ -559,28 +420,6 @@ func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDow
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for first stream chunk")
-	}
-
-	var completedPayload []byte
-	for completedPayload == nil {
-		select {
-		case chunk, ok := <-result.Chunks:
-			if !ok {
-				t.Fatal("stream closed before response.completed")
-			}
-			if chunk.Err != nil {
-				t.Fatalf("stream chunk error = %v", chunk.Err)
-			}
-			payload := bytes.TrimSpace(chunk.Payload)
-			if gjson.GetBytes(payload, "type").String() == "response.completed" {
-				completedPayload = append([]byte(nil), payload...)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for response.completed")
-		}
-	}
-	if got := gjson.GetBytes(completedPayload, "response.output.0.content.0.text").String(); got != "hello" {
-		t.Fatalf("patched completed output text = %q, want hello; payload=%s", got, completedPayload)
 	}
 
 	select {

@@ -42,10 +42,6 @@ const (
 	// Stateless HTTP SSE requests reuse a bounded set of upstream connections.
 	// Keeping several slots avoids serializing unrelated requests on one socket.
 	codexStatelessWebsocketPoolSlots = 8
-
-	codexWebsocketRequestKeyMetadataName = "_cliproxy_ws_request_key"
-	codexWebsocketRouteTombstoneTTL      = 2 * time.Minute
-	codexWebsocketRouteMaxTombstones     = 4096
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -86,15 +82,6 @@ type codexWebsocketSession struct {
 	activeDone   <-chan struct{}
 	activeCancel context.CancelFunc
 
-	routeMu            sync.Mutex
-	activeRequests     map[string]*codexWebsocketRequestState
-	responseToRequest  map[string]string
-	itemToRequest      map[string]string
-	completedRequests  map[string]time.Time
-	completedResponses map[string]time.Time
-	completedItems     map[string]time.Time
-	tombstoneOrder     []codexWebsocketRouteTombstone
-
 	readerConn *websocket.Conn
 
 	upstreamDisconnectOnce    sync.Once
@@ -103,27 +90,6 @@ type codexWebsocketSession struct {
 	upstreamDisconnectErrConn *websocket.Conn
 	upstreamDisconnectErr     error
 }
-
-type codexWebsocketRequestState struct {
-	conn         *websocket.Conn
-	requestKey   string
-	ch           chan codexWebsocketRead
-	done         <-chan struct{}
-	cancel       context.CancelFunc
-	createdSeen  bool
-	terminalSeen bool
-}
-
-type codexWebsocketRouteTombstone struct {
-	kind string
-	id   string
-}
-
-const (
-	codexWebsocketRouteTombstoneRequest  = "request"
-	codexWebsocketRouteTombstoneResponse = "response"
-	codexWebsocketRouteTombstoneItem     = "item"
-)
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	return &CodexWebsocketsExecutor{
@@ -197,292 +163,6 @@ func (s *codexWebsocketSession) clearActive(conn *websocket.Conn, ch chan codexW
 	s.activeCancel = nil
 	s.activeDone = nil
 	return true
-}
-
-func (s *codexWebsocketSession) activateCodexRequest(conn *websocket.Conn, requestKey string) (chan codexWebsocketRead, string) {
-	if s == nil || conn == nil {
-		return nil, ""
-	}
-	requestKey = strings.TrimSpace(requestKey)
-	if requestKey == "" {
-		requestKey = uuid.NewString()
-	}
-	ch := make(chan codexWebsocketRead, 4096)
-	activeCtx, activeCancel := context.WithCancel(context.Background())
-
-	s.routeMu.Lock()
-	s.ensureCodexRouteMapsLocked()
-	if previous := s.activeRequests[requestKey]; previous != nil && previous.cancel != nil {
-		previous.cancel()
-	}
-	s.deleteCodexRouteMappingsForRequestLocked(requestKey, false, time.Time{})
-	s.activeRequests[requestKey] = &codexWebsocketRequestState{
-		conn:       conn,
-		requestKey: requestKey,
-		ch:         ch,
-		done:       activeCtx.Done(),
-		cancel:     activeCancel,
-	}
-	s.routeMu.Unlock()
-	return ch, requestKey
-}
-
-func (s *codexWebsocketSession) clearCodexRequest(conn *websocket.Conn, requestKey string, ch chan codexWebsocketRead) bool {
-	if s == nil {
-		return false
-	}
-	requestKey = strings.TrimSpace(requestKey)
-	s.routeMu.Lock()
-	defer s.routeMu.Unlock()
-	state := s.activeRequests[requestKey]
-	if state == nil || state.conn != conn || state.ch != ch {
-		return false
-	}
-	delete(s.activeRequests, requestKey)
-	if state.cancel != nil {
-		state.cancel()
-	}
-	now := time.Now()
-	s.addCodexRouteTombstoneLocked(codexWebsocketRouteTombstoneRequest, requestKey, now)
-	s.deleteCodexRouteMappingsForRequestLocked(requestKey, true, now)
-	s.pruneCodexRouteTombstonesLocked(now)
-	return true
-}
-
-func (s *codexWebsocketSession) activeCodexForConn(conn *websocket.Conn) (chan codexWebsocketRead, <-chan struct{}) {
-	if s == nil || conn == nil {
-		return nil, nil
-	}
-	s.routeMu.Lock()
-	defer s.routeMu.Unlock()
-	state := s.singleActiveCodexRequestForConnLocked(conn)
-	if state == nil {
-		return nil, nil
-	}
-	return state.ch, state.done
-}
-
-func (s *codexWebsocketSession) clearCodexActiveByChannel(conn *websocket.Conn, ch chan codexWebsocketRead) bool {
-	if s == nil || conn == nil || ch == nil {
-		return false
-	}
-	s.routeMu.Lock()
-	defer s.routeMu.Unlock()
-	for requestKey, state := range s.activeRequests {
-		if state == nil || state.conn != conn || state.ch != ch {
-			continue
-		}
-		delete(s.activeRequests, requestKey)
-		if state.cancel != nil {
-			state.cancel()
-		}
-		now := time.Now()
-		s.addCodexRouteTombstoneLocked(codexWebsocketRouteTombstoneRequest, requestKey, now)
-		s.deleteCodexRouteMappingsForRequestLocked(requestKey, true, now)
-		s.pruneCodexRouteTombstonesLocked(now)
-		return true
-	}
-	return false
-}
-
-func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload []byte) (chan codexWebsocketRead, <-chan struct{}, bool) {
-	if s == nil || conn == nil {
-		return nil, nil, false
-	}
-	eventType := codexWebsocketPayloadEventType(payload)
-	terminal := codexWebsocketEventIsTerminal(eventType)
-	requestKey := codexWebsocketPayloadRequestKey(payload)
-	responseIDs := codexWebsocketPayloadResponseIDs(payload)
-	itemIDs := codexWebsocketPayloadItemIDs(payload)
-
-	s.routeMu.Lock()
-	defer s.routeMu.Unlock()
-	s.ensureCodexRouteMapsLocked()
-
-	state := (*codexWebsocketRequestState)(nil)
-	if requestKey != "" {
-		if s.completedRequests[requestKey].IsZero() {
-			state = s.activeRequests[requestKey]
-		}
-		if state == nil {
-			return nil, nil, terminal
-		}
-	}
-	if state == nil {
-		for _, responseID := range responseIDs {
-			if !s.completedResponses[responseID].IsZero() {
-				return nil, nil, terminal
-			}
-			if key := s.responseToRequest[responseID]; key != "" {
-				state = s.activeRequests[key]
-				if state != nil {
-					break
-				}
-			}
-		}
-	}
-	if state == nil {
-		for _, itemID := range itemIDs {
-			if !s.completedItems[itemID].IsZero() {
-				return nil, nil, terminal
-			}
-			if key := s.itemToRequest[itemID]; key != "" {
-				state = s.activeRequests[key]
-				if state != nil {
-					break
-				}
-			}
-		}
-	}
-
-	if state == nil && codexWebsocketPayloadHasStrictRouteID(payload) {
-		return nil, nil, terminal
-	}
-	if state == nil {
-		state = s.singleActiveCodexRequestForConnLocked(conn)
-		if state == nil || state.terminalSeen {
-			return nil, nil, terminal
-		}
-	}
-	if state.conn != conn || state.terminalSeen {
-		return nil, nil, terminal
-	}
-	if eventType == "response.created" {
-		state.createdSeen = true
-	}
-	for _, responseID := range responseIDs {
-		s.responseToRequest[responseID] = state.requestKey
-	}
-	for _, itemID := range itemIDs {
-		s.itemToRequest[itemID] = state.requestKey
-	}
-	if terminal {
-		state.terminalSeen = true
-	}
-	return state.ch, state.done, terminal
-}
-
-func (s *codexWebsocketSession) ensureCodexRouteMapsLocked() {
-	if s.activeRequests == nil {
-		s.activeRequests = make(map[string]*codexWebsocketRequestState)
-	}
-	if s.responseToRequest == nil {
-		s.responseToRequest = make(map[string]string)
-	}
-	if s.itemToRequest == nil {
-		s.itemToRequest = make(map[string]string)
-	}
-	if s.completedRequests == nil {
-		s.completedRequests = make(map[string]time.Time)
-	}
-	if s.completedResponses == nil {
-		s.completedResponses = make(map[string]time.Time)
-	}
-	if s.completedItems == nil {
-		s.completedItems = make(map[string]time.Time)
-	}
-}
-
-func (s *codexWebsocketSession) singleActiveCodexRequestForConnLocked(conn *websocket.Conn) *codexWebsocketRequestState {
-	var selected *codexWebsocketRequestState
-	for _, state := range s.activeRequests {
-		if state == nil || state.conn != conn {
-			continue
-		}
-		if selected != nil {
-			return nil
-		}
-		selected = state
-	}
-	return selected
-}
-
-func (s *codexWebsocketSession) deleteCodexRouteMappingsForRequestLocked(requestKey string, tombstone bool, now time.Time) {
-	for responseID, mappedKey := range s.responseToRequest {
-		if mappedKey != requestKey {
-			continue
-		}
-		delete(s.responseToRequest, responseID)
-		if tombstone && responseID != "" {
-			s.addCodexRouteTombstoneLocked(codexWebsocketRouteTombstoneResponse, responseID, now)
-		}
-	}
-	for itemID, mappedKey := range s.itemToRequest {
-		if mappedKey != requestKey {
-			continue
-		}
-		delete(s.itemToRequest, itemID)
-		if tombstone && itemID != "" {
-			s.addCodexRouteTombstoneLocked(codexWebsocketRouteTombstoneItem, itemID, now)
-		}
-	}
-}
-
-func (s *codexWebsocketSession) addCodexRouteTombstoneLocked(kind string, id string, now time.Time) {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return
-	}
-	bucket := s.codexRouteTombstoneBucketLocked(kind)
-	if bucket == nil {
-		return
-	}
-	if _, exists := bucket[id]; !exists {
-		s.tombstoneOrder = append(s.tombstoneOrder, codexWebsocketRouteTombstone{kind: kind, id: id})
-	}
-	bucket[id] = now
-}
-
-func (s *codexWebsocketSession) codexRouteTombstoneBucketLocked(kind string) map[string]time.Time {
-	switch kind {
-	case codexWebsocketRouteTombstoneRequest:
-		return s.completedRequests
-	case codexWebsocketRouteTombstoneResponse:
-		return s.completedResponses
-	case codexWebsocketRouteTombstoneItem:
-		return s.completedItems
-	default:
-		return nil
-	}
-}
-
-func (s *codexWebsocketSession) codexRouteTombstoneCountLocked() int {
-	return len(s.completedRequests) + len(s.completedResponses) + len(s.completedItems)
-}
-
-func (s *codexWebsocketSession) pruneCodexRouteTombstonesLocked(now time.Time) {
-	cutoff := now.Add(-codexWebsocketRouteTombstoneTTL)
-	removed := 0
-	for len(s.tombstoneOrder) > 0 {
-		total := s.codexRouteTombstoneCountLocked()
-		if total <= codexWebsocketRouteMaxTombstones {
-			first := s.tombstoneOrder[0]
-			bucket := s.codexRouteTombstoneBucketLocked(first.kind)
-			if bucket == nil {
-				s.tombstoneOrder = s.tombstoneOrder[1:]
-				removed++
-				continue
-			}
-			ts, ok := bucket[first.id]
-			if !ok {
-				s.tombstoneOrder = s.tombstoneOrder[1:]
-				removed++
-				continue
-			}
-			if !ts.Before(cutoff) {
-				break
-			}
-		}
-		first := s.tombstoneOrder[0]
-		if bucket := s.codexRouteTombstoneBucketLocked(first.kind); bucket != nil {
-			delete(bucket, first.id)
-		}
-		s.tombstoneOrder = s.tombstoneOrder[1:]
-		removed++
-	}
-	if removed > 0 && len(s.tombstoneOrder)*2 < cap(s.tombstoneOrder) {
-		s.tombstoneOrder = append([]codexWebsocketRouteTombstone(nil), s.tombstoneOrder...)
-	}
 }
 
 func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, payload []byte) error {
@@ -707,11 +387,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer sess.reqMu.Unlock()
 	}
 
-	requestKey := ""
-	if sess != nil {
-		requestKey = uuid.NewString()
-	}
-	wsReqBody := buildCodexWebsocketRequestBodyWithRequestKey(upstreamBody, requestKey)
+	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -758,9 +434,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	var readCh chan codexWebsocketRead
 	if sess != nil {
-		readCh, requestKey = sess.activateCodexRequest(conn, requestKey)
+		readCh = sess.activate(conn)
 		defer func() {
-			sess.clearCodexRequest(conn, requestKey, readCh)
+			sess.clearActive(conn, readCh)
 		}()
 	}
 
@@ -779,8 +455,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry == nil && connRetry != nil {
 				conn = connRetry
-				readCh, requestKey = sess.activateCodexRequest(conn, requestKey)
-				wsReqBodyRetry := buildCodexWebsocketRequestBodyWithRequestKey(upstreamBody, requestKey)
+				readCh = sess.activate(conn)
+				wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
 					Method:    "WEBSOCKET",
@@ -815,12 +491,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
-	outputText := &codexOutputTextAccumulator{}
 	for {
 		if ctx != nil && ctx.Err() != nil {
-			if sess != nil {
-				e.invalidateUpstreamConn(sess, conn, "context_done", ctx.Err())
-			}
 			return resp, ctx.Err()
 		}
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
@@ -868,13 +540,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 		payload = normalizeCodexWebsocketCompletion(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
-		collectCodexOutputTextEvent(payload, outputText)
 		switch eventType {
 		case "response.output_item.done":
 			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
-			payload = patchCodexCompletedOutputWithText(payload, outputItemsByIndex, outputItemsFallback, outputText)
-			payload = stripCodexWebsocketRequestKey(payload)
+			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 			cacheCodexReasoningReplayFromCompleted(replayScope, payload)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
@@ -987,11 +657,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
-	requestKey := ""
-	if sess != nil {
-		requestKey = uuid.NewString()
-	}
-	wsReqBody := buildCodexWebsocketRequestBodyWithRequestKey(upstreamBody, requestKey)
+	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -1038,7 +704,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	var readCh chan codexWebsocketRead
 	if sess != nil {
-		readCh, requestKey = sess.activateCodexRequest(conn, requestKey)
+		readCh = sess.activate(conn)
 	}
 
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
@@ -1047,7 +713,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
-				sess.clearCodexRequest(conn, requestKey, readCh)
+				sess.clearActive(conn, readCh)
 				unlockSession()
 				return nil, errSend
 			}
@@ -1057,13 +723,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if errDialRetry != nil || connRetry == nil {
 				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
-				sess.clearCodexRequest(conn, requestKey, readCh)
+				sess.clearActive(conn, readCh)
 				unlockSession()
 				return nil, errDialRetry
 			}
 			conn = connRetry
-			readCh, requestKey = sess.activateCodexRequest(conn, requestKey)
-			wsReqBodyRetry := buildCodexWebsocketRequestBodyWithRequestKey(upstreamBody, requestKey)
+			readCh = sess.activate(conn)
+			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -1081,7 +747,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				errSendRetry = mapCodexWebsocketWriteError(sess, conn, errSendRetry)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, conn, "send_error", errSendRetry)
-				sess.clearCodexRequest(conn, requestKey, readCh)
+				sess.clearActive(conn, readCh)
 				unlockSession()
 				return nil, errSendRetry
 			}
@@ -1103,10 +769,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		defer close(out)
 		defer func() {
 			if sess != nil {
-				if terminateReason == "context_done" {
-					e.invalidateUpstreamConn(sess, conn, terminateReason, terminateErr)
-				}
-				sess.clearCodexRequest(conn, requestKey, readCh)
+				sess.clearActive(conn, readCh)
 				unlockSession()
 				return
 			}
@@ -1133,7 +796,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
-		outputText := &codexOutputTextAccumulator{}
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
@@ -1215,17 +877,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return
 			}
 
-			payload = stripCodexWebsocketRequestKey(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error"
-			collectCodexOutputTextEvent(payload, outputText)
 			if eventType == "response.output_item.done" {
 				collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 			}
 			completedPayload := payload
 			if eventType == "response.completed" || eventType == "response.done" {
 				completedPayload = normalizeCodexWebsocketCompletion(completedPayload)
-				completedPayload = patchCodexCompletedOutputWithText(completedPayload, outputItemsByIndex, outputItemsFallback, outputText)
+				completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
 				cacheCodexReasoningReplayFromCompleted(replayScope, completedPayload)
 				if detail, ok := helps.ParseCodexUsage(completedPayload); ok {
 					reporter.Publish(ctx, detail)
@@ -1234,9 +894,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if cliproxyexecutor.DownstreamWebsocket(ctx) {
-				if eventType == "response.completed" || eventType == "response.done" {
-					clientPayload = applyCodexIdentityExposeResponsePayload(completedPayload, identityState)
-				}
 				if !send(cliproxyexecutor.StreamChunk{Payload: clientPayload}) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
@@ -1364,100 +1021,6 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	fallback := bytes.Clone(body)
 	fallback, _ = sjson.SetBytes(fallback, "type", "response.create")
 	return fallback
-}
-
-func buildCodexWebsocketRequestBodyWithRequestKey(body []byte, requestKey string) []byte {
-	// requestKey is an internal local routing handle for a pooled websocket
-	// session. Do not send it upstream in request metadata: the real Codex
-	// websocket endpoint can reject unknown/internal metadata fields, and every
-	// active session is already serialized by reqMu, so response_id/item_id
-	// mappings plus tombstones are enough to prevent stale event leakage.
-	_ = requestKey
-	return stripCodexWebsocketRequestKey(buildCodexWebsocketRequestBody(body))
-}
-
-func stripCodexWebsocketRequestKey(payload []byte) []byte {
-	if len(payload) == 0 {
-		return payload
-	}
-	updated := payload
-	for _, path := range []string{
-		"metadata." + codexWebsocketRequestKeyMetadataName,
-		"response.metadata." + codexWebsocketRequestKeyMetadataName,
-		"body.metadata." + codexWebsocketRequestKeyMetadataName,
-		"body.response.metadata." + codexWebsocketRequestKeyMetadataName,
-	} {
-		if !gjson.GetBytes(updated, path).Exists() {
-			continue
-		}
-		if next, errDelete := sjson.DeleteBytes(updated, path); errDelete == nil && len(next) > 0 {
-			updated = next
-		}
-	}
-	return updated
-}
-
-func codexWebsocketPayloadEventType(payload []byte) string {
-	return strings.TrimSpace(gjson.GetBytes(payload, "type").String())
-}
-
-func codexWebsocketEventIsTerminal(eventType string) bool {
-	switch strings.TrimSpace(eventType) {
-	case "response.completed", "response.done", "error":
-		return true
-	default:
-		return false
-	}
-}
-
-func codexWebsocketPayloadRequestKey(payload []byte) string {
-	for _, path := range []string{
-		"metadata." + codexWebsocketRequestKeyMetadataName,
-		"response.metadata." + codexWebsocketRequestKeyMetadataName,
-		"body.metadata." + codexWebsocketRequestKeyMetadataName,
-		"body.response.metadata." + codexWebsocketRequestKeyMetadataName,
-	} {
-		if value := strings.TrimSpace(gjson.GetBytes(payload, path).String()); value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func codexWebsocketPayloadResponseIDs(payload []byte) []string {
-	ids := make([]string, 0, 2)
-	for _, path := range []string{"response.id", "response_id"} {
-		if value := strings.TrimSpace(gjson.GetBytes(payload, path).String()); value != "" {
-			ids = appendUniqueString(ids, value)
-		}
-	}
-	return ids
-}
-
-func codexWebsocketPayloadItemIDs(payload []byte) []string {
-	ids := make([]string, 0, 2)
-	for _, path := range []string{"item.id", "item_id"} {
-		if value := strings.TrimSpace(gjson.GetBytes(payload, path).String()); value != "" {
-			ids = appendUniqueString(ids, value)
-		}
-	}
-	return ids
-}
-
-func codexWebsocketPayloadHasStrictRouteID(payload []byte) bool {
-	if strings.TrimSpace(gjson.GetBytes(payload, "response_id").String()) != "" {
-		return true
-	}
-	return len(codexWebsocketPayloadItemIDs(payload)) > 0
-}
-
-func appendUniqueString(values []string, value string) []string {
-	for _, existing := range values {
-		if existing == value {
-			return values
-		}
-	}
-	return append(values, value)
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
@@ -2286,10 +1849,10 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			}
 			invalidated := false
-			ch, done := sess.activeCodexForConn(conn)
+			ch, done := sess.activeForConn(conn)
 			if ch != nil {
 				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
-				if sess.clearCodexActiveByChannel(conn, ch) {
+				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
 			}
@@ -2306,10 +1869,10 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				}
 				invalidated := false
-				ch, done := sess.activeCodexForConn(conn)
+				ch, done := sess.activeForConn(conn)
 				if ch != nil {
 					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
-					if sess.clearCodexActiveByChannel(conn, ch) {
+					if sess.clearActive(conn, ch) {
 						close(ch)
 					}
 				}
@@ -2321,13 +1884,12 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			continue
 		}
 
-		ch, done, _ := sess.routeCodexPayload(conn, payload)
+		ch, done := sess.activeForConn(conn)
 		if ch == nil {
 			continue
 		}
-		event := codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}
 		select {
-		case ch <- event:
+		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}:
 		case <-done:
 		}
 	}
