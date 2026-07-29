@@ -252,11 +252,35 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 func patchCodexCompletedOutputWithText(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte, outputText *codexOutputTextAccumulator) []byte {
 	outputResult := gjson.GetBytes(eventData, "response.output")
 	textItems := outputText.outputItems()
-	shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0 || len(textItems) > 0)
-	if !shouldPatchOutput {
+	doneItems := codexCollectedOutputItems(outputItemsByIndex, outputItemsFallback)
+	if len(doneItems) > 0 && !codexOutputItemsHaveVisibleMessageText(doneItems) && len(textItems) > 0 {
+		doneItems = codexMergeOutputItemsWithBackfill(doneItems, textItems)
+	}
+	sourceItems := doneItems
+	if len(sourceItems) == 0 {
+		sourceItems = textItems
+	}
+	if len(sourceItems) == 0 {
 		return eventData
 	}
 
+	if !outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0 {
+		return codexSetCompletedOutput(eventData, sourceItems)
+	}
+
+	existingItems := codexOutputArrayItems(outputResult)
+	if codexOutputItemsHaveVisibleMessageText(existingItems) {
+		return eventData
+	}
+
+	mergedItems := codexMergeOutputItemsWithBackfill(existingItems, sourceItems)
+	if len(mergedItems) == 0 || codexOutputItemsEqual(existingItems, mergedItems) {
+		return eventData
+	}
+	return codexSetCompletedOutput(eventData, mergedItems)
+}
+
+func codexCollectedOutputItems(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) [][]byte {
 	indexes := make([]int64, 0, len(outputItemsByIndex))
 	for idx := range outputItemsByIndex {
 		indexes = append(indexes, idx)
@@ -270,34 +294,204 @@ func patchCodexCompletedOutputWithText(eventData []byte, outputItemsByIndex map[
 		items = append(items, outputItemsByIndex[idx])
 	}
 	items = append(items, outputItemsFallback...)
+	return items
+}
+
+func codexOutputArrayItems(outputResult gjson.Result) [][]byte {
+	if !outputResult.Exists() || !outputResult.IsArray() {
+		return nil
+	}
+	outputArray := outputResult.Array()
+	items := make([][]byte, 0, len(outputArray))
+	for _, outputItem := range outputArray {
+		if outputItem.Type != gjson.JSON || strings.TrimSpace(outputItem.Raw) == "" {
+			continue
+		}
+		items = append(items, []byte(outputItem.Raw))
+	}
+	return items
+}
+
+func codexSetCompletedOutput(eventData []byte, items [][]byte) []byte {
 	if len(items) == 0 {
-		items = append(items, textItems...)
+		return eventData
 	}
 
-	outputArray := []byte("[]")
-	if len(items) > 0 {
-		var buf bytes.Buffer
-		totalLen := 2
-		for _, item := range items {
-			totalLen += len(item)
-		}
-		if len(items) > 1 {
-			totalLen += len(items) - 1
-		}
-		buf.Grow(totalLen)
-		buf.WriteByte('[')
-		for i, item := range items {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			buf.Write(item)
-		}
-		buf.WriteByte(']')
-		outputArray = buf.Bytes()
+	var buf bytes.Buffer
+	totalLen := 2
+	for _, item := range items {
+		totalLen += len(item)
 	}
+	if len(items) > 1 {
+		totalLen += len(items) - 1
+	}
+	buf.Grow(totalLen)
+	buf.WriteByte('[')
+	for i, item := range items {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.Write(item)
+	}
+	buf.WriteByte(']')
 
-	completedDataPatched, _ := sjson.SetRawBytes(eventData, "response.output", outputArray)
+	completedDataPatched, _ := sjson.SetRawBytes(eventData, "response.output", buf.Bytes())
 	return completedDataPatched
+}
+
+func codexMergeOutputItemsWithBackfill(existingItems [][]byte, backfillItems [][]byte) [][]byte {
+	items := make([][]byte, 0, len(existingItems)+len(backfillItems))
+	seen := make(map[string]struct{}, len(existingItems)+len(backfillItems))
+	appendItem := func(item []byte) {
+		if len(bytes.TrimSpace(item)) == 0 || !codexOutputItemHasMeaningfulContent(item) {
+			return
+		}
+		key := codexOutputItemDedupKey(item)
+		if key != "" {
+			if _, ok := seen[key]; ok {
+				return
+			}
+			seen[key] = struct{}{}
+		}
+		items = append(items, item)
+	}
+
+	for _, item := range existingItems {
+		if codexOutputMessageItemEffectivelyEmpty(item) {
+			continue
+		}
+		appendItem(item)
+	}
+	for _, item := range backfillItems {
+		appendItem(item)
+	}
+	return items
+}
+
+func codexOutputItemsHaveVisibleMessageText(items [][]byte) bool {
+	for _, item := range items {
+		if codexOutputMessageItemHasVisibleText(gjson.ParseBytes(item)) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexOutputItemHasMeaningfulContent(item []byte) bool {
+	result := gjson.ParseBytes(item)
+	if !result.Exists() || result.Type != gjson.JSON {
+		return false
+	}
+	itemType := strings.TrimSpace(result.Get("type").String())
+	if itemType == "message" {
+		return !codexOutputMessageItemEffectivelyEmptyResult(result)
+	}
+	return true
+}
+
+func codexOutputMessageItemEffectivelyEmpty(item []byte) bool {
+	return codexOutputMessageItemEffectivelyEmptyResult(gjson.ParseBytes(item))
+}
+
+func codexOutputMessageItemEffectivelyEmptyResult(item gjson.Result) bool {
+	if strings.TrimSpace(item.Get("type").String()) != "message" {
+		return false
+	}
+	if codexOutputMessageItemHasVisibleText(item) {
+		return false
+	}
+
+	contentResult := item.Get("content")
+	if !contentResult.Exists() || contentResult.Type == gjson.Null {
+		return true
+	}
+	if contentResult.Type == gjson.String {
+		return strings.TrimSpace(contentResult.String()) == ""
+	}
+	if !contentResult.IsArray() {
+		return strings.TrimSpace(contentResult.Raw) == "" || contentResult.Raw == "null"
+	}
+
+	contentArray := contentResult.Array()
+	if len(contentArray) == 0 {
+		return true
+	}
+	for _, contentItem := range contentArray {
+		if codexOutputContentPartHasVisibleText(contentItem) {
+			return false
+		}
+		partType := strings.TrimSpace(contentItem.Get("type").String())
+		switch partType {
+		case "", "output_text", "input_text", "text", "refusal":
+			continue
+		default:
+			if raw := strings.TrimSpace(contentItem.Raw); raw != "" && raw != "{}" && raw != "null" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func codexOutputMessageItemHasVisibleText(item gjson.Result) bool {
+	if item.Type != gjson.JSON {
+		return false
+	}
+	if item.Get("type").String() != "" && strings.TrimSpace(item.Get("type").String()) != "message" && strings.TrimSpace(item.Get("type").String()) != "output_text" {
+		return false
+	}
+	if strings.TrimSpace(item.Get("text").String()) != "" || strings.TrimSpace(item.Get("output_text").String()) != "" || strings.TrimSpace(item.Get("refusal").String()) != "" {
+		return true
+	}
+	contentResult := item.Get("content")
+	if contentResult.Type == gjson.String {
+		return strings.TrimSpace(contentResult.String()) != ""
+	}
+	if !contentResult.IsArray() {
+		return false
+	}
+	for _, contentItem := range contentResult.Array() {
+		if codexOutputContentPartHasVisibleText(contentItem) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexOutputContentPartHasVisibleText(contentItem gjson.Result) bool {
+	if contentItem.Type == gjson.String {
+		return strings.TrimSpace(contentItem.String()) != ""
+	}
+	if contentItem.Type != gjson.JSON {
+		return false
+	}
+	return strings.TrimSpace(contentItem.Get("text").String()) != "" ||
+		strings.TrimSpace(contentItem.Get("output_text").String()) != "" ||
+		strings.TrimSpace(contentItem.Get("refusal").String()) != ""
+}
+
+func codexOutputItemDedupKey(item []byte) string {
+	result := gjson.ParseBytes(item)
+	itemType := strings.TrimSpace(result.Get("type").String())
+	if id := strings.TrimSpace(result.Get("id").String()); id != "" {
+		return itemType + ":id:" + id
+	}
+	if callID := strings.TrimSpace(result.Get("call_id").String()); callID != "" {
+		return itemType + ":call:" + callID
+	}
+	return ""
+}
+
+func codexOutputItemsEqual(a, b [][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !bytes.Equal(bytes.TrimSpace(a[i]), bytes.TrimSpace(b[i])) {
+			return false
+		}
+	}
+	return true
 }
 
 func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
