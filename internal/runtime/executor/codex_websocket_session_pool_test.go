@@ -15,7 +15,6 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 func TestCodexStatelessWebsocketSessionPoolReusesIdleSlotsAndBoundsBusySlots(t *testing.T) {
@@ -66,10 +65,13 @@ func TestCodexWebsocketsExecuteStreamReusesStatelessHTTPSSESession(t *testing.T)
 			if errRead != nil {
 				return
 			}
-			requestKey := gjson.GetBytes(payload, "metadata."+codexWebsocketRequestKeyMetadataName).String()
+			if bytes.Contains(payload, []byte(codexWebsocketRequestKeyMetadataName)) {
+				t.Errorf("internal websocket request key leaked upstream: %s", payload)
+				return
+			}
 			responseID := fmt.Sprintf("resp-reuse-%d", i+1)
 			itemID := fmt.Sprintf("item-reuse-%d", i+1)
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"metadata":{"%s":%q}}}`, responseID, codexWebsocketRequestKeyMetadataName, requestKey)))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q}}`, responseID)))
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.output_item.added","response_id":%q,"item":{"id":%q}}`, responseID, itemID)))
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.output_text.delta","response_id":%q,"item_id":%q,"delta":"hello"}`, responseID, itemID)))
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`, responseID)))
@@ -138,8 +140,11 @@ func TestCodexWebsocketsStatelessPoolDropsStaleResponseEvents(t *testing.T) {
 		if errRead != nil {
 			return
 		}
-		firstKey := gjson.GetBytes(firstPayload, "metadata."+codexWebsocketRequestKeyMetadataName).String()
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":"resp-stale-1","metadata":{"%s":%q}}}`, codexWebsocketRequestKeyMetadataName, firstKey)))
+		if bytes.Contains(firstPayload, []byte(codexWebsocketRequestKeyMetadataName)) {
+			t.Errorf("internal websocket request key leaked upstream: %s", firstPayload)
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-stale-1"}}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","response_id":"resp-stale-1","item":{"id":"item-stale-1"}}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","response_id":"resp-stale-1","item_id":"item-stale-1","delta":"first"}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-stale-1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
@@ -148,9 +153,12 @@ func TestCodexWebsocketsStatelessPoolDropsStaleResponseEvents(t *testing.T) {
 		if errRead != nil {
 			return
 		}
-		secondKey := gjson.GetBytes(secondPayload, "metadata."+codexWebsocketRequestKeyMetadataName).String()
+		if bytes.Contains(secondPayload, []byte(codexWebsocketRequestKeyMetadataName)) {
+			t.Errorf("internal websocket request key leaked upstream: %s", secondPayload)
+			return
+		}
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","response_id":"resp-stale-1","item_id":"item-stale-1","delta":"STALE_SHOULD_NOT_LEAK"}`))
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":"resp-stale-2","metadata":{"%s":%q}}}`, codexWebsocketRequestKeyMetadataName, secondKey)))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-stale-2"}}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","response_id":"resp-stale-2","item":{"id":"item-stale-2"}}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","response_id":"resp-stale-2","item_id":"item-stale-2","delta":"fresh-second"}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-stale-2","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))

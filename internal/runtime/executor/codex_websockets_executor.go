@@ -336,7 +336,6 @@ func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload 
 		}
 	}
 
-	hasRoutingSignal := requestKey != "" || len(responseIDs) > 0 || len(itemIDs) > 0
 	if state == nil && codexWebsocketPayloadHasStrictRouteID(payload) {
 		return nil, nil, terminal, false
 	}
@@ -344,9 +343,6 @@ func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload 
 		state = s.singleActiveCodexRequestForConnLocked(conn)
 		if state == nil || state.terminalSeen {
 			return nil, nil, terminal, false
-		}
-		if !hasRoutingSignal {
-			state.usedUnidentifiedFallback = true
 		}
 	}
 	if state.conn != conn || state.terminalSeen {
@@ -364,7 +360,6 @@ func (s *codexWebsocketSession) routeCodexPayload(conn *websocket.Conn, payload 
 	invalidateAfterSend := false
 	if terminal {
 		state.terminalSeen = true
-		invalidateAfterSend = state.usedUnidentifiedFallback
 	}
 	return state.ch, state.done, terminal, invalidateAfterSend
 }
@@ -1367,16 +1362,13 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 }
 
 func buildCodexWebsocketRequestBodyWithRequestKey(body []byte, requestKey string) []byte {
-	wsReqBody := buildCodexWebsocketRequestBody(body)
-	requestKey = strings.TrimSpace(requestKey)
-	if len(wsReqBody) == 0 || requestKey == "" {
-		return wsReqBody
-	}
-	updated, errSet := sjson.SetBytes(wsReqBody, "metadata."+codexWebsocketRequestKeyMetadataName, requestKey)
-	if errSet == nil && len(updated) > 0 {
-		return updated
-	}
-	return wsReqBody
+	// requestKey is an internal local routing handle for a pooled websocket
+	// session. Do not send it upstream in request metadata: the real Codex
+	// websocket endpoint can reject unknown/internal metadata fields, and every
+	// active session is already serialized by reqMu, so response_id/item_id
+	// mappings plus tombstones are enough to prevent stale event leakage.
+	_ = requestKey
+	return buildCodexWebsocketRequestBody(body)
 }
 
 func stripCodexWebsocketRequestKey(payload []byte) []byte {

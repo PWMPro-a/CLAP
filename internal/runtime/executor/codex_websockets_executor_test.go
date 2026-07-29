@@ -42,7 +42,7 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 }
 
-func TestBuildCodexWebsocketRequestBodyWithRequestKeyAndStripResponse(t *testing.T) {
+func TestBuildCodexWebsocketRequestBodyWithRequestKeyDoesNotLeakInternalKey(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","metadata":{"client":"keep"},"input":"hello"}`)
 
 	wsReqBody := buildCodexWebsocketRequestBodyWithRequestKey(body, "req-key-1")
@@ -50,8 +50,8 @@ func TestBuildCodexWebsocketRequestBodyWithRequestKeyAndStripResponse(t *testing
 	if got := gjson.GetBytes(wsReqBody, "metadata.client").String(); got != "keep" {
 		t.Fatalf("metadata.client = %q, want keep; payload=%s", got, wsReqBody)
 	}
-	if got := gjson.GetBytes(wsReqBody, "metadata."+codexWebsocketRequestKeyMetadataName).String(); got != "req-key-1" {
-		t.Fatalf("request key = %q, want req-key-1; payload=%s", got, wsReqBody)
+	if gjson.GetBytes(wsReqBody, "metadata."+codexWebsocketRequestKeyMetadataName).Exists() {
+		t.Fatalf("internal request key leaked upstream: %s", wsReqBody)
 	}
 
 	clean := stripCodexWebsocketRequestKey([]byte(`{"type":"response.created","metadata":{"_cliproxy_ws_request_key":"top"},"response":{"id":"resp-1","metadata":{"_cliproxy_ws_request_key":"nested","client":"visible"}}}`))
@@ -154,7 +154,7 @@ func TestCodexWebsocketRouteTombstonesStayBoundedUnderBurst(t *testing.T) {
 	}
 }
 
-func TestCodexWebsocketUnidentifiedFallbackInvalidatesAfterTerminal(t *testing.T) {
+func TestCodexWebsocketUnidentifiedFallbackDoesNotInvalidateSingleActiveRequest(t *testing.T) {
 	sess := &codexWebsocketSession{}
 	conn := &websocket.Conn{}
 	readCh, _ := sess.activateCodexRequest(conn, "request-unidentified")
@@ -164,8 +164,8 @@ func TestCodexWebsocketUnidentifiedFallbackInvalidatesAfterTerminal(t *testing.T
 		t.Fatalf("unidentified delta route = {%p %v %v}, want active channel non-terminal", ch, terminal, invalidateAfterSend)
 	}
 	ch, _, terminal, invalidateAfterSend = sess.routeCodexPayload(conn, []byte(`{"type":"response.completed","response":{"id":"resp-legacy","output":[]}}`))
-	if ch != readCh || !terminal || !invalidateAfterSend {
-		t.Fatalf("unidentified terminal route = {%p %v %v}, want active channel terminal with invalidation", ch, terminal, invalidateAfterSend)
+	if ch != readCh || !terminal || invalidateAfterSend {
+		t.Fatalf("unidentified terminal route = {%p %v %v}, want active channel terminal without routing invalidation", ch, terminal, invalidateAfterSend)
 	}
 }
 
