@@ -815,6 +815,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
+	outputText := &codexOutputTextAccumulator{}
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			if sess != nil {
@@ -867,11 +868,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 		payload = normalizeCodexWebsocketCompletion(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
+		collectCodexOutputTextEvent(payload, outputText)
 		switch eventType {
 		case "response.output_item.done":
 			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
-			payload = patchCodexCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
+			payload = patchCodexCompletedOutputWithText(payload, outputItemsByIndex, outputItemsFallback, outputText)
 			payload = stripCodexWebsocketRequestKey(payload)
 			cacheCodexReasoningReplayFromCompleted(replayScope, payload)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
@@ -1131,6 +1133,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		outputText := &codexOutputTextAccumulator{}
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
@@ -1215,13 +1218,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			payload = stripCodexWebsocketRequestKey(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error"
+			collectCodexOutputTextEvent(payload, outputText)
 			if eventType == "response.output_item.done" {
 				collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 			}
 			completedPayload := payload
 			if eventType == "response.completed" || eventType == "response.done" {
 				completedPayload = normalizeCodexWebsocketCompletion(completedPayload)
-				completedPayload = patchCodexCompletedOutput(completedPayload, outputItemsByIndex, outputItemsFallback)
+				completedPayload = patchCodexCompletedOutputWithText(completedPayload, outputItemsByIndex, outputItemsFallback, outputText)
 				cacheCodexReasoningReplayFromCompleted(replayScope, completedPayload)
 				if detail, ok := helps.ParseCodexUsage(completedPayload); ok {
 					reporter.Publish(ctx, detail)
@@ -1230,6 +1234,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
 			if cliproxyexecutor.DownstreamWebsocket(ctx) {
+				if eventType == "response.completed" || eventType == "response.done" {
+					clientPayload = applyCodexIdentityExposeResponsePayload(completedPayload, identityState)
+				}
 				if !send(cliproxyexecutor.StreamChunk{Payload: clientPayload}) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()

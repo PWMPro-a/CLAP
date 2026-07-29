@@ -561,6 +561,28 @@ func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDow
 		t.Fatal("timed out waiting for first stream chunk")
 	}
 
+	var completedPayload []byte
+	for completedPayload == nil {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				t.Fatal("stream closed before response.completed")
+			}
+			if chunk.Err != nil {
+				t.Fatalf("stream chunk error = %v", chunk.Err)
+			}
+			payload := bytes.TrimSpace(chunk.Payload)
+			if gjson.GetBytes(payload, "type").String() == "response.completed" {
+				completedPayload = append([]byte(nil), payload...)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for response.completed")
+		}
+	}
+	if got := gjson.GetBytes(completedPayload, "response.output.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("patched completed output text = %q, want hello; payload=%s", got, completedPayload)
+	}
+
 	select {
 	case payload := <-capturedPayload:
 		if got := gjson.GetBytes(payload, "model").String(); got != "gpt-5-codex" {
