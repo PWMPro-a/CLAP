@@ -67,6 +67,14 @@ func (inactiveTokenTestError) Error() string {
 
 func (inactiveTokenTestError) StatusCode() int { return http.StatusForbidden }
 
+type deactivatedWorkspaceTestError struct{}
+
+func (deactivatedWorkspaceTestError) Error() string {
+	return `{"detail":{"code":"deactivated_workspace"}}`
+}
+
+func (deactivatedWorkspaceTestError) StatusCode() int { return http.StatusPaymentRequired }
+
 func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
@@ -188,6 +196,36 @@ func TestManager_InactiveTokenExecutionFailureDisablesAuth(t *testing.T) {
 	}
 	if got := store.saveCount.Load(); got != 1 {
 		t.Fatalf("inactive token persistence calls = %d, want 1", got)
+	}
+}
+
+func TestManager_DeactivatedWorkspaceExecutionFailureDisablesAuth(t *testing.T) {
+	ctx := context.Background()
+	store := &requestPrepareStore{}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	auth := &Auth{
+		ID:       "deactivated-workspace",
+		Provider: "codex",
+		Metadata: map[string]any{"email": "x@example.com"},
+	}
+	if _, errRegister := manager.Register(WithSkipPersist(ctx), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	resultErr := resultErrorFromError(deactivatedWorkspaceTestError{})
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5.6-sol",
+		Error:    resultErr,
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || !updated.Disabled || updated.Status != StatusDisabled {
+		t.Fatalf("deactivated workspace auth = %#v, want disabled", updated)
+	}
+	if got := store.saveCount.Load(); got != 1 {
+		t.Fatalf("deactivated workspace persistence calls = %d, want 1", got)
 	}
 }
 

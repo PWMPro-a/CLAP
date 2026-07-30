@@ -155,6 +155,49 @@ func TestCodexWebsocketsExecuteRestoresClaudeAgentReasoningReplay(t *testing.T) 
 	}
 }
 
+func TestCodexWebsocketsExecuteBackfillsEmptyCompletionOutputFromTextDelta(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Fatalf("upgrade websocket: %v", errUpgrade)
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Fatalf("read upstream websocket message: %v", errRead)
+		}
+		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","output_index":0,"item_id":"msg_1","content_index":0,"delta":"hel"}`)); errWrite != nil {
+			t.Fatalf("write delta websocket message: %v", errWrite)
+		}
+		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.done","output_index":0,"item_id":"msg_1","content_index":0,"text":"hello"}`)); errWrite != nil {
+			t.Fatalf("write done websocket message: %v", errWrite)
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-ws-empty","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}
+
+	resp, errExecute := exec.Execute(context.Background(), auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	gotContent := gjson.GetBytes(resp.Payload, "choices.0.message.content").String()
+	if gotContent != "hello" {
+		t.Fatalf("choices.0.message.content = %q, want hello; payload=%s", gotContent, resp.Payload)
+	}
+}
+
 func TestClearCodexReasoningReplayOnWebsocketInvalidSignature(t *testing.T) {
 	internalcache.ClearCodexReasoningReplayCache()
 	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
@@ -420,6 +463,22 @@ func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDow
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for first stream chunk")
+	}
+
+	select {
+	case chunk, ok := <-result.Chunks:
+		if !ok {
+			t.Fatal("stream closed before completed chunk")
+		}
+		if chunk.Err != nil {
+			t.Fatalf("completed chunk error = %v", chunk.Err)
+		}
+		gotContent := gjson.GetBytes(bytes.TrimSpace(chunk.Payload), "response.output.0.content.0.text").String()
+		if gotContent != "hello" {
+			t.Fatalf("completed chunk content = %q, want hello; payload=%s", gotContent, chunk.Payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for completed stream chunk")
 	}
 
 	select {

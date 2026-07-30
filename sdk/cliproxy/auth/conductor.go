@@ -6386,6 +6386,7 @@ func isTerminalCredentialFailure(err error) bool {
 		"refresh_token_invalidated",
 		"token_invalidated",
 		"account_deactivated",
+		"deactivated_workspace",
 		"personal access token owner is inactive",
 		"biscuit_baker_service_auth_credential_error_status",
 	} {
