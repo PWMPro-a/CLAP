@@ -314,6 +314,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if availability, ok := auth.Runtime.(runtimeSelectionAvailability); ok && availability != nil && !availability.RuntimeSelectionAvailable() {
 		return true, blockReasonOther, time.Time{}
 	}
+	if blocked, reason, next := runtimeAuthBlockedForModel(auth, now); blocked {
+		return true, reason, next
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]
@@ -362,6 +365,39 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 			return true, blockReasonCooldown, next
 		}
 		return true, blockReasonOther, next
+	}
+	return false, blockReasonNone, time.Time{}
+}
+
+func runtimeAuthBlockedForModel(auth *Auth, now time.Time) (bool, blockReason, time.Time) {
+	if auth == nil {
+		return true, blockReasonOther, time.Time{}
+	}
+	state := auth.ensureRuntimeLimits()
+	if state == nil {
+		return false, blockReasonNone, time.Time{}
+	}
+	cfg := auth.runtimeLimitConfig()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	state.compactRuntimeWindowLocked(now, cfg)
+	if !state.frozenUntil.IsZero() && state.frozenUntil.After(now) {
+		state.recordSkipLocked("frozen", state.frozenUntil, now)
+		return true, blockReasonCooldown, state.frozenUntil
+	}
+	if cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
+		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
+		return true, blockReasonOther, time.Time{}
+	}
+	if cfg.rateLimitMaxRequests > 0 && state.rateWindowCount >= cfg.rateLimitMaxRequests {
+		until := state.rateWindowStart.Add(time.Duration(cfg.rateLimitWindowSeconds) * time.Second)
+		if until.Before(now) {
+			until = now
+		}
+		state.rateLimitedUntil = until
+		state.recordSkipLocked("rate_limited", until, now)
+		return true, blockReasonCooldown, until
 	}
 	return false, blockReasonNone, time.Time{}
 }
@@ -433,11 +469,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	cacheKey := provider + "::" + primaryID + "::" + model
+	cacheKey := sessionAffinityCacheKey(provider, primaryID, model)
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				if auth.consumeStickyBypass(cacheKey, now) {
+					s.cache.Invalidate(cacheKey)
+					break
+				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
@@ -453,7 +493,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey := provider + "::" + fallbackID + "::" + model
+		fallbackKey := sessionAffinityCacheKey(provider, fallbackID, model)
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
@@ -507,6 +547,20 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	}
 }
 
+// BindAuthSession records an explicit session-to-auth binding. It is used for
+// response id continuity, where the next request references the previous
+// response id instead of repeating a stable client session id.
+func (s *SessionAffinitySelector) BindAuthSession(provider, model, sessionID, authID string) {
+	if s == nil || s.cache == nil {
+		return
+	}
+	cacheKey := sessionAffinityCacheKey(provider, sessionID, model)
+	if cacheKey == "" || strings.TrimSpace(authID) == "" {
+		return
+	}
+	s.cache.Set(cacheKey, strings.TrimSpace(authID))
+}
+
 // ExtractSessionID extracts session identifier from multiple sources.
 // Priority order:
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
@@ -519,6 +573,21 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
+}
+
+func runtimeStickyBypassSessionKey(provider, model string, opts cliproxyexecutor.Options) string {
+	primary, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primary == "" {
+		return ""
+	}
+	return sessionAffinityCacheKey(provider, primary, model)
+}
+
+func sessionAffinityCacheKey(provider, sessionID, model string) string {
+	if strings.TrimSpace(sessionID) == "" {
+		return ""
+	}
+	return provider + "::" + sessionID + "::" + model
 }
 
 // extractSessionIDs returns (primaryID, fallbackID) for session affinity.
@@ -553,6 +622,14 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 
 	// 3. Session_id header (Codex)
 	if headers != nil {
+		if turnMetadata := strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Turn-Metadata")); turnMetadata != "" {
+			if key := codexAffinitySessionKeyFromTurnMetadata(turnMetadata); key != "" {
+				return key, ""
+			}
+		}
+		if windowID := strings.TrimSpace(headerValueCaseInsensitive(headers, "X-Codex-Window-Id")); windowID != "" {
+			return "window:" + windowID, ""
+		}
 		if sid := headers.Get("Session-Id"); sid != "" {
 			return "codex:" + sid, ""
 		}
@@ -561,14 +638,14 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		}
 	}
 
-	// 4. X-Client-Request-Id header (PI)
-	if headers != nil {
-		if rid := headers.Get("X-Client-Request-Id"); rid != "" {
-			return "clientreq:" + rid, ""
-		}
-	}
-
 	if len(payload) == 0 {
+		// 4. X-Client-Request-Id header (PI). This can be per-request, so only
+		// use it when no body is available to provide a more stable key.
+		if headers != nil {
+			if rid := strings.TrimSpace(headers.Get("X-Client-Request-Id")); rid != "" {
+				return "clientreq:" + rid, ""
+			}
+		}
 		return "", ""
 	}
 
@@ -578,13 +655,70 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		return "user:" + userID, ""
 	}
 
-	// 7. conversation_id field
+	// 7. Codex/OpenAI Responses stable continuation fields.
+	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String()); promptCacheKey != "" {
+		return "prompt-cache:" + promptCacheKey, ""
+	}
+	if windowID := strings.TrimSpace(gjson.GetBytes(payload, "client_metadata.x-codex-window-id").String()); windowID != "" {
+		return "window:" + windowID, ""
+	}
+	if turnMetadata := strings.TrimSpace(gjson.GetBytes(payload, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
+		if key := codexAffinitySessionKeyFromTurnMetadata(turnMetadata); key != "" {
+			return key, ""
+		}
+	}
+	if previousResponseID := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()); previousResponseID != "" {
+		return "response:" + previousResponseID, ""
+	}
+	if responseID := strings.TrimSpace(gjson.GetBytes(payload, "response.id").String()); responseID != "" {
+		return "response:" + responseID, ""
+	}
+
+	// X-Client-Request-Id is often unique per request. Keep it below stable
+	// conversation/window/previous_response keys to avoid breaking affinity.
+	if headers != nil {
+		if rid := strings.TrimSpace(headers.Get("X-Client-Request-Id")); rid != "" {
+			return "clientreq:" + rid, ""
+		}
+	}
+
+	// 8. conversation_id field
 	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
 		return "conv:" + convID, ""
 	}
 
-	// 8. Hash-based fallback from message content
+	// 9. Hash-based fallback from message content
 	return extractMessageHashIDs(payload)
+}
+
+func codexAffinitySessionKeyFromTurnMetadata(turnMetadata string) string {
+	if promptCacheKey := strings.TrimSpace(gjson.Get(turnMetadata, "prompt_cache_key").String()); promptCacheKey != "" {
+		return "prompt-cache:" + promptCacheKey
+	}
+	if windowID := strings.TrimSpace(gjson.Get(turnMetadata, "window_id").String()); windowID != "" {
+		return "window:" + windowID
+	}
+	return ""
+}
+
+func headerValueCaseInsensitive(headers http.Header, key string) string {
+	if headers == nil || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	if value := strings.TrimSpace(headers.Get(key)); value != "" {
+		return value
+	}
+	for name, values := range headers {
+		if !strings.EqualFold(name, key) {
+			continue
+		}
+		for _, value := range values {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
 }
 
 func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {

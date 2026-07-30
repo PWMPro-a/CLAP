@@ -96,8 +96,9 @@ type Auth struct {
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
 
-	recentRequests recentRequestRing `json:"-"`
-	indexAssigned  bool              `json:"-"`
+	recentRequests recentRequestRing  `json:"-"`
+	indexAssigned  bool               `json:"-"`
+	runtimeLimits  *authRuntimeLimits `json:"-"`
 }
 
 // RuntimeAuthView is a minimal read-only projection for callers that only need
@@ -272,6 +273,7 @@ func (a *Auth) Clone() *Auth {
 		return nil
 	}
 	copyAuth := *a
+	copyAuth.runtimeLimits = a.ensureRuntimeLimits()
 	if len(a.Attributes) > 0 {
 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
 		for key, value := range a.Attributes {

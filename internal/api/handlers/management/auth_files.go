@@ -512,6 +512,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						}
 					}
 				}
+				applyAuthFileRuntimeLimitFieldsFromJSON(fileData, data)
 			}
 
 			files = append(files, fileData)
@@ -644,7 +645,128 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if runtime, ok := auth.Runtime.(agentIdentityRegistrationRuntime); ok && runtime != nil {
 		entry["agent_identity_registration"] = runtime.RegistrationStatus()
 	}
+	applyAuthFileRuntimeLimitFields(entry, auth)
 	return entry
+}
+
+func applyAuthFileRuntimeLimitFields(entry gin.H, auth *coreauth.Auth) {
+	if entry == nil || auth == nil {
+		return
+	}
+	metadata := auth.Metadata
+	if v, ok := authFileMetadataInt(metadata, "max_concurrency", "max-concurrency", "maxConcurrency"); ok {
+		entry["max_concurrency"] = v
+	}
+	if v, ok := authFileMetadataInt(metadata, "rate_limit_max_requests", "rate-limit-max-requests", "rateLimitMaxRequests"); ok {
+		entry["rate_limit_max_requests"] = v
+	}
+	if v, ok := authFileMetadataInt(metadata, "rate_limit_window_seconds", "rate-limit-window-seconds", "rateLimitWindowSeconds"); ok {
+		entry["rate_limit_window_seconds"] = v
+	}
+	if v, ok := authFileMetadataInt(metadata, "selection_error_freeze_seconds", "selection-error-freeze-seconds", "selectionErrorFreezeSeconds"); ok {
+		entry["selection_error_freeze_seconds"] = v
+	}
+	if v, ok := authFileMetadataBool(metadata, "disable_sticky_on_next_request", "disable-sticky-on-next-request", "disableStickyOnNextRequest"); ok {
+		entry["disable_sticky_on_next_request"] = v
+	}
+	snapshot := auth.RuntimeLimitSnapshot(time.Now())
+	entry["runtime_current_concurrency"] = snapshot.CurrentConcurrency
+	if !snapshot.FrozenUntil.IsZero() {
+		entry["runtime_frozen_until"] = snapshot.FrozenUntil
+	}
+	if !snapshot.RateLimitedUntil.IsZero() {
+		entry["runtime_rate_limited_until"] = snapshot.RateLimitedUntil
+	}
+	if snapshot.LastSkipReason != "" {
+		entry["runtime_last_skip_reason"] = snapshot.LastSkipReason
+	}
+}
+
+func applyAuthFileRuntimeLimitFieldsFromJSON(entry gin.H, data []byte) {
+	if entry == nil || len(data) == 0 {
+		return
+	}
+	if pv := gjson.GetBytes(data, "max_concurrency"); pv.Exists() {
+		if v, ok := gjsonValueToInt(pv); ok {
+			entry["max_concurrency"] = v
+		}
+	}
+	if pv := gjson.GetBytes(data, "rate_limit_max_requests"); pv.Exists() {
+		if v, ok := gjsonValueToInt(pv); ok {
+			entry["rate_limit_max_requests"] = v
+		}
+	}
+	if pv := gjson.GetBytes(data, "rate_limit_window_seconds"); pv.Exists() {
+		if v, ok := gjsonValueToInt(pv); ok {
+			entry["rate_limit_window_seconds"] = v
+		}
+	}
+	if pv := gjson.GetBytes(data, "selection_error_freeze_seconds"); pv.Exists() {
+		if v, ok := gjsonValueToInt(pv); ok {
+			entry["selection_error_freeze_seconds"] = v
+		}
+	}
+	if pv := gjson.GetBytes(data, "disable_sticky_on_next_request"); pv.Exists() {
+		if v, ok := gjsonValueToBool(pv); ok {
+			entry["disable_sticky_on_next_request"] = v
+		}
+	}
+}
+
+func authFileMetadataInt(metadata map[string]any, keys ...string) (int, bool) {
+	if len(metadata) == 0 {
+		return 0, false
+	}
+	for _, key := range keys {
+		if value, ok := metadata[key]; ok {
+			if parsed, okParse := authFileIntValue(value); okParse {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func authFileMetadataBool(metadata map[string]any, keys ...string) (bool, bool) {
+	if len(metadata) == 0 {
+		return false, false
+	}
+	for _, key := range keys {
+		if value, ok := metadata[key]; ok {
+			if parsed, okParse := authFileBoolValue(value); okParse {
+				return parsed, true
+			}
+		}
+	}
+	return false, false
+}
+
+func gjsonValueToInt(value gjson.Result) (int, bool) {
+	switch value.Type {
+	case gjson.Number:
+		return int(value.Int()), true
+	case gjson.String:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value.String())); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func gjsonValueToBool(value gjson.Result) (bool, bool) {
+	switch value.Type {
+	case gjson.True:
+		return true, true
+	case gjson.False:
+		return false, true
+	case gjson.String:
+		if parsed, err := strconv.ParseBool(strings.TrimSpace(value.String())); err == nil {
+			return parsed, true
+		}
+	case gjson.Number:
+		return value.Int() != 0, true
+	}
+	return false, false
 }
 
 func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {

@@ -225,6 +225,9 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		if entry == nil || entry.auth == nil {
 			return false
 		}
+		if blocked, _, _ := runtimeAuthBlockedForModel(entry.auth, time.Now()); blocked {
+			return false
+		}
 		if pinnedAuthID != "" && entry.auth.ID != pinnedAuthID {
 			return false
 		}
@@ -298,6 +301,9 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
 				return false
 			}
+			if blocked, _, _ := runtimeAuthBlockedForModel(entry.auth, time.Now()); blocked {
+				return false
+			}
 			if len(tried) == 0 {
 				return true
 			}
@@ -310,11 +316,11 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
-	predicate := triedPredicate(tried)
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
 	now := time.Now()
+	predicate := triedPredicate(tried, modelKey, now)
 	for providerIndex, providerKey := range normalized {
 		providerState := s.providers[providerKey]
 		if providerState == nil {
@@ -411,6 +417,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
 func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, tried map[string]struct{}) error {
 	now := time.Now()
+	modelKey := canonicalModelKey(model)
 	total := 0
 	cooldownCount := 0
 	earliest := time.Time{}
@@ -423,7 +430,7 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if shard == nil {
 			continue
 		}
-		localTotal, localCooldownCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried))
+		localTotal, localCooldownCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried, modelKey, now))
 		total += localTotal
 		cooldownCount += localCooldownCount
 		if !localEarliest.IsZero() && (earliest.IsZero() || localEarliest.Before(earliest)) {
@@ -444,17 +451,24 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
-func triedPredicate(tried map[string]struct{}) func(*scheduledAuth) bool {
+func triedPredicate(tried map[string]struct{}, model string, now time.Time) func(*scheduledAuth) bool {
 	if len(tried) == 0 {
-		return func(entry *scheduledAuth) bool { return entry != nil && entry.auth != nil }
+		return func(entry *scheduledAuth) bool {
+			return entry != nil && entry.auth != nil && !runtimeAuthBlockedForPredicate(entry.auth, now)
+		}
 	}
 	return func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
 			return false
 		}
 		_, ok := tried[entry.auth.ID]
-		return !ok
+		return !ok && !runtimeAuthBlockedForPredicate(entry.auth, now)
 	}
+}
+
+func runtimeAuthBlockedForPredicate(auth *Auth, now time.Time) bool {
+	blocked, _, _ := runtimeAuthBlockedForModel(auth, now)
+	return blocked
 }
 
 // normalizeProviderKeys lowercases, trims, and de-duplicates provider keys while preserving order.

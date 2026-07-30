@@ -29,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -1772,7 +1773,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, affinityModel, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -1811,6 +1812,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			if len(payload) == 0 {
 				return true
 			}
+			m.bindSessionAffinityFromResponsePayload(ctx, provider, affinityModel, auth.ID, payload)
 			chunk.Payload = payload
 			if ctx == nil {
 				out <- chunk
@@ -1959,7 +1961,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, resultModel, streamResult.Headers, buffered, remaining, aliasResult), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -2209,6 +2211,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
+	auth.runtimeLimits = existing.runtimeLimits
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
@@ -2576,15 +2579,21 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+		execCtx = contextWithRuntimeStickyBypassSession(execCtx, runtimeStickyBypassSessionKey(provider, routeModel, opts))
 
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
+		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlot(time.Now())
+		if !acquired {
+			continue
+		}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			releaseRuntimeSlot(releaseRuntime)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -2604,6 +2613,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					releaseRuntimeSlot(releaseRuntime)
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
@@ -2625,6 +2635,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					releaseRuntimeSlot(releaseRuntime)
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -2632,16 +2643,20 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			m.MarkResult(execCtx, result)
 			rewriteForceMappedResponse(&resp, aliasResult)
+			m.bindSessionAffinityFromResponsePayload(execCtx, provider, routeModel, auth.ID, resp.Payload)
+			releaseRuntimeSlot(releaseRuntime)
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				releaseRuntimeSlot(releaseRuntime)
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
 			}
+			releaseRuntimeSlot(releaseRuntime)
 			continue
 		}
 	}
@@ -2689,15 +2704,21 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+		execCtx = contextWithRuntimeStickyBypassSession(execCtx, runtimeStickyBypassSessionKey(provider, routeModel, opts))
 
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
+		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlot(time.Now())
+		if !acquired {
+			continue
+		}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			releaseRuntimeSlot(releaseRuntime)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -2717,6 +2738,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					releaseRuntimeSlot(releaseRuntime)
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
@@ -2746,6 +2768,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					m.MarkResult(execCtx, result)
 				}
 				if isRequestInvalidError(errExec) {
+					releaseRuntimeSlot(releaseRuntime)
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -2753,16 +2776,20 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			m.MarkResult(execCtx, result)
 			rewriteForceMappedResponse(&resp, aliasResult)
+			m.bindSessionAffinityFromResponsePayload(execCtx, provider, routeModel, auth.ID, resp.Payload)
+			releaseRuntimeSlot(releaseRuntime)
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				releaseRuntimeSlot(releaseRuntime)
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
 			}
+			releaseRuntimeSlot(releaseRuntime)
 			continue
 		}
 	}
@@ -2809,14 +2836,20 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		execCtx = contextWithRuntimeStickyBypassSession(execCtx, runtimeStickyBypassSessionKey(provider, routeModel, opts))
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
+		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlot(time.Now())
+		if !acquired {
+			continue
+		}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			releaseRuntimeSlot(releaseRuntime)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -2830,18 +2863,21 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, streamExecutionModel, models, pooled, aliasResult)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
+				releaseRuntimeSlot(releaseRuntime)
 				return nil, errCtx
 			}
 			if isRequestInvalidError(errStream) {
+				releaseRuntimeSlot(releaseRuntime)
 				return nil, errStream
 			}
 			lastErr = errStream
 			if homeMode {
 				homeAuthCount++
 			}
+			releaseRuntimeSlot(releaseRuntime)
 			continue
 		}
-		return streamResult, nil
+		return wrapStreamResultWithRuntimeRelease(execCtx, streamResult, releaseRuntime), nil
 	}
 }
 
@@ -3035,6 +3071,60 @@ func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.O
 		ctx = coreusage.WithGenerate(ctx, generate)
 	}
 	return ctx
+}
+
+type sessionAffinityBinder interface {
+	BindAuthSession(provider, model, sessionID, authID string)
+}
+
+func (m *Manager) bindSessionAffinityFromResponsePayload(ctx context.Context, provider, model, authID string, payload []byte) {
+	if m == nil || len(payload) == 0 || strings.TrimSpace(authID) == "" {
+		return
+	}
+	binder, ok := m.selector.(sessionAffinityBinder)
+	if !ok || binder == nil {
+		return
+	}
+	for _, responseID := range responseSessionAffinityIDs(payload) {
+		binder.BindAuthSession(provider, model, "response:"+responseID, authID)
+	}
+}
+
+func responseSessionAffinityIDs(payload []byte) []string {
+	if len(payload) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, 2)
+	out := make([]string, 0, 2)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	collectJSON := func(data []byte) {
+		data = bytes.TrimSpace(data)
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			return
+		}
+		add(gjson.GetBytes(data, "id").String())
+		add(gjson.GetBytes(data, "response.id").String())
+	}
+
+	collectJSON(payload)
+	for _, line := range bytes.Split(payload, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		collectJSON(bytes.TrimSpace(line[len("data:"):]))
+	}
+	return out
 }
 
 func requestedModelAliasFromOptions(opts cliproxyexecutor.Options, fallback string) string {
@@ -3888,6 +3978,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
+		auth.maybeFreezeRuntimeResult(result, now, runtimeStickyBypassSessionFromContext(ctx))
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
