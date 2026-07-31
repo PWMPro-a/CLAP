@@ -108,19 +108,14 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 				if err == nil {
 					helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid historical message id at input[%d] item_id=%q", provider, index, itemID)
 				}
-			case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output":
-				// Older Responses transcripts use item_* for tool items. The Codex
-				// backend validates a type-specific ID prefix. Preserve the suffix and
-				// call_id so tool result items remain tied to their invocation.
-				prefix := map[string]string{
-					"function_call":           "fc_",
-					"function_call_output":    "fco_",
-					"custom_tool_call":        "ctc_",
-					"custom_tool_call_output": "ctco_",
-				}[itemType]
-				nextItem, err = sjson.Set(itemRaw, "id", prefix+strings.TrimPrefix(itemID, "item_"))
+			case "function_call":
+				// Older Responses transcripts use item_* for function calls. The
+				// Codex backend now validates function_call IDs and requires fc_*.
+				// Preserve the suffix and call_id so following function_call_output
+				// items remain associated with the original invocation.
+				nextItem, err = sjson.Set(itemRaw, "id", "fc_"+strings.TrimPrefix(itemID, "item_"))
 				if err == nil {
-					helps.LogWithRequestID(ctx).Debugf("%s: normalized legacy %s id at input[%d] item_id=%q", provider, itemType, index, itemID)
+					helps.LogWithRequestID(ctx).Debugf("%s: normalized legacy function call id at input[%d] item_id=%q", provider, index, itemID)
 				}
 			default:
 				keepCurrentItem()
