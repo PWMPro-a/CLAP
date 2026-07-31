@@ -62,25 +62,44 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 
 	for index, item := range items {
 		itemType := strings.TrimSpace(item.Get("type").String())
-		if itemType == "message" {
-			itemIDResult := item.Get("id")
-			itemID := strings.TrimSpace(itemIDResult.String())
-			// Historical Responses transcripts can contain item_* IDs on message
-			// items. Codex rejects that specific shape and expects a msg_* ID (or
-			// no ID for an input message). Keep other message ID formats intact;
-			// callers may rely on them for replay correlation.
-			if itemIDResult.Exists() && strings.HasPrefix(itemID, "item_") {
-				nextItem, err := sjson.Delete(item.Raw, "id")
-				if err != nil {
-					helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid message id at input[%d]: %v", provider, index, err)
-					keep(item.Raw)
-					continue
+		itemIDResult := item.Get("id")
+		itemID := strings.TrimSpace(itemIDResult.String())
+		if itemIDResult.Exists() && strings.HasPrefix(itemID, "item_") {
+			var (
+				nextItem string
+				err      error
+			)
+
+			switch itemType {
+			case "message":
+				// Historical Responses transcripts can contain item_* IDs on message
+				// items. Codex expects a msg_* ID (or no ID for an input message).
+				nextItem, err = sjson.Delete(item.Raw, "id")
+				if err == nil {
+					helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid historical message id at input[%d] item_id=%q", provider, index, itemID)
 				}
-				startRebuild(index)
-				keep(nextItem)
-				helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid historical message id at input[%d] item_id=%q", provider, index, itemID)
+			case "function_call":
+				// Older Responses transcripts use item_* for function calls. The
+				// Codex backend now validates function_call IDs and requires fc_*.
+				// Preserve the suffix and call_id so following function_call_output
+				// items remain associated with the original invocation.
+				nextItem, err = sjson.Set(item.Raw, "id", "fc_"+strings.TrimPrefix(itemID, "item_"))
+				if err == nil {
+					helps.LogWithRequestID(ctx).Debugf("%s: normalized legacy function call id at input[%d] item_id=%q", provider, index, itemID)
+				}
+			default:
+				keep(item.Raw)
 				continue
 			}
+
+			if err != nil {
+				helps.LogWithRequestID(ctx).Debugf("%s: failed to sanitize historical %s id at input[%d]: %v", provider, itemType, index, err)
+				keep(item.Raw)
+				continue
+			}
+			startRebuild(index)
+			keep(nextItem)
+			continue
 		}
 		if itemType != "reasoning" {
 			keep(item.Raw)
@@ -88,7 +107,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 		}
 
 		encryptedContent := item.Get("encrypted_content")
-		itemID := strings.TrimSpace(item.Get("id").String())
+		itemID = strings.TrimSpace(item.Get("id").String())
 		if itemID == "" {
 			itemID = fmt.Sprintf("input[%d]", index)
 		}

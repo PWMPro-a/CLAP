@@ -101,3 +101,22 @@ func TestSanitizeOpenAIResponsesReasoningEncryptedContent_StripsInvalidMessageID
 		t.Fatalf("message content changed while stripping id: %s", got)
 	}
 }
+
+func TestSanitizeOpenAIResponsesReasoningEncryptedContent_NormalizesLegacyFunctionCallIDs(t *testing.T) {
+	body := []byte(`{"store":false,"input":[` +
+		`{"id":"item_legacy_call","type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"},` +
+		`{"id":"fco_123","type":"function_call_output","call_id":"call_123","output":"ok"}` +
+		`]}`)
+
+	got := sanitizeOpenAIResponsesReasoningEncryptedContent(context.Background(), "test", body)
+
+	if gotID := gjson.GetBytes(got, "input.0.id").String(); gotID != "fc_legacy_call" {
+		t.Fatalf("function call id = %q, want fc_legacy_call; body=%s", gotID, got)
+	}
+	if gotCallID := gjson.GetBytes(got, "input.0.call_id").String(); gotCallID != "call_123" {
+		t.Fatalf("function call call_id = %q, want call_123; body=%s", gotCallID, got)
+	}
+	if gotOutputCallID := gjson.GetBytes(got, "input.1.call_id").String(); gotOutputCallID != "call_123" {
+		t.Fatalf("function call output call_id = %q, want call_123; body=%s", gotOutputCallID, got)
+	}
+}
