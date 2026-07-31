@@ -120,35 +120,3 @@ func TestSanitizeOpenAIResponsesReasoningEncryptedContent_NormalizesLegacyFuncti
 		t.Fatalf("function call output call_id = %q, want call_123; body=%s", gotOutputCallID, got)
 	}
 }
-
-func TestSanitizeOpenAIResponsesReasoningEncryptedContent_NormalizesLegacyReasoningIDs(t *testing.T) {
-	valid := validOpenAIResponsesReasoningEncryptedContentForTest()
-	body := []byte(`{"store":false,"input":[` +
-		`{"id":"item_null_signature","type":"reasoning","encrypted_content":null,"summary":[]},` +
-		`{"id":"item_valid_signature","type":"reasoning","encrypted_content":"` + valid + `","summary":[]}` +
-		`]}`)
-
-	got := sanitizeOpenAIResponsesReasoningEncryptedContent(context.Background(), "test", body)
-
-	if gjson.GetBytes(got, "input.0.id").Exists() {
-		t.Fatalf("store=false invalid reasoning id should be stripped: %s", got)
-	}
-	if gjson.GetBytes(got, "input.0.encrypted_content").Exists() {
-		t.Fatalf("null encrypted_content should be stripped: %s", got)
-	}
-	if gotID := gjson.GetBytes(got, "input.1.id").String(); gotID != "rs_valid_signature" {
-		t.Fatalf("valid legacy reasoning id = %q, want rs_valid_signature; body=%s", gotID, got)
-	}
-	if gotEncryptedContent := gjson.GetBytes(got, "input.1.encrypted_content").String(); gotEncryptedContent != valid {
-		t.Fatalf("valid encrypted_content changed: %s", got)
-	}
-
-	storeEnabled := []byte(`{"store":true,"input":[{"id":"item_null_signature","type":"reasoning","encrypted_content":null,"summary":[]}]}`)
-	storeEnabledGot := sanitizeOpenAIResponsesReasoningEncryptedContent(context.Background(), "test", storeEnabled)
-	if gotID := gjson.GetBytes(storeEnabledGot, "input.0.id").String(); gotID != "rs_null_signature" {
-		t.Fatalf("store=true invalid reasoning id = %q, want rs_null_signature; body=%s", gotID, storeEnabledGot)
-	}
-	if gjson.GetBytes(storeEnabledGot, "input.0.encrypted_content").Exists() {
-		t.Fatalf("store=true null encrypted_content should be stripped: %s", storeEnabledGot)
-	}
-}
