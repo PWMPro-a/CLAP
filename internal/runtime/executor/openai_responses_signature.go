@@ -62,36 +62,6 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 
 	for index, item := range items {
 		itemType := strings.TrimSpace(item.Get("type").String())
-		itemRaw := item.Raw
-		itemChanged := false
-		role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
-		content := item.Get("content")
-		if content.Exists() && content.IsArray() {
-			textPartType := "input_text"
-			if role == "assistant" {
-				textPartType = "output_text"
-			}
-			for contentIndex, part := range content.Array() {
-				if strings.TrimSpace(part.Get("type").String()) != "text" {
-					continue
-				}
-				nextItem, err := sjson.Set(itemRaw, fmt.Sprintf("content.%d.type", contentIndex), textPartType)
-				if err != nil {
-					helps.LogWithRequestID(ctx).Debugf("%s: failed to normalize legacy text content at input[%d].content[%d]: %v", provider, index, contentIndex, err)
-					continue
-				}
-				itemRaw = nextItem
-				itemChanged = true
-				helps.LogWithRequestID(ctx).Debugf("%s: normalized legacy text content at input[%d].content[%d] role=%q", provider, index, contentIndex, role)
-			}
-		}
-		keepCurrentItem := func() {
-			if itemChanged {
-				startRebuild(index)
-			}
-			keep(itemRaw)
-		}
-
 		itemIDResult := item.Get("id")
 		itemID := strings.TrimSpace(itemIDResult.String())
 		if itemType != "reasoning" && itemIDResult.Exists() && strings.HasPrefix(itemID, "item_") {
@@ -104,7 +74,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 			case "message":
 				// Historical Responses transcripts can contain item_* IDs on message
 				// items. Codex expects a msg_* ID (or no ID for an input message).
-				nextItem, err = sjson.Delete(itemRaw, "id")
+				nextItem, err = sjson.Delete(item.Raw, "id")
 				if err == nil {
 					helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid historical message id at input[%d] item_id=%q", provider, index, itemID)
 				}
@@ -113,18 +83,18 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 				// Codex backend now validates function_call IDs and requires fc_*.
 				// Preserve the suffix and call_id so following function_call_output
 				// items remain associated with the original invocation.
-				nextItem, err = sjson.Set(itemRaw, "id", "fc_"+strings.TrimPrefix(itemID, "item_"))
+				nextItem, err = sjson.Set(item.Raw, "id", "fc_"+strings.TrimPrefix(itemID, "item_"))
 				if err == nil {
 					helps.LogWithRequestID(ctx).Debugf("%s: normalized legacy function call id at input[%d] item_id=%q", provider, index, itemID)
 				}
 			default:
-				keepCurrentItem()
+				keep(item.Raw)
 				continue
 			}
 
 			if err != nil {
 				helps.LogWithRequestID(ctx).Debugf("%s: failed to sanitize historical %s id at input[%d]: %v", provider, itemType, index, err)
-				keepCurrentItem()
+				keep(item.Raw)
 				continue
 			}
 			startRebuild(index)
@@ -132,7 +102,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 			continue
 		}
 		if itemType != "reasoning" {
-			keepCurrentItem()
+			keep(item.Raw)
 			continue
 		}
 
@@ -145,10 +115,10 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 
 		if !encryptedContent.Exists() {
 			if stripOrphanReasoningIDs && item.Get("id").Exists() {
-				nextItem, err := sjson.Delete(itemRaw, "id")
+				nextItem, err := sjson.Delete(item.Raw, "id")
 				if err != nil {
 					helps.LogWithRequestID(ctx).Debugf("%s: failed to drop orphan reasoning id at input[%d]: %v", provider, index, err)
-					keepCurrentItem()
+					keep(item.Raw)
 					continue
 				}
 				startRebuild(index)
@@ -157,10 +127,10 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 				continue
 			}
 			if legacyReasoningID {
-				nextItem, err := sjson.Set(itemRaw, "id", "rs_"+strings.TrimPrefix(itemID, "item_"))
+				nextItem, err := sjson.Set(item.Raw, "id", "rs_"+strings.TrimPrefix(itemID, "item_"))
 				if err != nil {
 					helps.LogWithRequestID(ctx).Debugf("%s: failed to normalize orphan reasoning id at input[%d]: %v", provider, index, err)
-					keepCurrentItem()
+					keep(item.Raw)
 					continue
 				}
 				startRebuild(index)
@@ -168,7 +138,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 				helps.LogWithRequestID(ctx).Debugf("%s: normalized legacy orphan reasoning id at input[%d] item_id=%q", provider, index, itemID)
 				continue
 			}
-			keepCurrentItem()
+			keep(item.Raw)
 			continue
 		}
 
@@ -188,10 +158,10 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 		}
 		if reason == "" {
 			if legacyReasoningID {
-				nextItem, err := sjson.Set(itemRaw, "id", "rs_"+strings.TrimPrefix(itemID, "item_"))
+				nextItem, err := sjson.Set(item.Raw, "id", "rs_"+strings.TrimPrefix(itemID, "item_"))
 				if err != nil {
 					helps.LogWithRequestID(ctx).Debugf("%s: failed to normalize legacy reasoning id at input[%d]: %v", provider, index, err)
-					keepCurrentItem()
+					keep(item.Raw)
 					continue
 				}
 				startRebuild(index)
@@ -199,14 +169,14 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 				helps.LogWithRequestID(ctx).Debugf("%s: normalized legacy reasoning id at input[%d] item_id=%q", provider, index, itemID)
 				continue
 			}
-			keepCurrentItem()
+			keep(item.Raw)
 			continue
 		}
 
-		nextItem, err := sjson.Delete(itemRaw, "encrypted_content")
+		nextItem, err := sjson.Delete(item.Raw, "encrypted_content")
 		if err != nil {
 			helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning encrypted_content at input[%d]: %v", provider, index, err)
-			keepCurrentItem()
+			keep(item.Raw)
 			continue
 		}
 		if stripOrphanReasoningIDs && item.Get("id").Exists() {

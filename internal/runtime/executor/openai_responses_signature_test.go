@@ -152,29 +152,3 @@ func TestSanitizeOpenAIResponsesReasoningEncryptedContent_NormalizesLegacyReason
 		t.Fatalf("store=true null encrypted_content should be stripped: %s", storeEnabledGot)
 	}
 }
-
-func TestSanitizeOpenAIResponsesReasoningEncryptedContent_NormalizesLegacyTextContent(t *testing.T) {
-	body := []byte(`{"input":[` +
-		`{"role":"user","content":[{"type":"text","text":"question"},{"type":"image_url","image_url":"https://example.test/image.png"}]},` +
-		`{"type":"message","role":"assistant","content":[{"type":"text","text":"answer"}]},` +
-		`{"id":"item_legacy_message","type":"message","role":"assistant","content":[{"type":"text","text":"history"}]}` +
-		`]}`)
-
-	got := sanitizeOpenAIResponsesReasoningEncryptedContent(context.Background(), "test", body)
-
-	if gotType := gjson.GetBytes(got, "input.0.content.0.type").String(); gotType != "input_text" {
-		t.Fatalf("user text content type = %q, want input_text; body=%s", gotType, got)
-	}
-	if gotType := gjson.GetBytes(got, "input.0.content.1.type").String(); gotType != "image_url" {
-		t.Fatalf("image content type = %q, want image_url; body=%s", gotType, got)
-	}
-	if gotType := gjson.GetBytes(got, "input.1.content.0.type").String(); gotType != "output_text" {
-		t.Fatalf("assistant text content type = %q, want output_text; body=%s", gotType, got)
-	}
-	if gjson.GetBytes(got, "input.2.id").Exists() {
-		t.Fatalf("legacy assistant message id should be stripped: %s", got)
-	}
-	if gotType := gjson.GetBytes(got, "input.2.content.0.type").String(); gotType != "output_text" {
-		t.Fatalf("legacy assistant content type = %q, want output_text; body=%s", gotType, got)
-	}
-}
