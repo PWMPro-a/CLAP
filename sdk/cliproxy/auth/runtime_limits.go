@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -30,6 +31,10 @@ type authRuntimeLimits struct {
 	lastSkipReason         string
 	lastSkipRecordedAt     time.Time
 	lastSkipRecoveryTarget time.Time
+
+	// codexQuotaSnapshots is replaced atomically by the asynchronous quota
+	// collector. Request-time reads remain lock-free.
+	codexQuotaSnapshots atomic.Value
 }
 
 var runtimeLimitsInitMu sync.Mutex
@@ -185,6 +190,10 @@ func (a *Auth) markStickyBypassForSession(sessionKey string, now time.Time) {
 }
 
 func (a *Auth) acquireRuntimeSlot(now time.Time) (release func(), ok bool, reason string, retryAt time.Time) {
+	return a.acquireRuntimeSlotWithTailBurst(now, false)
+}
+
+func (a *Auth) acquireRuntimeSlotWithTailBurst(now time.Time, tailBurst bool) (release func(), ok bool, reason string, retryAt time.Time) {
 	if a == nil {
 		return nil, false, "missing_auth", time.Time{}
 	}
@@ -201,7 +210,7 @@ func (a *Auth) acquireRuntimeSlot(now time.Time) (release func(), ok bool, reaso
 		state.recordSkipLocked("frozen", state.frozenUntil, now)
 		return nil, false, "frozen", state.frozenUntil
 	}
-	if cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
+	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return nil, false, "concurrency_limit", time.Time{}
 	}

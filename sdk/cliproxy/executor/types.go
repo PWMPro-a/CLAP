@@ -31,6 +31,10 @@ const ServiceTierMetadataKey = "service_tier"
 // Missing or true means generation is enabled; only an explicit false disables generation.
 const GenerateMetadataKey = "generate"
 
+// CodexTailBurstMetadataKey marks an internally selected Codex request that
+// is executing in the credential's quota-tail drain mode.
+const CodexTailBurstMetadataKey = "__cliproxy_codex_tail_burst"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

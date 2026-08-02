@@ -190,6 +190,15 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # Temporarily prioritize a credential after an external quota collector reports
+  # that the current model window is almost exhausted.
+  tail-burst:
+    enabled: false
+    trigger-used-ratio: 0.98
+    snapshot-ttl: "90s"
+    tool-injection:
+      enabled: true
+      model-allowlist: []
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true

@@ -253,6 +253,11 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
+	// codexTailBurstCandidates contains the small, asynchronously maintained
+	// index of credentials eligible for quota-tail drain routing.
+	codexTailBurstCandidates atomic.Value
+	codexTailBurstSequence   atomic.Uint64
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
@@ -286,6 +291,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
+	manager.codexTailBurstCandidates.Store(codexTailBurstCandidateIndex{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
@@ -513,6 +519,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	m.refreshCodexTailBurstCandidates()
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if !cfg.Home.Enabled {
 		m.clearHomeRuntimeAuths()
@@ -1185,6 +1192,10 @@ func executionResultModel(routeModel, upstreamModel string, pooled bool) string 
 }
 
 func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
+	return m.filterExecutionModelsWithTailBurst(auth, routeModel, candidates, pooled, false)
+}
+
+func (m *Manager) filterExecutionModelsWithTailBurst(auth *Auth, routeModel string, candidates []string, pooled bool, tailBurst bool) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -1192,7 +1203,7 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
 		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
-		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
+		blocked, _, _ := isAuthBlockedForModelWithTailBurst(auth, stateModel, now, tailBurst)
 		if blocked {
 			continue
 		}
@@ -1208,8 +1219,12 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]stri
 }
 
 func (m *Manager) preparedExecutionModelsWithAlias(auth *Auth, routeModel string) ([]string, bool, OAuthModelAliasResult) {
+	return m.preparedExecutionModelsWithAliasForTailBurst(auth, routeModel, false)
+}
+
+func (m *Manager) preparedExecutionModelsWithAliasForTailBurst(auth *Auth, routeModel string, tailBurst bool) ([]string, bool, OAuthModelAliasResult) {
 	candidates, pooled, aliasResult := m.executionModelCandidatesWithAlias(auth, routeModel)
-	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled, aliasResult
+	return m.filterExecutionModelsWithTailBurst(auth, routeModel, candidates, pooled, tailBurst), pooled, aliasResult
 }
 
 func (m *Manager) executionModelCandidatesWithAlias(auth *Auth, routeModel string) ([]string, bool, OAuthModelAliasResult) {
@@ -2175,6 +2190,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	m.refreshCodexTailBurstCandidates()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -2226,6 +2242,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	m.refreshCodexTailBurstCandidates()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -2274,6 +2291,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		}
 	}
 	m.mu.Unlock()
+	m.refreshCodexTailBurstCandidates()
 
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -2330,6 +2348,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
 	m.syncScheduler()
+	m.refreshCodexTailBurstCandidates()
 	return nil
 }
 
@@ -2541,6 +2560,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	opts = m.withCodexTailBurstRequestMetadata(ctx, providers, req, opts)
 	routeModel := authSelectionModelFromOptions(opts, req.Model)
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
@@ -2581,12 +2601,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		execCtx = contextWithRuntimeStickyBypassSession(execCtx, runtimeStickyBypassSessionKey(provider, routeModel, opts))
 
-		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
+		tailBurst := codexTailBurstRequested(opts) && m.codexTailBurstActive(auth, routeModel, time.Now())
+		models, pooled, aliasResult := m.preparedExecutionModelsWithAliasForTailBurst(auth, routeModel, tailBurst)
 		if len(models) == 0 {
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
-		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlot(time.Now())
+		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlotWithTailBurst(time.Now(), tailBurst)
 		if !acquired {
 			continue
 		}
@@ -2609,6 +2630,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				execReq.Model = executionModel
 			}
 			execOpts := opts
+			if tailBurst {
+				execOpts = withCodexTailBurstSelected(execOpts)
+			}
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
@@ -2799,6 +2823,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	opts = m.withCodexTailBurstRequestMetadata(ctx, providers, req, opts)
 	routeModel := authSelectionModelFromOptions(opts, req.Model)
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
@@ -2837,12 +2862,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRuntimeStickyBypassSession(execCtx, runtimeStickyBypassSessionKey(provider, routeModel, opts))
-		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
+
+		tailBurst := codexTailBurstRequested(opts) && m.codexTailBurstActive(auth, routeModel, time.Now())
+		models, pooled, aliasResult := m.preparedExecutionModelsWithAliasForTailBurst(auth, routeModel, tailBurst)
 		if len(models) == 0 {
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
-		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlot(time.Now())
+		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlotWithTailBurst(time.Now(), tailBurst)
 		if !acquired {
 			continue
 		}
@@ -2860,7 +2887,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if restoreExecutionModel {
 			streamExecutionModel = executionModel
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, streamExecutionModel, models, pooled, aliasResult)
+		execOpts := opts
+		if tailBurst {
+			execOpts = withCodexTailBurstSelected(execOpts)
+		}
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				releaseRuntimeSlot(releaseRuntime)
@@ -5091,6 +5122,11 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		if auth, executor, ok := m.pickCodexTailBurstAuth(model, opts, tried); ok {
+			return auth, executor, nil
+		}
+	}
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
@@ -5256,6 +5292,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	if hasCodexProvider(providers) {
+		if auth, executor, ok := m.pickCodexTailBurstAuth(model, opts, tried); ok {
+			return auth, executor, "codex", nil
+		}
+	}
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}

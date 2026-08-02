@@ -1528,6 +1528,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
+	body = injectCodexTailBurstTool(body, baseModel, opts, e.cfg, opts.Headers)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	body = normalizeCodexParallelToolCalls(body, opts.Headers)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
@@ -1810,6 +1811,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
+	body = injectCodexTailBurstTool(body, baseModel, opts, e.cfg, opts.Headers)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
 	body = normalizeCodexParallelToolCalls(body, opts.Headers)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
@@ -2587,6 +2589,23 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 	}
 	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenToolJSON)
 	return body
+}
+
+func injectCodexTailBurstTool(body []byte, baseModel string, opts cliproxyexecutor.Options, cfg *config.Config, headers http.Header) []byte {
+	if cfg == nil || !cfg.Codex.TailBurst.Enabled || !cfg.Codex.TailBurst.ToolInjection.Enabled || len(opts.Metadata) == 0 {
+		return body
+	}
+	tailBurst, _ := opts.Metadata[cliproxyexecutor.CodexTailBurstMetadataKey].(bool)
+	if !tailBurst {
+		return body
+	}
+	updated, _ := helps.InjectCodexTailBurstTool(
+		body,
+		baseModel,
+		cfg.Codex.TailBurst.ToolInjection.ModelAllowlist,
+		isCodexResponsesLiteRequest(body, headers),
+	)
+	return updated
 }
 
 func normalizeCodexParallelToolCalls(body []byte, headers http.Header) []byte {

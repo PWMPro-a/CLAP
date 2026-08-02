@@ -1013,6 +1013,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.PUT("/codex-tail-burst/quota", s.mgmt.PutCodexTailBurstQuota)
 		mgmt.GET("/auth-files/agent-identity/registrations", s.mgmt.ListAgentIdentityRegistrations)
 		mgmt.GET("/auth-files/agent-identity/recovery", s.mgmt.ListAgentIdentityRecovery)
 		mgmt.PUT("/auth-files/agent-identity/recovery/config", s.mgmt.PutAgentIdentityRecoveryConfig)

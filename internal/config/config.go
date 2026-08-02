@@ -318,7 +318,24 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	IdentityConfuse bool                 `yaml:"identity-confuse" json:"identity-confuse"`
+	TailBurst       CodexTailBurstConfig `yaml:"tail-burst" json:"tail-burst"`
+}
+
+// CodexTailBurstConfig controls the temporary high-concurrency drain mode for
+// Codex credentials that are close to exhausting a tracked usage window.
+type CodexTailBurstConfig struct {
+	Enabled          bool                              `yaml:"enabled" json:"enabled"`
+	TriggerUsedRatio float64                           `yaml:"trigger-used-ratio" json:"trigger-used-ratio"`
+	SnapshotTTL      string                            `yaml:"snapshot-ttl" json:"snapshot-ttl"`
+	ToolInjection    CodexTailBurstToolInjectionConfig `yaml:"tool-injection" json:"tool-injection"`
+}
+
+// CodexTailBurstToolInjectionConfig controls the internal function-tool
+// declaration added only to eligible tail-burst requests.
+type CodexTailBurstToolInjectionConfig struct {
+	Enabled        bool     `yaml:"enabled" json:"enabled"`
+	ModelAllowlist []string `yaml:"model-allowlist" json:"model-allowlist"`
 }
 
 // TLSConfig holds HTTPS server settings.
