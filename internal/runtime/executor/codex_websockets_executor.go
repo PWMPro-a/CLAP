@@ -42,6 +42,12 @@ const (
 	// Stateless HTTP SSE requests reuse a bounded set of upstream connections.
 	// Keeping several slots avoids serializing unrelated requests on one socket.
 	codexStatelessWebsocketPoolSlots = 8
+	// Keep several authenticated standby connections ready so a busy execution
+	// session can obtain a hot parallel slot without paying handshake latency.
+	codexWebsocketStandbySlots = 3
+	// Keep a small bounded set of completed response and item IDs so late
+	// websocket frames cannot be delivered to the next serialized request.
+	codexWebsocketCompletedRouteLimit = 256
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -82,6 +88,10 @@ type codexWebsocketSession struct {
 	activeDone   <-chan struct{}
 	activeCancel context.CancelFunc
 
+	completedRouteMu    sync.Mutex
+	completedRouteIDs   map[string]struct{}
+	completedRouteOrder []string
+
 	readerConn *websocket.Conn
 
 	upstreamDisconnectOnce    sync.Once
@@ -103,6 +113,83 @@ type codexWebsocketRead struct {
 	msgType int
 	payload []byte
 	err     error
+}
+
+type codexWebsocketResponseScope struct {
+	responseID string
+	itemIDs    map[string]struct{}
+}
+
+func (s *codexWebsocketSession) acceptResponsePayload(payload []byte, scope *codexWebsocketResponseScope) bool {
+	if s == nil || scope == nil || len(payload) == 0 {
+		return true
+	}
+
+	responseID := strings.TrimSpace(gjson.GetBytes(payload, "response_id").String())
+	if responseID == "" {
+		responseID = strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+	}
+	itemID := strings.TrimSpace(gjson.GetBytes(payload, "item_id").String())
+	if itemID == "" {
+		itemID = strings.TrimSpace(gjson.GetBytes(payload, "item.id").String())
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+
+	s.completedRouteMu.Lock()
+	defer s.completedRouteMu.Unlock()
+	if s.isCompletedRouteLocked("response", responseID) || s.isCompletedRouteLocked("item", itemID) {
+		return false
+	}
+	if scope.responseID != "" && responseID != "" && responseID != scope.responseID {
+		return false
+	}
+	if scope.responseID == "" && responseID != "" {
+		scope.responseID = responseID
+	}
+	if itemID != "" {
+		if scope.itemIDs == nil {
+			scope.itemIDs = make(map[string]struct{})
+		}
+		scope.itemIDs[itemID] = struct{}{}
+	}
+
+	if eventType == "response.completed" || eventType == "response.done" {
+		s.rememberCompletedRouteLocked("response", scope.responseID)
+		for completedItemID := range scope.itemIDs {
+			s.rememberCompletedRouteLocked("item", completedItemID)
+		}
+	}
+	return true
+}
+
+func (s *codexWebsocketSession) isCompletedRouteLocked(kind, id string) bool {
+	if s == nil || strings.TrimSpace(id) == "" || s.completedRouteIDs == nil {
+		return false
+	}
+	_, ok := s.completedRouteIDs[kind+"\x00"+id]
+	return ok
+}
+
+func (s *codexWebsocketSession) rememberCompletedRouteLocked(kind, id string) {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	if s.completedRouteIDs == nil {
+		s.completedRouteIDs = make(map[string]struct{})
+	}
+	key := kind + "\x00" + id
+	if _, exists := s.completedRouteIDs[key]; exists {
+		return
+	}
+	s.completedRouteIDs[key] = struct{}{}
+	s.completedRouteOrder = append(s.completedRouteOrder, key)
+	if len(s.completedRouteOrder) <= codexWebsocketCompletedRouteLimit {
+		return
+	}
+	oldest := s.completedRouteOrder[0]
+	delete(s.completedRouteIDs, oldest)
+	copy(s.completedRouteOrder, s.completedRouteOrder[1:])
+	s.completedRouteOrder = s.completedRouteOrder[:len(s.completedRouteOrder)-1]
 }
 
 func (s *codexWebsocketSession) setActive(conn *websocket.Conn, ch chan codexWebsocketRead) {
@@ -342,6 +429,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
+	body = injectCodexTailBurstTool(body, baseModel, opts, e.cfg, opts.Headers)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = normalizeCodexWebsocketParallelToolCalls(body, opts.Headers)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
@@ -380,10 +468,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	executionSessionID := executionSessionIDFromOptions(opts)
-	var sess *codexWebsocketSession
-	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID)
-		sess.reqMu.Lock()
+	parallelPoolKey := codexStatelessWebsocketPoolKey(auth, e.cfg, authID, wsURL)
+	sess, sessionLocked := e.tryAcquireExecutionSession(executionSessionID)
+	if executionSessionID != "" && !sessionLocked {
+		sess, sessionLocked = e.acquireStatelessSession(parallelPoolKey)
+	}
+	if sessionLocked {
 		defer sess.reqMu.Unlock()
 	}
 
@@ -433,9 +523,17 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	var readCh chan codexWebsocketRead
+	requestCompleted := false
 	if sess != nil {
 		readCh = sess.activate(conn)
 		defer func() {
+			if !requestCompleted {
+				incompleteErr := err
+				if incompleteErr == nil {
+					incompleteErr = errors.New("codex websockets executor: request ended before terminal response")
+				}
+				e.invalidateUpstreamConn(sess, conn, "request_incomplete", incompleteErr)
+			}
 			sess.clearActive(conn, readCh)
 		}()
 	}
@@ -492,6 +590,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	outputItemsByIndex := make(map[int64][]byte)
 	var outputItemsFallback [][]byte
 	outputText := &codexOutputTextAccumulator{}
+	responseScope := &codexWebsocketResponseScope{}
+	parallelPrewarmStarted := false
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -518,7 +618,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if len(payload) == 0 {
 			continue
 		}
+		if sess != nil && !sess.acceptResponsePayload(payload, responseScope) {
+			continue
+		}
 		reporter.MarkFirstResponseByte()
+		if !parallelPrewarmStarted && executionSessionID != "" {
+			parallelPrewarmStarted = true
+			e.prewarmParallelSessions(auth, parallelPoolKey, authID, wsURL, wsHeaders)
+		}
 		payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
@@ -546,6 +653,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		case "response.output_item.done":
 			collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 		case "response.completed":
+			requestCompleted = true
 			payload = patchCodexCompletedOutputWithText(payload, outputItemsByIndex, outputItemsFallback, outputText)
 			cacheCodexReasoningReplayFromCompleted(replayScope, payload)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
@@ -601,6 +709,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
+	body = injectCodexTailBurstTool(body, baseModel, opts, e.cfg, opts.Headers)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = normalizeCodexWebsocketParallelToolCalls(body, opts.Headers)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
@@ -637,20 +746,17 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	authType, authValue = auth.AccountInfo()
 
 	executionSessionID := executionSessionIDFromOptions(opts)
-	var sess *codexWebsocketSession
-	sessionLocked := false
-	if executionSessionID != "" {
-		sess = e.getOrCreateSession(executionSessionID)
-		if sess != nil {
-			sess.reqMu.Lock()
-			sessionLocked = true
-		}
-	} else if !cliproxyexecutor.DownstreamWebsocket(ctx) {
+	parallelPoolKey := codexStatelessWebsocketPoolKey(auth, e.cfg, authID, wsURL)
+	sess, sessionLocked := e.tryAcquireExecutionSession(executionSessionID)
+	if executionSessionID != "" && !sessionLocked {
+		// A downstream execution session is one logical WebSocket with several
+		// physical upstream slots. Busy sessions borrow a hot standby slot.
+		sess, sessionLocked = e.acquireStatelessSession(parallelPoolKey)
+	} else if executionSessionID == "" && !cliproxyexecutor.DownstreamWebsocket(ctx) {
 		// HTTP SSE has no long-lived downstream execution session, but it can
 		// still reuse an upstream Codex WebSocket handshake. If all slots are
 		// busy, keep the existing one-shot behavior instead of queueing here.
-		poolKey := codexStatelessWebsocketPoolKey(auth, e.cfg, authID, wsURL)
-		sess, sessionLocked = e.acquireStatelessSession(poolKey)
+		sess, sessionLocked = e.acquireStatelessSession(parallelPoolKey)
 	}
 	unlockSession := func() {
 		if sess != nil && sessionLocked {
@@ -767,10 +873,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	go func() {
 		terminateReason := "completed"
 		var terminateErr error
+		requestCompleted := false
 
 		defer close(out)
 		defer func() {
 			if sess != nil {
+				if !requestCompleted {
+					incompleteErr := terminateErr
+					if incompleteErr == nil {
+						incompleteErr = errors.New("codex websockets executor: request ended before terminal response")
+					}
+					e.invalidateUpstreamConn(sess, conn, "request_incomplete", incompleteErr)
+				}
 				sess.clearActive(conn, readCh)
 				unlockSession()
 				return
@@ -799,6 +913,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
 		outputText := &codexOutputTextAccumulator{}
+		responseScope := &codexWebsocketResponseScope{}
+		parallelPrewarmStarted := false
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
@@ -842,7 +958,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if len(payload) == 0 {
 				continue
 			}
+			if sess != nil && !sess.acceptResponsePayload(payload, responseScope) {
+				continue
+			}
 			reporter.MarkFirstResponseByte()
+			if !parallelPrewarmStarted && executionSessionID != "" {
+				parallelPrewarmStarted = true
+				e.prewarmParallelSessions(auth, parallelPoolKey, authID, wsURL, wsHeaders)
+			}
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
@@ -883,6 +1006,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			eventType := gjson.GetBytes(payload, "type").String()
 			collectCodexOutputTextEvent(payload, outputText)
 			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error"
+			if eventType == "response.completed" || eventType == "response.done" {
+				requestCompleted = true
+			}
 			if eventType == "response.output_item.done" {
 				collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 			}
@@ -1676,6 +1802,17 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	return sess
 }
 
+// tryAcquireExecutionSession reserves the reusable connection for a request.
+// Responses WebSocket connections serialize in-flight responses, so a busy
+// session borrows a separate hot pooled slot instead of queueing.
+func (e *CodexWebsocketsExecutor) tryAcquireExecutionSession(sessionID string) (*codexWebsocketSession, bool) {
+	sess := e.getOrCreateSession(sessionID)
+	if sess == nil || !sess.reqMu.TryLock() {
+		return nil, false
+	}
+	return sess, true
+}
+
 func codexStatelessWebsocketPoolKey(auth *cliproxyauth.Auth, cfg *config.Config, authID, wsURL string) string {
 	authID = strings.TrimSpace(authID)
 	wsURL = strings.TrimSpace(wsURL)
@@ -1728,6 +1865,106 @@ func (e *CodexWebsocketsExecutor) acquireStatelessSession(poolKey string) (*code
 	sess.reqMu.Lock()
 	store.stateless[poolKey] = append(pool, sess)
 	return sess, true
+}
+
+// prewarmParallelSessions fills a shared per-auth standby pool after the first
+// execution-session handshake. It runs outside the request path, so sequential
+// requests keep their existing first-token behavior while later parallel turns
+// can reserve an already authenticated connection.
+func (e *CodexWebsocketsExecutor) prewarmParallelSessions(auth *cliproxyauth.Auth, poolKey, authID, wsURL string, headers http.Header) {
+	if e == nil || strings.TrimSpace(poolKey) == "" || strings.TrimSpace(wsURL) == "" {
+		return
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	if store == nil {
+		return
+	}
+
+	store.mu.Lock()
+	if store.stateless == nil {
+		store.stateless = make(map[string][]*codexWebsocketSession)
+	}
+	pool := store.stateless[poolKey]
+	standbys := make([]*codexWebsocketSession, 0, codexWebsocketStandbySlots)
+	for len(pool) < codexWebsocketStandbySlots && len(pool) < codexStatelessWebsocketPoolSlots {
+		sess := &codexWebsocketSession{
+			sessionID:            "standby-" + uuid.NewString(),
+			upstreamDisconnectCh: make(chan error, 1),
+		}
+		sess.reqMu.Lock()
+		pool = append(pool, sess)
+		standbys = append(standbys, sess)
+	}
+	store.stateless[poolKey] = pool
+	store.mu.Unlock()
+
+	for _, standby := range standbys {
+		standby := standby
+		authCopy := auth.Clone()
+		headersCopy := headers.Clone()
+		go func() {
+			conn, resp, errDial := e.ensureUpstreamConn(context.Background(), authCopy, standby, authID, wsURL, headersCopy)
+			closeHTTPResponseBody(resp, "codex websockets executor: close standby handshake response body error")
+			if errDial != nil || conn == nil {
+				e.removeStatelessSession(poolKey, standby)
+				standby.reqMu.Unlock()
+				log.Debugf("codex websockets executor: standby connection failed: %v", errDial)
+				return
+			}
+			if !e.statelessSessionStored(poolKey, standby) {
+				closeCodexWebsocketSession(standby, "standby_removed")
+				standby.reqMu.Unlock()
+				return
+			}
+			standby.reqMu.Unlock()
+		}()
+	}
+}
+
+func (e *CodexWebsocketsExecutor) removeStatelessSession(poolKey string, target *codexWebsocketSession) {
+	if e == nil || target == nil {
+		return
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	pool := store.stateless[poolKey]
+	for i, sess := range pool {
+		if sess != target {
+			continue
+		}
+		pool = append(pool[:i], pool[i+1:]...)
+		break
+	}
+	if len(pool) == 0 {
+		delete(store.stateless, poolKey)
+	} else {
+		store.stateless[poolKey] = pool
+	}
+	store.mu.Unlock()
+}
+
+func (e *CodexWebsocketsExecutor) statelessSessionStored(poolKey string, target *codexWebsocketSession) bool {
+	if e == nil || target == nil {
+		return false
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, sess := range store.stateless[poolKey] {
+		if sess == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {

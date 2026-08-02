@@ -305,6 +305,10 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	return isAuthBlockedForModelWithTailBurst(auth, model, now, false)
+}
+
+func isAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.Time, tailBurst bool) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -314,7 +318,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if availability, ok := auth.Runtime.(runtimeSelectionAvailability); ok && availability != nil && !availability.RuntimeSelectionAvailable() {
 		return true, blockReasonOther, time.Time{}
 	}
-	if blocked, reason, next := runtimeAuthBlockedForModel(auth, now); blocked {
+	if blocked, reason, next := runtimeAuthBlockedForModelWithTailBurst(auth, now, tailBurst); blocked {
 		return true, reason, next
 	}
 	if model != "" {
@@ -370,6 +374,10 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 }
 
 func runtimeAuthBlockedForModel(auth *Auth, now time.Time) (bool, blockReason, time.Time) {
+	return runtimeAuthBlockedForModelWithTailBurst(auth, now, false)
+}
+
+func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, now time.Time, tailBurst bool) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -386,7 +394,7 @@ func runtimeAuthBlockedForModel(auth *Auth, now time.Time) (bool, blockReason, t
 		state.recordSkipLocked("frozen", state.frozenUntil, now)
 		return true, blockReasonCooldown, state.frozenUntil
 	}
-	if cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
+	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
 	}

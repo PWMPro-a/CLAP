@@ -375,7 +375,15 @@ func matchesAuthFileLookup(auth *coreauth.Auth, name string, authIndex string) b
 func (h *Handler) lookupAuthFile(name string, authIndex string) (*coreauth.Auth, bool) {
 	name = strings.TrimSpace(name)
 	authIndex = strings.TrimSpace(authIndex)
-	if h == nil || h.authManager == nil || name == "" {
+	if h == nil || h.authManager == nil || (name == "" && authIndex == "") {
+		return nil, false
+	}
+	if name == "" {
+		for _, auth := range h.authManager.List() {
+			if matchesAuthFileLookup(auth, "", authIndex) {
+				return auth, true
+			}
+		}
 		return nil, false
 	}
 	if authIndex == "" {
@@ -646,6 +654,14 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		entry["agent_identity_registration"] = runtime.RegistrationStatus()
 	}
 	applyAuthFileRuntimeLimitFields(entry, auth)
+	if h.authManager != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if snapshots := h.authManager.CodexQuotaSnapshots(auth.ID); len(snapshots) > 0 {
+			entry["codex_quota_snapshots"] = snapshots
+		}
+		if enabled, ok := authFileMetadataBool(auth.Metadata, "tail_burst_enabled", "tail-burst-enabled"); ok {
+			entry["tail_burst_enabled"] = enabled
+		}
+	}
 	return entry
 }
 
