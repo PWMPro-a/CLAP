@@ -280,7 +280,7 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 //
 // Parsing priority:
 //  1. Special values: "none" → ModeNone, "auto"/"-1" → ModeAuto
-//  2. Level names: "minimal", "low", "medium", "high", "xhigh", "max" → ModeLevel
+//  2. Level names: "minimal", "low", "medium", "high", "xhigh" → ModeLevel
 //  3. Numeric values: positive integers → ModeBudget, 0 → ModeNone
 //
 // If none of the above match, returns empty ThinkingConfig (treated as no config).
@@ -295,7 +295,7 @@ func parseSuffixToConfig(rawSuffix, provider, model string) ThinkingConfig {
 		}
 	}
 
-	// 2. Try level parsing (minimal, low, medium, high, xhigh, max)
+	// 2. Try level parsing (minimal, low, medium, high, xhigh)
 	if level, ok := ParseLevelSuffix(rawSuffix); ok {
 		return ThinkingConfig{Mode: ModeLevel, Level: level}
 	}
@@ -631,7 +631,7 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 // extractCodexConfig extracts thinking configuration from Codex format request body.
 //
 // Codex API format (OpenAI Responses API):
-//   - reasoning.effort: "none", "low", "medium", "high", "xhigh", "max"
+//   - reasoning.effort: "none", "low", "medium", "high"
 //
 // This is similar to OpenAI but uses nested field "reasoning.effort" instead of "reasoning_effort".
 func extractCodexConfig(body []byte) ThinkingConfig {

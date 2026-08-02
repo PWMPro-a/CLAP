@@ -17,24 +17,6 @@ func TestWithXAIBuiltinsIncludesVideoPreviewModel(t *testing.T) {
 	t.Fatalf("expected xAI builtin model %s", xaiBuiltinVideo15PreviewModelID)
 }
 
-func TestWithCodexBuiltinsAddsGPT55MaxReasoning(t *testing.T) {
-	input := []*ModelInfo{{
-		ID:       codexMaxReasoningModelID,
-		Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
-	}}
-
-	models := WithCodexBuiltins(input)
-	if len(models) != 3 {
-		t.Fatalf("models length = %d, want 3", len(models))
-	}
-	if !hasThinkingLevel(models[0].Thinking.Levels, "max") {
-		t.Fatalf("gpt-5.5 reasoning levels = %#v, want max", models[0].Thinking.Levels)
-	}
-	if hasThinkingLevel(input[0].Thinking.Levels, "max") {
-		t.Fatalf("input reasoning levels mutated: %#v", input[0].Thinking.Levels)
-	}
-}
-
 func TestAntigravityWebSearchModelForRequiresRequestedModelCapability(t *testing.T) {
 	registryRef := GetGlobalRegistry()
 	registryRef.RegisterClient("test-antigravity-websearch-route", "antigravity", []*ModelInfo{
