@@ -534,6 +534,7 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 	if !ok || len(serviceTiers) != 1 {
 		t.Fatalf("expected gpt-5.5 priority service tier, got %#v", gpt55["service_tiers"])
 	}
+	assertCodexSupportedReasoningLevels(t, gpt55, []string{"low", "medium", "high", "xhigh", "max"})
 	if custom == nil {
 		t.Fatal("expected custom model codex catalog entry")
 	}

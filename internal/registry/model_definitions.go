@@ -9,6 +9,7 @@ import (
 const (
 	codexBuiltinImage15ModelID      = "gpt-image-1.5"
 	codexBuiltinImageModelID        = "gpt-image-2"
+	codexMaxReasoningModelID        = "gpt-5.5"
 	xaiBuiltinImageModelID          = "grok-imagine-image"
 	xaiBuiltinImageQualityModelID   = "grok-imagine-image-quality"
 	xaiBuiltinVideoModelID          = "grok-imagine-video"
@@ -110,11 +111,40 @@ func GetXAIModels() []*ModelInfo {
 	return WithXAIBuiltins(cloneModelInfos(getModels().XAI))
 }
 
-// WithCodexBuiltins injects hard-coded Codex-only model definitions that should
-// not depend on remote models.json updates. Built-ins replace any matching IDs
-// already present in the provided slice.
+// WithCodexBuiltins injects hard-coded Codex-only model definitions and
+// capability overrides that should not depend on remote models.json updates.
+// Built-ins replace any matching IDs already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, codexBuiltinImage15ModelInfo(), codexBuiltinImageModelInfo())
+	models = upsertModelInfos(models, codexBuiltinImage15ModelInfo(), codexBuiltinImageModelInfo())
+	return withCodexReasoningOverrides(models)
+}
+
+// withCodexReasoningOverrides keeps explicit Codex capabilities stable when
+// the remotely refreshed model catalog is behind the supported API surface.
+func withCodexReasoningOverrides(models []*ModelInfo) []*ModelInfo {
+	for index, model := range models {
+		if model == nil || !strings.EqualFold(strings.TrimSpace(model.ID), codexMaxReasoningModelID) {
+			continue
+		}
+
+		updated := cloneModelInfo(model)
+		if updated.Thinking == nil {
+			updated.Thinking = &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}}
+		} else if !hasThinkingLevel(updated.Thinking.Levels, "max") {
+			updated.Thinking.Levels = append(updated.Thinking.Levels, "max")
+		}
+		models[index] = updated
+	}
+	return models
+}
+
+func hasThinkingLevel(levels []string, target string) bool {
+	for _, level := range levels {
+		if strings.EqualFold(strings.TrimSpace(level), target) {
+			return true
+		}
+	}
+	return false
 }
 
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should

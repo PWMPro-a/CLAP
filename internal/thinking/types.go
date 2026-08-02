@@ -54,8 +54,7 @@ const (
 	LevelHigh ThinkingLevel = "high"
 	// LevelXHigh sets extra-high thinking effort
 	LevelXHigh ThinkingLevel = "xhigh"
-	// LevelMax sets maximum thinking effort.
-	// This is currently used by Claude 4.6 adaptive thinking (opus supports "max").
+	// LevelMax sets maximum thinking effort for models that explicitly advertise it.
 	LevelMax ThinkingLevel = "max"
 )
 
