@@ -293,6 +293,31 @@ func TestCodexTailBurstCandidateIndexRefreshesForAuthLifecycle(t *testing.T) {
 	}
 }
 
+func TestUpdateCodexQuotaSnapshotsPublishesBatchWithOneCandidateSet(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(newTailBurstConfig())
+	for _, id := range []string{"tail-a", "tail-b"} {
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: id, Provider: "codex", Status: StatusActive}); errRegister != nil {
+			t.Fatalf("Register(%s): %v", id, errRegister)
+		}
+	}
+	accepted, errUpdate := manager.UpdateCodexQuotaSnapshots([]CodexQuotaSnapshotUpdate{
+		{AuthID: "tail-a", Snapshot: CodexQuotaSnapshot{UsedRatio: 0.99}},
+		{AuthID: "tail-b", Snapshot: CodexQuotaSnapshot{UsedRatio: 0.985}},
+		{AuthID: "missing", Snapshot: CodexQuotaSnapshot{UsedRatio: 0.99}},
+	})
+	if errUpdate != nil {
+		t.Fatalf("UpdateCodexQuotaSnapshots: %v", errUpdate)
+	}
+	if accepted != 2 {
+		t.Fatalf("accepted = %d, want 2", accepted)
+	}
+	ids := codexTailBurstCandidateIDs(manager, "*")
+	if len(ids) != 2 || ids[0] != "tail-a" || ids[1] != "tail-b" {
+		t.Fatalf("candidate ids = %#v", ids)
+	}
+}
+
 func codexTailBurstCandidateIDs(manager *Manager, model string) []string {
 	index, _ := manager.codexTailBurstCandidates.Load().(codexTailBurstCandidateIndex)
 	return append([]string(nil), index[model]...)

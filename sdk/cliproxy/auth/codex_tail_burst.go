@@ -32,6 +32,15 @@ type CodexQuotaSnapshot struct {
 	Generation     uint64    `json:"generation"`
 }
 
+// CodexQuotaSnapshotUpdate is one collector-produced usage snapshot. Batching
+// updates lets collectors publish a full polling round while rebuilding the
+// request-time candidate index only once.
+type CodexQuotaSnapshotUpdate struct {
+	AuthID   string
+	Model    string
+	Snapshot CodexQuotaSnapshot
+}
+
 type codexQuotaSnapshotStore map[string]CodexQuotaSnapshot
 type codexTailBurstCandidateIndex map[string][]string
 
@@ -220,6 +229,52 @@ func (m *Manager) UpdateCodexQuotaSnapshot(authID, model string, snapshot CodexQ
 		m.refreshCodexTailBurstCandidates()
 	}
 	return stored, accepted, nil
+}
+
+// UpdateCodexQuotaSnapshots publishes a complete asynchronous collection round.
+// It performs no network I/O and rebuilds the immutable request-time index once
+// after all accepted updates, rather than once per credential.
+func (m *Manager) UpdateCodexQuotaSnapshots(updates []CodexQuotaSnapshotUpdate) (int, error) {
+	if m == nil {
+		return 0, fmt.Errorf("auth manager is unavailable")
+	}
+	if len(updates) == 0 {
+		return 0, nil
+	}
+	settings := m.codexTailBurstSettings()
+	now := time.Now()
+	acceptedCount := 0
+	for _, update := range updates {
+		authID := strings.TrimSpace(update.AuthID)
+		if authID == "" {
+			continue
+		}
+		snapshot := update.Snapshot
+		if snapshot.UsedRatio < 0 || snapshot.UsedRatio > 1 {
+			continue
+		}
+		if snapshot.SampledAt.IsZero() {
+			snapshot.SampledAt = now
+		}
+		if snapshot.ExpiresAt.IsZero() || !snapshot.ExpiresAt.After(snapshot.SampledAt) {
+			snapshot.ExpiresAt = snapshot.SampledAt.Add(settings.snapshotTTL)
+		}
+		snapshot.RemainingRatio = 1 - snapshot.UsedRatio
+
+		m.mu.RLock()
+		auth := m.auths[authID]
+		m.mu.RUnlock()
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex") {
+			continue
+		}
+		if _, accepted := auth.setCodexQuotaSnapshot(strings.TrimSpace(update.Model), snapshot); accepted {
+			acceptedCount++
+		}
+	}
+	if acceptedCount > 0 {
+		m.refreshCodexTailBurstCandidates()
+	}
+	return acceptedCount, nil
 }
 
 // CodexQuotaSnapshot returns the fresh quota snapshot used by tail routing.

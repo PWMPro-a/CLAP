@@ -325,10 +325,20 @@ type CodexConfig struct {
 // CodexTailBurstConfig controls the temporary high-concurrency drain mode for
 // Codex credentials that are close to exhausting a tracked usage window.
 type CodexTailBurstConfig struct {
-	Enabled          bool                              `yaml:"enabled" json:"enabled"`
-	TriggerUsedRatio float64                           `yaml:"trigger-used-ratio" json:"trigger-used-ratio"`
-	SnapshotTTL      string                            `yaml:"snapshot-ttl" json:"snapshot-ttl"`
-	ToolInjection    CodexTailBurstToolInjectionConfig `yaml:"tool-injection" json:"tool-injection"`
+	Enabled          bool                               `yaml:"enabled" json:"enabled"`
+	TriggerUsedRatio float64                            `yaml:"trigger-used-ratio" json:"trigger-used-ratio"`
+	SnapshotTTL      string                             `yaml:"snapshot-ttl" json:"snapshot-ttl"`
+	QuotaCollector   CodexTailBurstQuotaCollectorConfig `yaml:"quota-collector" json:"quota-collector"`
+	ToolInjection    CodexTailBurstToolInjectionConfig  `yaml:"tool-injection" json:"tool-injection"`
+}
+
+// CodexTailBurstQuotaCollectorConfig controls the asynchronous OAuth usage
+// collector. It is active only while Codex tail-burst is enabled and never runs
+// on the model request path.
+type CodexTailBurstQuotaCollectorConfig struct {
+	Interval       string `yaml:"interval" json:"interval"`
+	MaxConcurrency int    `yaml:"max-concurrency" json:"max-concurrency"`
+	Timeout        string `yaml:"timeout" json:"timeout"`
 }
 
 // CodexTailBurstToolInjectionConfig controls the internal function-tool

@@ -196,6 +196,12 @@ codex:
     enabled: false
     trigger-used-ratio: 0.98
     snapshot-ttl: "90s"
+    # The OAuth usage endpoint is polled independently of model requests.
+    # It never waits for, buffers, or shares an upstream Responses WebSocket.
+    quota-collector:
+      interval: "45s"
+      max-concurrency: 4
+      timeout: "8s"
     tool-injection:
       enabled: true
       model-allowlist: []

@@ -88,6 +88,10 @@ type Service struct {
 	// authQueueStop cancels the auth update queue processing.
 	authQueueStop context.CancelFunc
 
+	// tailBurstCollectorCancel stops the independent Codex quota collector.
+	// It never shares request execution resources with the model proxy path.
+	tailBurstCollectorCancel context.CancelFunc
+
 	// authManager handles legacy authentication operations.
 	authManager *sdkAuth.Manager
 
@@ -448,6 +452,17 @@ func (s *Service) registerModelRefreshCallback() {
 		if refreshed > 0 {
 			log.Infof("re-registered models for %d auth(s) due to model catalog changes: %v", refreshed, changedProviders)
 		}
+	})
+}
+
+func (s *Service) startCodexTailBurstQuotaCollector(ctx context.Context) {
+	if s == nil || s.coreManager == nil || s.tailBurstCollectorCancel != nil {
+		return
+	}
+	s.tailBurstCollectorCancel = executor.StartCodexTailBurstQuotaCollector(ctx, s.coreManager, func() *config.Config {
+		s.cfgMu.RLock()
+		defer s.cfgMu.RUnlock()
+		return s.cfg
 	})
 }
 
@@ -1796,6 +1811,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.registerModelRefreshCallback()
+	s.startCodexTailBurstQuotaCollector(ctx)
 
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil && !homeEnabled {
@@ -1871,6 +1887,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.authQueueStop != nil {
 			s.authQueueStop()
 			s.authQueueStop = nil
+		}
+		if s.tailBurstCollectorCancel != nil {
+			s.tailBurstCollectorCancel()
+			s.tailBurstCollectorCancel = nil
 		}
 
 		if errShutdownPprof := s.shutdownPprof(ctx); errShutdownPprof != nil {
