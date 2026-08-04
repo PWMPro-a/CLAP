@@ -162,6 +162,29 @@ func (s *codexWebsocketSession) acceptResponsePayload(payload []byte, scope *cod
 	return true
 }
 
+func collectCodexWebsocketResponseScope(payload []byte, scope *codexWebsocketResponseScope) {
+	if scope == nil || len(payload) == 0 {
+		return
+	}
+	responseID := strings.TrimSpace(gjson.GetBytes(payload, "response_id").String())
+	if responseID == "" {
+		responseID = strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+	}
+	if scope.responseID == "" && responseID != "" {
+		scope.responseID = responseID
+	}
+	itemID := strings.TrimSpace(gjson.GetBytes(payload, "item_id").String())
+	if itemID == "" {
+		itemID = strings.TrimSpace(gjson.GetBytes(payload, "item.id").String())
+	}
+	if itemID != "" {
+		if scope.itemIDs == nil {
+			scope.itemIDs = make(map[string]struct{})
+		}
+		scope.itemIDs[itemID] = struct{}{}
+	}
+}
+
 func (s *codexWebsocketSession) isCompletedRouteLocked(kind, id string) bool {
 	if s == nil || strings.TrimSpace(id) == "" || s.completedRouteIDs == nil {
 		return false
@@ -599,6 +622,17 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 		if errRead != nil {
 			mappedErr := mapCodexWebsocketReadError(errRead)
+			if isCodexWebsocketTransientReadError(errRead) {
+				if recoveredPayload := buildCodexSyntheticWebsocketCompleted(baseModel, responseScope, outputItemsByIndex, outputItemsFallback, outputText); len(recoveredPayload) > 0 {
+					requestCompleted = true
+					helps.RecordAPIWebsocketError(ctx, e.cfg, "read_recovered", mappedErr)
+					clientPayload := applyCodexIdentityExposeResponsePayload(recoveredPayload, identityState)
+					var param any
+					out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, clientBody, clientPayload, &param)
+					resp = cliproxyexecutor.Response{Payload: out}
+					return resp, nil
+				}
+			}
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
 			return resp, mappedErr
 		}
@@ -618,8 +652,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if len(payload) == 0 {
 			continue
 		}
-		if sess != nil && !sess.acceptResponsePayload(payload, responseScope) {
-			continue
+		if sess != nil {
+			if !sess.acceptResponsePayload(payload, responseScope) {
+				continue
+			}
+		} else {
+			collectCodexWebsocketResponseScope(payload, responseScope)
 		}
 		reporter.MarkFirstResponseByte()
 		if !parallelPrewarmStarted && executionSessionID != "" {
@@ -931,6 +969,29 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					return
 				}
 				mappedErr := mapCodexWebsocketReadError(errRead)
+				if isCodexWebsocketTransientReadError(errRead) {
+					if recoveredPayload := buildCodexSyntheticWebsocketCompleted(baseModel, responseScope, outputItemsByIndex, outputItemsFallback, outputText); len(recoveredPayload) > 0 {
+						requestCompleted = true
+						terminateReason = "recovered_disconnect"
+						terminateErr = mappedErr
+						helps.RecordAPIWebsocketError(ctx, e.cfg, "read_recovered", mappedErr)
+						clientPayload := applyCodexIdentityExposeResponsePayload(recoveredPayload, identityState)
+						if cliproxyexecutor.DownstreamWebsocket(ctx) {
+							_ = send(cliproxyexecutor.StreamChunk{Payload: clientPayload})
+							return
+						}
+						line := encodeCodexWebsocketAsSSE(clientPayload)
+						chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param, claudeInputTokens)
+						for i := range chunks {
+							if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+								terminateReason = "context_done"
+								terminateErr = ctx.Err()
+								return
+							}
+						}
+						return
+					}
+				}
 				terminateReason = "read_error"
 				terminateErr = mappedErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", mappedErr)
@@ -958,8 +1019,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if len(payload) == 0 {
 				continue
 			}
-			if sess != nil && !sess.acceptResponsePayload(payload, responseScope) {
-				continue
+			if sess != nil {
+				if !sess.acceptResponsePayload(payload, responseScope) {
+					continue
+				}
+			} else {
+				collectCodexWebsocketResponseScope(payload, responseScope)
 			}
 			reporter.MarkFirstResponseByte()
 			if !parallelPrewarmStarted && executionSessionID != "" {
@@ -1117,6 +1182,88 @@ func (codexWebsocketMessageTooBigError) IsRequestScoped() bool {
 	return true
 }
 
+func buildCodexSyntheticWebsocketCompleted(model string, scope *codexWebsocketResponseScope, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte, outputText *codexOutputTextAccumulator) []byte {
+	completed := []byte(`{"type":"response.completed","response":{"object":"response","status":"completed","output":[]}}`)
+
+	responseID := ""
+	if scope != nil {
+		responseID = strings.TrimSpace(scope.responseID)
+	}
+	if responseID == "" {
+		responseID = "resp_recovered_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	}
+	completed = helps.SetStringIfDifferent(completed, "response.id", responseID)
+	completed, _ = sjson.SetBytes(completed, "response.created_at", time.Now().Unix())
+	if model = strings.TrimSpace(model); model != "" {
+		completed = helps.SetStringIfDifferent(completed, "response.model", model)
+	}
+
+	completed = patchCodexCompletedOutputWithText(completed, outputItemsByIndex, outputItemsFallback, outputText)
+	outputResult := gjson.GetBytes(completed, "response.output")
+	if !outputResult.IsArray() {
+		return nil
+	}
+	outputItems := codexOutputArrayItems(outputResult)
+	if len(outputItems) == 0 || !codexOutputItemsHaveVisibleMessageText(outputItems) {
+		return nil
+	}
+	return completed
+}
+
+func newCodexWebsocketTransientDisconnectError(err error) statusErr {
+	message := "upstream websocket disconnected before response.completed"
+	if err != nil {
+		message += ": " + strings.TrimSpace(err.Error())
+	}
+	return statusErr{
+		code: http.StatusBadGateway,
+		msg: fmt.Sprintf(
+			`{"error":{"message":%s,"type":"server_error","code":"websocket_upstream_disconnected"}}`,
+			strconv.Quote(message),
+		),
+	}
+}
+
+func isCodexWebsocketTransientReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		switch closeErr.Code {
+		case websocket.CloseAbnormalClosure, websocket.CloseServiceRestart, websocket.CloseTryAgainLater:
+			return true
+		}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	errText := strings.ToLower(strings.TrimSpace(err.Error()))
+	if errText == "" {
+		return false
+	}
+	transientFragments := []string{
+		"websocket: close 1006",
+		"websocket: close 1012",
+		"websocket: close 1013",
+		"unexpected eof",
+		"i/o timeout",
+		"connection reset by peer",
+		"broken pipe",
+		"use of closed network connection",
+	}
+	for _, fragment := range transientFragments {
+		if strings.Contains(errText, fragment) {
+			return true
+		}
+	}
+	return errText == "eof"
+}
+
 func mapCodexWebsocketReadError(err error) error {
 	if err == nil {
 		return nil
@@ -1127,6 +1274,9 @@ func mapCodexWebsocketReadError(err error) error {
 			code: http.StatusRequestEntityTooLarge,
 			msg:  `{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}`,
 		}}
+	}
+	if isCodexWebsocketTransientReadError(err) {
+		return newCodexWebsocketTransientDisconnectError(err)
 	}
 	return err
 }

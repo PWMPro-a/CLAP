@@ -198,6 +198,46 @@ func TestCodexWebsocketsExecuteBackfillsEmptyCompletionOutputFromTextDelta(t *te
 	}
 }
 
+func TestCodexWebsocketsExecuteCompletesAfterTransientDisconnectWithText(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Fatalf("upgrade websocket: %v", errUpgrade)
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Fatalf("read upstream websocket message: %v", errRead)
+		}
+		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","response_id":"resp-nonstream-1012","output_index":0,"item_id":"msg_1","content_index":0,"delta":"partial nonstream answer"}`)); errWrite != nil {
+			t.Fatalf("write delta websocket message: %v", errWrite)
+		}
+		closeMessage := websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service restart")
+		if errWrite := conn.WriteControl(websocket.CloseMessage, closeMessage, time.Now().Add(time.Second)); errWrite != nil {
+			t.Fatalf("write close websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}
+
+	resp, errExecute := exec.Execute(context.Background(), auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	gotContent := gjson.GetBytes(resp.Payload, "choices.0.message.content").String()
+	if gotContent != "partial nonstream answer" {
+		t.Fatalf("choices.0.message.content = %q, want partial nonstream answer; payload=%s", gotContent, resp.Payload)
+	}
+}
+
 func TestClearCodexReasoningReplayOnWebsocketInvalidSignature(t *testing.T) {
 	internalcache.ClearCodexReasoningReplayCache()
 	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
@@ -787,6 +827,183 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for error stream chunk")
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamCompletesAfterTransientDisconnectWithText(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		delta := []byte(`{"type":"response.output_text.delta","response_id":"resp-1012","output_index":0,"item_id":"msg_1012","content_index":0,"delta":"partial answer"}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, delta); errWrite != nil {
+			t.Errorf("write delta websocket message: %v", errWrite)
+			return
+		}
+		closeMessage := websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service restart")
+		if errWrite := conn.WriteControl(websocket.CloseMessage, closeMessage, time.Now().Add(time.Second)); errWrite != nil {
+			t.Errorf("write close websocket message: %v", errWrite)
+			return
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	var completed []byte
+	for {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				if len(completed) == 0 {
+					t.Fatal("stream closed before recovered response.completed")
+				}
+				gotContent := gjson.GetBytes(completed, "response.output.0.content.0.text").String()
+				if gotContent != "partial answer" {
+					t.Fatalf("response.output[0].content[0].text = %q, want partial answer; completed=%s", gotContent, completed)
+				}
+				if gotID := gjson.GetBytes(completed, "response.id").String(); gotID != "resp-1012" {
+					t.Fatalf("response.id = %q, want resp-1012; completed=%s", gotID, completed)
+				}
+				return
+			}
+			if chunk.Err != nil {
+				t.Fatalf("stream chunk error = %v", chunk.Err)
+			}
+			payload := bytes.TrimSpace(chunk.Payload)
+			if !bytes.HasPrefix(payload, []byte("data:")) {
+				continue
+			}
+			data := bytes.TrimSpace(payload[len("data:"):])
+			if gjson.GetBytes(data, "type").String() == "response.completed" {
+				completed = append([]byte(nil), data...)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for recovered completed chunk")
+		}
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamPropagatesTransientDisconnectBeforeText(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		closeMessage := websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service restart")
+		if errWrite := conn.WriteControl(websocket.CloseMessage, closeMessage, time.Now().Add(time.Second)); errWrite != nil {
+			t.Errorf("write close websocket message: %v", errWrite)
+			return
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	select {
+	case chunk, ok := <-result.Chunks:
+		if !ok {
+			t.Fatal("stream closed before transient disconnect error")
+		}
+		if chunk.Err == nil {
+			t.Fatal("chunk.Err = nil, want transient disconnect error")
+		}
+		statusErr, ok := chunk.Err.(interface{ StatusCode() int })
+		if !ok {
+			t.Fatalf("error type %T does not expose StatusCode", chunk.Err)
+		}
+		if got := statusErr.StatusCode(); got != http.StatusBadGateway {
+			t.Fatalf("status = %d, want %d; err=%v", got, http.StatusBadGateway, chunk.Err)
+		}
+		if got := gjson.Get(chunk.Err.Error(), "error.code").String(); got != "websocket_upstream_disconnected" {
+			t.Fatalf("error code = %q, want websocket_upstream_disconnected; err=%v", got, chunk.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for transient disconnect error")
+	}
+}
+
+type codexWebsocketTimeoutTestError struct{}
+
+func (codexWebsocketTimeoutTestError) Error() string {
+	return "read tcp 127.0.0.1:1->127.0.0.1:2: i/o timeout"
+}
+func (codexWebsocketTimeoutTestError) Timeout() bool   { return true }
+func (codexWebsocketTimeoutTestError) Temporary() bool { return true }
+
+func TestMapCodexWebsocketReadErrorMapsTransientDisconnects(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "service restart", err: &websocket.CloseError{Code: websocket.CloseServiceRestart}},
+		{name: "abnormal close", err: &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "unexpected EOF"}},
+		{name: "timeout", err: codexWebsocketTimeoutTestError{}},
+		{name: "unexpected eof text", err: errors.New("websocket: close 1006 (abnormal closure): unexpected EOF")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mappedErr := mapCodexWebsocketReadError(tt.err)
+			statusErr, ok := mappedErr.(interface{ StatusCode() int })
+			if !ok {
+				t.Fatalf("mapped error type %T does not expose StatusCode: %v", mappedErr, mappedErr)
+			}
+			if got := statusErr.StatusCode(); got != http.StatusBadGateway {
+				t.Fatalf("status = %d, want %d; err=%v", got, http.StatusBadGateway, mappedErr)
+			}
+			if got := gjson.Get(mappedErr.Error(), "error.code").String(); got != "websocket_upstream_disconnected" {
+				t.Fatalf("error code = %q, want websocket_upstream_disconnected; err=%v", got, mappedErr)
+			}
+			if requestErr, ok := mappedErr.(interface{ IsRequestScoped() bool }); ok && requestErr.IsRequestScoped() {
+				t.Fatalf("transient disconnect should remain credential-retryable, got request-scoped %T", mappedErr)
+			}
+		})
 	}
 }
 
