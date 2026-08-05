@@ -41,7 +41,7 @@ const (
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
 	// Stateless HTTP SSE requests reuse a bounded set of upstream connections.
 	// Keeping several slots avoids serializing unrelated requests on one socket.
-	codexStatelessWebsocketPoolSlots = 8
+	codexStatelessWebsocketPoolSlots = 30
 	// Keep several authenticated standby connections ready so a busy execution
 	// session can obtain a hot parallel slot without paying handshake latency.
 	codexWebsocketStandbySlots = 3
