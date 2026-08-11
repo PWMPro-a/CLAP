@@ -250,30 +250,6 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
-
-	// SessionAffinityRendezvous uses stable weighted rendezvous hashing for cold
-	// bindings and failover. Existing bindings remain unchanged.
-	SessionAffinityRendezvous bool `yaml:"session-affinity-rendezvous,omitempty" json:"session-affinity-rendezvous,omitempty"`
-
-	// SessionAffinityQuotaAware uses asynchronous Codex quota snapshots only for
-	// cold bindings and failover. It never fetches quota data on a model request.
-	SessionAffinityQuotaAware bool `yaml:"session-affinity-quota-aware,omitempty" json:"session-affinity-quota-aware,omitempty"`
-
-	// SessionAffinityPersist writes session bindings asynchronously so restarts
-	// do not remap every active client session.
-	SessionAffinityPersist bool `yaml:"session-affinity-persist,omitempty" json:"session-affinity-persist,omitempty"`
-
-	// SessionAffinityStateFile overrides the default state path used when
-	// persistence is enabled.
-	SessionAffinityStateFile string `yaml:"session-affinity-state-file,omitempty" json:"session-affinity-state-file,omitempty"`
-
-	// SessionAffinityPCKShadow emits sampled prompt-cache-key diagnostics to the
-	// internal usage stream without changing the upstream prompt_cache_key.
-	SessionAffinityPCKShadow bool `yaml:"session-affinity-pck-shadow,omitempty" json:"session-affinity-pck-shadow,omitempty"`
-
-	// SessionAffinityPCKShadowSampleRate controls normal-hit sampling. Cold binds
-	// and failover are always sampled. Default: 0.01.
-	SessionAffinityPCKShadowSampleRate float64 `yaml:"session-affinity-pck-shadow-sample-rate,omitempty" json:"session-affinity-pck-shadow-sample-rate,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

@@ -752,7 +752,6 @@ func TestAuditAccountedCodexXAIReconnectReuseAndTargetChange(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 			var connections atomic.Int32
-			var responses atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
 				if errUpgrade != nil {
@@ -765,8 +764,7 @@ func TestAuditAccountedCodexXAIReconnectReuseAndTargetChange(t *testing.T) {
 					if _, _, errRead := conn.ReadMessage(); errRead != nil {
 						return
 					}
-					responseID := fmt.Sprintf("response-%d", responses.Add(1))
-					completed := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`, responseID))
+					completed := []byte(`{"type":"response.completed","response":{"id":"response-1","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
 					if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
 						return
 					}

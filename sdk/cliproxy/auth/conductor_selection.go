@@ -5,7 +5,6 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net/http"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -243,45 +242,12 @@ func (m *Manager) SetSelector(selector Selector) {
 		selector = &RoundRobinSelector{}
 	}
 	m.mu.Lock()
-	previous := m.selector
-	discardedCache, sharedCache := adoptSessionAffinityCache(previous, selector)
 	m.selector = selector
 	m.mu.Unlock()
-	if discardedCache != nil {
-		discardedCache.Stop()
-	}
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
 	}
-	if stoppable, ok := previous.(StoppableSelector); ok && !sharedCache && !sameSelectorInstance(previous, selector) {
-		stoppable.Stop()
-	}
-}
-
-func adoptSessionAffinityCache(previous, next Selector) (*SessionCache, bool) {
-	previousAffinity, previousOK := previous.(*SessionAffinitySelector)
-	nextAffinity, nextOK := next.(*SessionAffinitySelector)
-	if !previousOK || !nextOK || previousAffinity == nil || nextAffinity == nil || previousAffinity.cache == nil || nextAffinity.cache == nil {
-		return nil, false
-	}
-	if previousAffinity.cache == nextAffinity.cache {
-		previousAffinity.cache.Reconfigure(nextAffinity.cacheOptions)
-		return nil, true
-	}
-	discarded := nextAffinity.cache
-	nextAffinity.cache = previousAffinity.cache
-	nextAffinity.cache.Reconfigure(nextAffinity.cacheOptions)
-	return discarded, true
-}
-
-func sameSelectorInstance(left, right Selector) bool {
-	leftValue := reflect.ValueOf(left)
-	rightValue := reflect.ValueOf(right)
-	if !leftValue.IsValid() || !rightValue.IsValid() || leftValue.Type() != rightValue.Type() {
-		return false
-	}
-	return leftValue.Kind() == reflect.Pointer && leftValue.Pointer() == rightValue.Pointer()
 }
 
 // Selector returns the current credential selector.
@@ -292,21 +258,6 @@ func (m *Manager) Selector() Selector {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.selector
-}
-
-// SessionAffinityPersistenceError returns the active selector's latest
-// persistence failure, if session affinity persistence is enabled.
-func (m *Manager) SessionAffinityPersistenceError() *SessionCachePersistenceError {
-	if m == nil {
-		return nil
-	}
-	m.mu.RLock()
-	selector, _ := m.selector.(*SessionAffinitySelector)
-	m.mu.RUnlock()
-	if selector == nil {
-		return nil
-	}
-	return selector.PersistenceError()
 }
 
 // SetStore swaps the underlying persistence store.
