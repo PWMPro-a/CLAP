@@ -269,6 +269,28 @@ func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	}
 }
 
+func TestAPICallTransportAuthSourceIPBypassesGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+
+	transport := h.apiCallTransport(&coreauth.Auth{SourceIP: "127.0.0.2"})
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+	if httpTransport.Proxy != nil {
+		t.Fatal("expected source IP transport to bypass proxy function")
+	}
+	if httpTransport.DialContext == nil {
+		t.Fatal("expected source IP transport to configure DialContext")
+	}
+}
+
 func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
 	t.Parallel()
 

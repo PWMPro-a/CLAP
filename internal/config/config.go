@@ -524,6 +524,9 @@ type ClaudeKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// SourceIP binds direct outbound connections for this API key to a local source IP.
+	SourceIP string `yaml:"source-ip,omitempty" json:"source-ip,omitempty"`
+
 	// Models defines upstream model names and aliases for request routing.
 	Models []ClaudeModel `yaml:"models" json:"models"`
 
@@ -594,6 +597,9 @@ type CodexKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// SourceIP binds direct outbound connections for this API key to a local source IP.
+	SourceIP string `yaml:"source-ip,omitempty" json:"source-ip,omitempty"`
+
 	// Models defines upstream model names and aliases for request routing.
 	Models []CodexModel `yaml:"models" json:"models"`
 
@@ -654,6 +660,9 @@ type GeminiKey struct {
 
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// SourceIP binds direct outbound connections for this API key to a local source IP.
+	SourceIP string `yaml:"source-ip,omitempty" json:"source-ip,omitempty"`
 
 	// Models defines upstream model names and aliases for request routing.
 	Models []GeminiModel `yaml:"models,omitempty" json:"models,omitempty"`
@@ -730,6 +739,9 @@ type OpenAICompatibilityAPIKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// SourceIP binds direct outbound connections for this API key to a local source IP.
+	SourceIP string `yaml:"source-ip,omitempty" json:"source-ip,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
@@ -1091,6 +1103,9 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
+		for j := range e.APIKeyEntries {
+			e.APIKeyEntries[j].SourceIP = strings.TrimSpace(e.APIKeyEntries[j].SourceIP)
+		}
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
 			continue
@@ -1127,6 +1142,7 @@ func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {
 		e := entries[i]
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.SourceIP = strings.TrimSpace(e.SourceIP)
 		e.Headers = NormalizeHeaders(e.Headers)
 		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
 		if e.BaseURL == "" {
@@ -1145,6 +1161,7 @@ func (cfg *Config) SanitizeClaudeKeys() {
 	for i := range cfg.ClaudeKey {
 		entry := &cfg.ClaudeKey[i]
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
+		entry.SourceIP = strings.TrimSpace(entry.SourceIP)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 	}
@@ -1162,6 +1179,7 @@ func sanitizeGeminiKeyEntries(entries []GeminiKey) []GeminiKey {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.SourceIP = strings.TrimSpace(entry.SourceIP)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 		uniqueKey := entry.APIKey + "|" + entry.BaseURL

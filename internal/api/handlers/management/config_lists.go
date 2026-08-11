@@ -151,6 +151,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		Prefix         *string            `json:"prefix"`
 		BaseURL        *string            `json:"base-url"`
 		ProxyURL       *string            `json:"proxy-url"`
+		SourceIP       *string            `json:"source-ip"`
 		Headers        *map[string]string `json:"headers"`
 		ExcludedModels *[]string          `json:"excluded-models"`
 	}
@@ -205,6 +206,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.SourceIP != nil {
+		entry.SourceIP = strings.TrimSpace(*body.Value.SourceIP)
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
@@ -310,6 +314,7 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 		Prefix         *string            `json:"prefix"`
 		BaseURL        *string            `json:"base-url"`
 		ProxyURL       *string            `json:"proxy-url"`
+		SourceIP       *string            `json:"source-ip"`
 		Headers        *map[string]string `json:"headers"`
 		ExcludedModels *[]string          `json:"excluded-models"`
 	}
@@ -365,6 +370,9 @@ func (h *Handler) PatchInteractionsKey(c *gin.Context) {
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.SourceIP != nil {
+		entry.SourceIP = strings.TrimSpace(*body.Value.SourceIP)
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
@@ -472,6 +480,7 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		Prefix                  *string               `json:"prefix"`
 		BaseURL                 *string               `json:"base-url"`
 		ProxyURL                *string               `json:"proxy-url"`
+		SourceIP                *string               `json:"source-ip"`
 		Models                  *[]config.ClaudeModel `json:"models"`
 		Headers                 *map[string]string    `json:"headers"`
 		ExcludedModels          *[]string             `json:"excluded-models"`
@@ -519,6 +528,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.SourceIP != nil {
+		entry.SourceIP = strings.TrimSpace(*body.Value.SourceIP)
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.ClaudeModel(nil), (*body.Value.Models)...)
@@ -772,6 +784,7 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		Prefix         *string                     `json:"prefix"`
 		BaseURL        *string                     `json:"base-url"`
 		ProxyURL       *string                     `json:"proxy-url"`
+		SourceIP       *string                     `json:"source-ip"`
 		Headers        *map[string]string          `json:"headers"`
 		Models         *[]config.VertexCompatModel `json:"models"`
 		ExcludedModels *[]string                   `json:"excluded-models"`
@@ -834,6 +847,9 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.SourceIP != nil {
+		entry.SourceIP = strings.TrimSpace(*body.Value.SourceIP)
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
@@ -1128,6 +1144,7 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		Prefix         *string              `json:"prefix"`
 		BaseURL        *string              `json:"base-url"`
 		ProxyURL       *string              `json:"proxy-url"`
+		SourceIP       *string              `json:"source-ip"`
 		Models         *[]config.CodexModel `json:"models"`
 		Headers        *map[string]string   `json:"headers"`
 		ExcludedModels *[]string            `json:"excluded-models"`
@@ -1181,6 +1198,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.SourceIP != nil {
+		entry.SourceIP = strings.TrimSpace(*body.Value.SourceIP)
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.CodexModel(nil), (*body.Value.Models)...)
@@ -1296,6 +1316,7 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 		BaseURL        *string            `json:"base-url"`
 		Websockets     *bool              `json:"websockets"`
 		ProxyURL       *string            `json:"proxy-url"`
+		SourceIP       *string            `json:"source-ip"`
 		Models         *[]config.XAIModel `json:"models"`
 		Headers        *map[string]string `json:"headers"`
 		ExcludedModels *[]string          `json:"excluded-models"`
@@ -1356,6 +1377,9 @@ func (h *Handler) PatchXAIKey(c *gin.Context) {
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.SourceIP != nil {
+		entry.SourceIP = strings.TrimSpace(*body.Value.SourceIP)
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.XAIModel(nil), (*body.Value.Models)...)
@@ -1439,6 +1463,7 @@ func normalizeOpenAICompatibilityEntry(entry *config.OpenAICompatibility) {
 	for i := range entry.APIKeyEntries {
 		trimmed := strings.TrimSpace(entry.APIKeyEntries[i].APIKey)
 		entry.APIKeyEntries[i].APIKey = trimmed
+		entry.APIKeyEntries[i].SourceIP = strings.TrimSpace(entry.APIKeyEntries[i].SourceIP)
 		if trimmed != "" {
 			existing[trimmed] = struct{}{}
 		}
@@ -1468,6 +1493,7 @@ func normalizeClaudeKey(entry *config.ClaudeKey) {
 	entry.APIKey = strings.TrimSpace(entry.APIKey)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+	entry.SourceIP = strings.TrimSpace(entry.SourceIP)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
 	if len(entry.Models) == 0 {
@@ -1494,6 +1520,7 @@ func normalizeCodexKey(entry *config.CodexKey) {
 	entry.Prefix = strings.TrimSpace(entry.Prefix)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+	entry.SourceIP = strings.TrimSpace(entry.SourceIP)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
 	if len(entry.Models) == 0 {
@@ -1520,6 +1547,7 @@ func normalizeVertexCompatKey(entry *config.VertexCompatKey) {
 	entry.Prefix = strings.TrimSpace(entry.Prefix)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+	entry.SourceIP = strings.TrimSpace(entry.SourceIP)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
 	if len(entry.Models) == 0 {

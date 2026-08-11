@@ -2,11 +2,13 @@ package proxyutil
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +166,67 @@ func TestBuildHTTPTransportSOCKS5HProxy(t *testing.T) {
 	}
 	if transport.DialContext == nil {
 		t.Fatal("expected SOCKS5H transport to have custom DialContext")
+	}
+}
+
+func TestBuildHTTPTransportWithSourceIPBindsLocalAddress(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("loopback source alias behavior differs on Windows")
+	}
+
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("net.Listen returned error: %v", errListen)
+	}
+	defer func() { _ = listener.Close() }()
+
+	remoteAddrCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			errCh <- errAccept
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		remoteAddrCh <- conn.RemoteAddr().String()
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+	}()
+
+	transport, mode, errBuild := BuildHTTPTransportWithSourceIP("", "127.0.0.2")
+	if errBuild != nil {
+		t.Fatalf("BuildHTTPTransportWithSourceIP returned error: %v", errBuild)
+	}
+	if mode != ModeDirect {
+		t.Fatalf("mode = %d, want %d", mode, ModeDirect)
+	}
+	if transport == nil {
+		t.Fatal("expected source-bound transport, got nil")
+	}
+	req, errReq := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+listener.Addr().String(), nil)
+	if errReq != nil {
+		t.Fatalf("NewRequestWithContext returned error: %v", errReq)
+	}
+	resp, errDo := (&http.Client{Transport: transport}).Do(req)
+	if errDo != nil {
+		t.Skipf("source-bound loopback connect is not available on this host: %v", errDo)
+	}
+	_ = resp.Body.Close()
+
+	select {
+	case errAccept := <-errCh:
+		t.Fatalf("server accept error: %v", errAccept)
+	case remoteAddr := <-remoteAddrCh:
+		host, _, errSplit := net.SplitHostPort(remoteAddr)
+		if errSplit != nil {
+			t.Fatalf("SplitHostPort(%q) returned error: %v", remoteAddr, errSplit)
+		}
+		if host != "127.0.0.2" {
+			t.Fatalf("remote host = %q, want 127.0.0.2", host)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for source-bound connection")
 	}
 }
 

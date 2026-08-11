@@ -12,10 +12,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
-// 1. Use auth.ProxyURL if configured (highest priority)
-// 2. Use cfg.ProxyURL if auth proxy is not configured
-// 3. Use RoundTripper from context if neither are configured
+// NewProxyAwareHTTPClient creates an HTTP client with proper egress configuration priority:
+// 1. Use auth.ProxyURL if configured.
+// 2. Use auth.SourceIP if configured, bypassing the global proxy.
+// 3. Use cfg.ProxyURL/cfg.SourceIP.
+// 4. Use RoundTripper from context if neither are configured.
 //
 // Parameters:
 //   - ctx: The context containing optional RoundTripper
@@ -31,26 +32,17 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClient.Timeout = timeout
 	}
 
-	// Priority 1: Use auth.ProxyURL if configured
-	var proxyURL string
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
+	proxyURL, sourceIP := ResolveEgressSettings(cfg, auth)
 
-	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-
-	// If we have a proxy URL configured, set up the transport
-	if proxyURL != "" {
-		transport := buildProxyTransport(proxyURL)
+	// If we have an egress override configured, set up the transport.
+	if proxyURL != "" || sourceIP != "" {
+		transport := buildProxyTransport(proxyURL, sourceIP)
 		if transport != nil {
 			httpClient.Transport = transport
 			return httpClient
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
-		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyutil.Redact(proxyURL))
+		log.Debugf("failed to setup egress from proxy URL %s and source IP %q, falling back to context transport", proxyutil.Redact(proxyURL), sourceIP)
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
@@ -61,16 +53,32 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	return httpClient
 }
 
-// buildProxyTransport creates an HTTP transport configured for the given proxy URL.
-// It supports SOCKS5, HTTP, and HTTPS proxy protocols.
-//
-// Parameters:
-//   - proxyURL: The proxy URL string (e.g., "socks5://user:pass@host:port", "http://host:port")
-//
-// Returns:
-//   - *http.Transport: A configured transport, or nil if the proxy URL is invalid
-func buildProxyTransport(proxyURL string) *http.Transport {
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+// ResolveEgressSettings returns the effective proxy URL and source IP for an auth.
+func ResolveEgressSettings(cfg *config.Config, auth *cliproxyauth.Auth) (string, string) {
+	authProxyURL := ""
+	authSourceIP := ""
+	if auth != nil {
+		authProxyURL = strings.TrimSpace(auth.ProxyURL)
+		authSourceIP = strings.TrimSpace(auth.SourceIP)
+	}
+	if authProxyURL != "" {
+		if authSourceIP == "" && cfg != nil {
+			authSourceIP = strings.TrimSpace(cfg.SourceIP)
+		}
+		return authProxyURL, authSourceIP
+	}
+	if authSourceIP != "" {
+		return "", authSourceIP
+	}
+	if cfg == nil {
+		return "", ""
+	}
+	return strings.TrimSpace(cfg.ProxyURL), strings.TrimSpace(cfg.SourceIP)
+}
+
+// buildProxyTransport creates an HTTP transport configured for the given egress settings.
+func buildProxyTransport(proxyURL string, sourceIP string) *http.Transport {
+	transport, _, errBuild := proxyutil.BuildHTTPTransportWithSourceIP(proxyURL, sourceIP)
 	if errBuild != nil {
 		log.Errorf("%v", errBuild)
 		return nil

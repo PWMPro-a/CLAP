@@ -28,3 +28,19 @@ func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 		t.Fatal("expected direct transport to disable proxy function")
 	}
 }
+
+func TestResolveEgressSettingsAuthSourceIPBypassesGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	proxyURL, sourceIP := ResolveEgressSettings(
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"}},
+		&cliproxyauth.Auth{SourceIP: "127.0.0.2"},
+	)
+
+	if proxyURL != "" {
+		t.Fatalf("proxyURL = %q, want empty direct source route", proxyURL)
+	}
+	if sourceIP != "127.0.0.2" {
+		t.Fatalf("sourceIP = %q, want 127.0.0.2", sourceIP)
+	}
+}

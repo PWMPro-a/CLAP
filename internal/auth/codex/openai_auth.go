@@ -68,15 +68,29 @@ func NewCodexAuth(cfg *config.Config) *CodexAuth {
 // NewCodexAuthWithProxyURL creates a new CodexAuth service instance.
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
+	return NewCodexAuthWithProxyURLAndSourceIP(cfg, proxyURL, "")
+}
+
+// NewCodexAuthWithProxyURLAndSourceIP creates a new CodexAuth service instance.
+// proxyURL takes precedence over cfg.ProxyURL when non-empty, and sourceIP binds direct egress.
+func NewCodexAuthWithProxyURLAndSourceIP(cfg *config.Config, proxyURL string, sourceIP string) *CodexAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	effectiveSourceIP := strings.TrimSpace(sourceIP)
 	var sdkCfg config.SDKConfig
 	if cfg != nil {
 		sdkCfg = cfg.SDKConfig
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
+		if effectiveSourceIP == "" {
+			effectiveSourceIP = strings.TrimSpace(cfg.SourceIP)
+		}
+	}
+	if strings.TrimSpace(proxyURL) == "" && strings.TrimSpace(sourceIP) != "" {
+		effectiveProxyURL = ""
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
+	sdkCfg.SourceIP = effectiveSourceIP
 	return &CodexAuth{
 		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
 	}

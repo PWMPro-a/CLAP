@@ -81,6 +81,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ProxyURL != newCfg.ProxyURL {
 		changes = append(changes, fmt.Sprintf("proxy-url: %s -> %s", formatProxyURL(oldCfg.ProxyURL), formatProxyURL(newCfg.ProxyURL)))
 	}
+	if strings.TrimSpace(oldCfg.SourceIP) != strings.TrimSpace(newCfg.SourceIP) {
+		changes = append(changes, fmt.Sprintf("source-ip: %s -> %s", strings.TrimSpace(oldCfg.SourceIP), strings.TrimSpace(newCfg.SourceIP)))
+	}
 	if oldCfg.WebsocketAuth != newCfg.WebsocketAuth {
 		changes = append(changes, fmt.Sprintf("ws-auth: %t -> %t", oldCfg.WebsocketAuth, newCfg.WebsocketAuth))
 	}
@@ -131,6 +134,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.ProxyURL) != strings.TrimSpace(n.ProxyURL) {
 				changes = append(changes, fmt.Sprintf("gemini[%d].proxy-url: %s -> %s", i, formatProxyURL(o.ProxyURL), formatProxyURL(n.ProxyURL)))
 			}
+			if strings.TrimSpace(o.SourceIP) != strings.TrimSpace(n.SourceIP) {
+				changes = append(changes, fmt.Sprintf("gemini[%d].source-ip: %s -> %s", i, strings.TrimSpace(o.SourceIP), strings.TrimSpace(n.SourceIP)))
+			}
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("gemini[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
 			}
@@ -163,6 +169,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if strings.TrimSpace(o.ProxyURL) != strings.TrimSpace(n.ProxyURL) {
 				changes = append(changes, fmt.Sprintf("interactions[%d].proxy-url: %s -> %s", i, formatProxyURL(o.ProxyURL), formatProxyURL(n.ProxyURL)))
+			}
+			if strings.TrimSpace(o.SourceIP) != strings.TrimSpace(n.SourceIP) {
+				changes = append(changes, fmt.Sprintf("interactions[%d].source-ip: %s -> %s", i, strings.TrimSpace(o.SourceIP), strings.TrimSpace(n.SourceIP)))
 			}
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("interactions[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
@@ -198,6 +207,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if strings.TrimSpace(o.ProxyURL) != strings.TrimSpace(n.ProxyURL) {
 				changes = append(changes, fmt.Sprintf("claude[%d].proxy-url: %s -> %s", i, formatProxyURL(o.ProxyURL), formatProxyURL(n.ProxyURL)))
+			}
+			if strings.TrimSpace(o.SourceIP) != strings.TrimSpace(n.SourceIP) {
+				changes = append(changes, fmt.Sprintf("claude[%d].source-ip: %s -> %s", i, strings.TrimSpace(o.SourceIP), strings.TrimSpace(n.SourceIP)))
 			}
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("claude[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
@@ -248,6 +260,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.ProxyURL) != strings.TrimSpace(n.ProxyURL) {
 				changes = append(changes, fmt.Sprintf("codex[%d].proxy-url: %s -> %s", i, formatProxyURL(o.ProxyURL), formatProxyURL(n.ProxyURL)))
 			}
+			if strings.TrimSpace(o.SourceIP) != strings.TrimSpace(n.SourceIP) {
+				changes = append(changes, fmt.Sprintf("codex[%d].source-ip: %s -> %s", i, strings.TrimSpace(o.SourceIP), strings.TrimSpace(n.SourceIP)))
+			}
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("codex[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
 			}
@@ -285,6 +300,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if strings.TrimSpace(o.ProxyURL) != strings.TrimSpace(n.ProxyURL) {
 				changes = append(changes, fmt.Sprintf("xai[%d].proxy-url: %s -> %s", i, formatProxyURL(o.ProxyURL), formatProxyURL(n.ProxyURL)))
+			}
+			if strings.TrimSpace(o.SourceIP) != strings.TrimSpace(n.SourceIP) {
+				changes = append(changes, fmt.Sprintf("xai[%d].source-ip: %s -> %s", i, strings.TrimSpace(o.SourceIP), strings.TrimSpace(n.SourceIP)))
 			}
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("xai[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))
@@ -370,6 +388,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			}
 			if strings.TrimSpace(o.ProxyURL) != strings.TrimSpace(n.ProxyURL) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].proxy-url: %s -> %s", i, formatProxyURL(o.ProxyURL), formatProxyURL(n.ProxyURL)))
+			}
+			if strings.TrimSpace(o.SourceIP) != strings.TrimSpace(n.SourceIP) {
+				changes = append(changes, fmt.Sprintf("vertex[%d].source-ip: %s -> %s", i, strings.TrimSpace(o.SourceIP), strings.TrimSpace(n.SourceIP)))
 			}
 			if strings.TrimSpace(o.Prefix) != strings.TrimSpace(n.Prefix) {
 				changes = append(changes, fmt.Sprintf("vertex[%d].prefix: %s -> %s", i, strings.TrimSpace(o.Prefix), strings.TrimSpace(n.Prefix)))

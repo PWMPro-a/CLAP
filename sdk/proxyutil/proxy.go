@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -85,17 +86,50 @@ func NewDirectTransport() *http.Transport {
 	return clone
 }
 
+// NewSourceIPTransport returns a direct transport bound to the provided local source IP.
+func NewSourceIPTransport(sourceIP string) (*http.Transport, error) {
+	ip, errParse := parseSourceIP(sourceIP)
+	if errParse != nil {
+		return nil, errParse
+	}
+	clone := NewDirectTransport()
+	dialer := sourceIPNetDialer(ip)
+	clone.DialContext = dialer.DialContext
+	return clone, nil
+}
+
 // BuildHTTPTransport constructs an HTTP transport for the provided proxy setting.
 func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
+	return BuildHTTPTransportWithSourceIP(raw, "")
+}
+
+// BuildHTTPTransportWithSourceIP constructs an HTTP transport for proxy and source IP settings.
+// Concrete proxy URLs keep proxy behavior and do not bind source IP on the proxy socket.
+func BuildHTTPTransportWithSourceIP(raw string, sourceIP string) (*http.Transport, Mode, error) {
 	setting, errParse := Parse(raw)
 	if errParse != nil {
 		return nil, setting.Mode, errParse
 	}
+	sourceIP = strings.TrimSpace(sourceIP)
 
 	switch setting.Mode {
 	case ModeInherit:
+		if sourceIP != "" {
+			transport, errSource := NewSourceIPTransport(sourceIP)
+			if errSource != nil {
+				return nil, setting.Mode, errSource
+			}
+			return transport, ModeDirect, nil
+		}
 		return nil, setting.Mode, nil
 	case ModeDirect:
+		if sourceIP != "" {
+			transport, errSource := NewSourceIPTransport(sourceIP)
+			if errSource != nil {
+				return nil, setting.Mode, errSource
+			}
+			return transport, setting.Mode, nil
+		}
 		return NewDirectTransport(), setting.Mode, nil
 	case ModeProxy:
 		if setting.URL.Scheme == "socks5" || setting.URL.Scheme == "socks5h" {
@@ -126,15 +160,29 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 
 // BuildDialer constructs a proxy dialer for settings that operate at the connection layer.
 func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
+	return BuildDialerWithSourceIP(raw, "")
+}
+
+// BuildDialerWithSourceIP constructs a connection-layer dialer for proxy and source IP settings.
+// Concrete proxy URLs keep proxy behavior and do not bind source IP on the proxy socket.
+func BuildDialerWithSourceIP(raw string, sourceIP string) (proxy.Dialer, Mode, error) {
 	setting, errParse := Parse(raw)
 	if errParse != nil {
 		return nil, setting.Mode, errParse
 	}
+	sourceIP = strings.TrimSpace(sourceIP)
 
 	switch setting.Mode {
 	case ModeInherit:
+		if sourceIP != "" {
+			dialer, _, errSource := NewSourceIPDialer(sourceIP)
+			return dialer, ModeDirect, errSource
+		}
 		return nil, setting.Mode, nil
 	case ModeDirect:
+		if sourceIP != "" {
+			return NewSourceIPDialer(sourceIP)
+		}
 		return proxy.Direct, setting.Mode, nil
 	case ModeProxy:
 		if setting.URL.Scheme == "http" || setting.URL.Scheme == "https" {
@@ -147,6 +195,43 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 		return dialer, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
+	}
+}
+
+// NewSourceIPDialer returns a direct proxy.Dialer bound to the provided local source IP.
+func NewSourceIPDialer(sourceIP string) (proxy.Dialer, Mode, error) {
+	ip, errParse := parseSourceIP(sourceIP)
+	if errParse != nil {
+		return nil, ModeDirect, errParse
+	}
+	return &sourceIPDialer{dialer: sourceIPNetDialer(ip)}, ModeDirect, nil
+}
+
+type sourceIPDialer struct {
+	dialer net.Dialer
+}
+
+func (d *sourceIPDialer) Dial(network, addr string) (net.Conn, error) {
+	return d.dialer.Dial(network, addr)
+}
+
+func parseSourceIP(sourceIP string) (net.IP, error) {
+	trimmed := strings.TrimSpace(sourceIP)
+	if trimmed == "" {
+		return nil, fmt.Errorf("source IP is empty")
+	}
+	ip := net.ParseIP(trimmed)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid source IP: %s", trimmed)
+	}
+	return ip, nil
+}
+
+func sourceIPNetDialer(ip net.IP) net.Dialer {
+	return net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		LocalAddr: &net.TCPAddr{IP: ip},
 	}
 }
 

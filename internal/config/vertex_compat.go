@@ -28,6 +28,9 @@ type VertexCompatKey struct {
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 
+	// SourceIP binds direct outbound connections for this API key to a local source IP.
+	SourceIP string `yaml:"source-ip,omitempty" json:"source-ip,omitempty"`
+
 	// Headers optionally adds extra HTTP headers for requests sent with this key.
 	// Commonly used for cookies, user-agent, and other authentication headers.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
@@ -80,6 +83,7 @@ func (cfg *Config) SanitizeVertexCompatKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.SourceIP = strings.TrimSpace(entry.SourceIP)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 

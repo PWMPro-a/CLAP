@@ -69,6 +69,8 @@ type Auth struct {
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
 	ProxyURL string `json:"proxy_url,omitempty"`
+	// SourceIP binds direct outbound connections for this auth to a local source IP.
+	SourceIP string `json:"source_ip,omitempty"`
 	// Attributes stores provider specific metadata needed by executors (immutable configuration).
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
@@ -439,6 +441,17 @@ func (a *Auth) ProxyInfo() string {
 		return "via " + proxyStr[:idx] + " proxy"
 	}
 	return "via proxy"
+}
+
+func (a *Auth) SourceInfo() string {
+	if a == nil {
+		return ""
+	}
+	sourceIP := strings.TrimSpace(a.SourceIP)
+	if sourceIP == "" {
+		return ""
+	}
+	return "from " + sourceIP
 }
 
 // DisableCoolingOverride returns the auth scoped disable_cooling override when present.

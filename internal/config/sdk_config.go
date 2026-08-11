@@ -9,6 +9,9 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// SourceIP binds direct outbound connections to a specific local source IP.
+	SourceIP string `yaml:"source-ip" json:"source-ip"`
+
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
 	//
 	// Supported values:

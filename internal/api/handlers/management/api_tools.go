@@ -573,25 +573,38 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
-	var proxyCandidates []string
+	type egressCandidate struct {
+		proxyURL string
+		sourceIP string
+	}
+	var candidates []egressCandidate
 	if auth != nil {
-		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
-			proxyCandidates = append(proxyCandidates, proxyStr)
+		authProxyURL := strings.TrimSpace(auth.ProxyURL)
+		authSourceIP := strings.TrimSpace(auth.SourceIP)
+		if authProxyURL != "" && authSourceIP == "" && h != nil && h.cfg != nil {
+			authSourceIP = strings.TrimSpace(h.cfg.SourceIP)
+		}
+		if authProxyURL != "" || authSourceIP != "" {
+			candidates = append(candidates, egressCandidate{proxyURL: authProxyURL, sourceIP: authSourceIP})
 		}
 		if h != nil && h.cfg != nil {
-			if proxyStr := strings.TrimSpace(proxyURLFromAPIKeyConfig(h.cfg, auth)); proxyStr != "" {
-				proxyCandidates = append(proxyCandidates, proxyStr)
+			cfgProxyURL := strings.TrimSpace(proxyURLFromAPIKeyConfig(h.cfg, auth))
+			cfgSourceIP := strings.TrimSpace(sourceIPFromAPIKeyConfig(h.cfg, auth))
+			if cfgProxyURL != "" || cfgSourceIP != "" {
+				candidates = append(candidates, egressCandidate{proxyURL: cfgProxyURL, sourceIP: cfgSourceIP})
 			}
 		}
 	}
 	if h != nil && h.cfg != nil {
-		if proxyStr := strings.TrimSpace(h.cfg.ProxyURL); proxyStr != "" {
-			proxyCandidates = append(proxyCandidates, proxyStr)
+		proxyStr := strings.TrimSpace(h.cfg.ProxyURL)
+		sourceIP := strings.TrimSpace(h.cfg.SourceIP)
+		if proxyStr != "" || sourceIP != "" {
+			candidates = append(candidates, egressCandidate{proxyURL: proxyStr, sourceIP: sourceIP})
 		}
 	}
 
-	for _, proxyStr := range proxyCandidates {
-		if transport := buildProxyTransport(proxyStr); transport != nil {
+	for _, candidate := range candidates {
+		if transport := buildProxyTransport(candidate.proxyURL, candidate.sourceIP); transport != nil {
 			return transport
 		}
 	}
@@ -690,6 +703,59 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 		if entry := resolveAPIKeyConfig(cfg.XAIKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
+	case "vertex":
+		if entry := resolveAPIKeyConfig(cfg.VertexCompatAPIKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyURL)
+		}
+	}
+	return ""
+}
+
+func sourceIPFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
+	if cfg == nil || auth == nil {
+		return ""
+	}
+	authKind, authAccount := auth.AccountInfo()
+	if !strings.EqualFold(strings.TrimSpace(authKind), "api_key") {
+		return ""
+	}
+
+	attrs := auth.Attributes
+	compatName := ""
+	providerKey := ""
+	if len(attrs) > 0 {
+		compatName = strings.TrimSpace(attrs["compat_name"])
+		providerKey = strings.TrimSpace(attrs["provider_key"])
+	}
+	if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+		return resolveOpenAICompatAPIKeySourceIP(cfg, auth, strings.TrimSpace(authAccount), providerKey, compatName)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "gemini":
+		if entry := resolveAPIKeyConfig(cfg.GeminiKey, auth); entry != nil {
+			return strings.TrimSpace(entry.SourceIP)
+		}
+	case "gemini-interactions":
+		if entry := resolveAPIKeyConfig(cfg.InteractionsKey, auth); entry != nil {
+			return strings.TrimSpace(entry.SourceIP)
+		}
+	case "claude":
+		if entry := resolveAPIKeyConfig(cfg.ClaudeKey, auth); entry != nil {
+			return strings.TrimSpace(entry.SourceIP)
+		}
+	case "codex":
+		if entry := resolveAPIKeyConfig(cfg.CodexKey, auth); entry != nil {
+			return strings.TrimSpace(entry.SourceIP)
+		}
+	case "xai":
+		if entry := resolveAPIKeyConfig(cfg.XAIKey, auth); entry != nil {
+			return strings.TrimSpace(entry.SourceIP)
+		}
+	case "vertex":
+		if entry := resolveAPIKeyConfig(cfg.VertexCompatAPIKey, auth); entry != nil {
+			return strings.TrimSpace(entry.SourceIP)
+		}
 	}
 	return ""
 }
@@ -733,8 +799,47 @@ func resolveOpenAICompatAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth, 
 	return ""
 }
 
-func buildProxyTransport(proxyStr string) *http.Transport {
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyStr)
+func resolveOpenAICompatAPIKeySourceIP(cfg *config.Config, auth *coreauth.Auth, apiKey, providerKey, compatName string) string {
+	if cfg == nil || auth == nil {
+		return ""
+	}
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return ""
+	}
+	candidates := make([]string, 0, 3)
+	if v := strings.TrimSpace(compatName); v != "" {
+		candidates = append(candidates, v)
+	}
+	if v := strings.TrimSpace(providerKey); v != "" {
+		candidates = append(candidates, v)
+	}
+	if v := strings.TrimSpace(auth.Provider); v != "" {
+		candidates = append(candidates, v)
+	}
+
+	for i := range cfg.OpenAICompatibility {
+		compat := &cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
+		for _, candidate := range candidates {
+			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
+				for j := range compat.APIKeyEntries {
+					entry := &compat.APIKeyEntries[j]
+					if strings.EqualFold(strings.TrimSpace(entry.APIKey), apiKey) {
+						return strings.TrimSpace(entry.SourceIP)
+					}
+				}
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+func buildProxyTransport(proxyStr string, sourceIP string) *http.Transport {
+	transport, _, errBuild := proxyutil.BuildHTTPTransportWithSourceIP(proxyStr, sourceIP)
 	if errBuild != nil {
 		log.WithError(errBuild).Debug("build proxy transport failed")
 		return nil

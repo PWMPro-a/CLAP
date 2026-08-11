@@ -11,7 +11,7 @@ import (
 )
 
 // defaultRoundTripperProvider returns a per-auth HTTP RoundTripper based on
-// the Auth.ProxyURL value. It caches transports per proxy URL string.
+// the Auth.ProxyURL and Auth.SourceIP values. It caches transports per egress tuple.
 type defaultRoundTripperProvider struct {
 	mu    sync.RWMutex
 	cache map[string]http.RoundTripper
@@ -27,16 +27,18 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 		return nil
 	}
 	proxyStr := strings.TrimSpace(auth.ProxyURL)
-	if proxyStr == "" {
+	sourceIP := strings.TrimSpace(auth.SourceIP)
+	if proxyStr == "" && sourceIP == "" {
 		return nil
 	}
+	cacheKey := proxyStr + "\x00" + sourceIP
 	p.mu.RLock()
-	rt := p.cache[proxyStr]
+	rt := p.cache[cacheKey]
 	p.mu.RUnlock()
 	if rt != nil {
 		return rt
 	}
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyStr)
+	transport, _, errBuild := proxyutil.BuildHTTPTransportWithSourceIP(proxyStr, sourceIP)
 	if errBuild != nil {
 		log.Errorf("%v", errBuild)
 		return nil
@@ -45,7 +47,7 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 		return nil
 	}
 	p.mu.Lock()
-	p.cache[proxyStr] = transport
+	p.cache[cacheKey] = transport
 	p.mu.Unlock()
 	return transport
 }

@@ -95,6 +95,7 @@ func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 					APIKey:   "api-key",
 					BaseURL:  "https://custom.api.com",
 					ProxyURL: "http://proxy.local:8080",
+					SourceIP: "127.0.0.2",
 					Prefix:   "custom",
 				},
 			},
@@ -105,6 +106,9 @@ func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 				}
 				if auths[0].ProxyURL != "http://proxy.local:8080" {
 					t.Errorf("expected proxy_url http://proxy.local:8080, got %s", auths[0].ProxyURL)
+				}
+				if auths[0].SourceIP != "127.0.0.2" {
+					t.Errorf("expected source_ip 127.0.0.2, got %s", auths[0].SourceIP)
 				}
 			},
 		},

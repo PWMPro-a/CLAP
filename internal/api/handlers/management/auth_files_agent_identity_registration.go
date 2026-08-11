@@ -418,11 +418,16 @@ func (h *Handler) retryAgentIdentityRegistration(name string) (agentIdentityRegi
 func (h *Handler) agentIdentityRegistrationClient(auth *coreauth.Auth) *http.Client {
 	client := &http.Client{}
 	proxyURL := strings.TrimSpace(auth.ProxyURL)
-	if proxyURL == "" && h != nil && h.cfg != nil {
-		proxyURL = strings.TrimSpace(h.cfg.ProxyURL)
+	sourceIP := strings.TrimSpace(auth.SourceIP)
+	if proxyURL != "" && sourceIP == "" && h != nil && h.cfg != nil {
+		sourceIP = strings.TrimSpace(h.cfg.SourceIP)
 	}
-	if proxyURL != "" {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
+	if proxyURL == "" && sourceIP == "" && h != nil && h.cfg != nil {
+		proxyURL = strings.TrimSpace(h.cfg.ProxyURL)
+		sourceIP = strings.TrimSpace(h.cfg.SourceIP)
+	}
+	if proxyURL != "" || sourceIP != "" {
+		if transport := buildProxyTransport(proxyURL, sourceIP); transport != nil {
 			client.Transport = transport
 		}
 	}

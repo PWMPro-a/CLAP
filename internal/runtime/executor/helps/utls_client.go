@@ -26,12 +26,12 @@ type utlsRoundTripper struct {
 	dialer      proxy.Dialer
 }
 
-func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
+func newUtlsRoundTripper(proxyURL string, sourceIP string) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
-	if proxyURL != "" {
-		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
+	if proxyURL != "" || strings.TrimSpace(sourceIP) != "" {
+		proxyDialer, mode, errBuild := proxyutil.BuildDialerWithSourceIP(proxyURL, sourceIP)
 		if errBuild != nil {
-			log.Errorf("utls: failed to configure proxy dialer for %q: %v", proxyutil.Redact(proxyURL), errBuild)
+			log.Errorf("utls: failed to configure egress dialer for proxy %q and source IP %q: %v", proxyutil.Redact(proxyURL), strings.TrimSpace(sourceIP), errBuild)
 		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
 			dialer = proxyDialer
 		}
@@ -156,23 +156,17 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 // Use this for provider requests that need a Chrome-like TLS fingerprint.
 // Falls back to standard transport for non-HTTPS requests.
 func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	var proxyURL string
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	proxyURL, sourceIP := ResolveEgressSettings(cfg, auth)
 
 	var ctxRoundTripper http.RoundTripper
 	if ctx != nil {
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL, sourceIP)
 	var standardTransport http.RoundTripper = http.DefaultTransport
-	if proxyURL != "" {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
+	if proxyURL != "" || sourceIP != "" {
+		if transport := buildProxyTransport(proxyURL, sourceIP); transport != nil {
 			standardTransport = transport
 		}
 	} else if ctxRoundTripper != nil {

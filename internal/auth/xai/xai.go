@@ -31,15 +31,28 @@ func NewXAIAuth(cfg *config.Config) *XAIAuth {
 
 // NewXAIAuthWithProxyURL creates an xAI OAuth helper with an explicit proxy URL.
 func NewXAIAuthWithProxyURL(cfg *config.Config, proxyURL string) *XAIAuth {
+	return NewXAIAuthWithProxyURLAndSourceIP(cfg, proxyURL, "")
+}
+
+// NewXAIAuthWithProxyURLAndSourceIP creates an xAI OAuth helper with explicit egress settings.
+func NewXAIAuthWithProxyURLAndSourceIP(cfg *config.Config, proxyURL string, sourceIP string) *XAIAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	effectiveSourceIP := strings.TrimSpace(sourceIP)
 	var sdkCfg config.SDKConfig
 	if cfg != nil {
 		sdkCfg = cfg.SDKConfig
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
+		if effectiveSourceIP == "" {
+			effectiveSourceIP = strings.TrimSpace(cfg.SourceIP)
+		}
+	}
+	if strings.TrimSpace(proxyURL) == "" && strings.TrimSpace(sourceIP) != "" {
+		effectiveProxyURL = ""
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
+	sdkCfg.SourceIP = effectiveSourceIP
 	return &XAIAuth{httpClient: util.SetProxy(&sdkCfg, &http.Client{Timeout: httpClientTimeout})}
 }
 

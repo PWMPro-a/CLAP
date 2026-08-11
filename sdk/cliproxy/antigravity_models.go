@@ -38,7 +38,8 @@ func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Contex
 	}
 
 	client := &http.Client{}
-	if transport, _, errProxy := proxyutil.BuildHTTPTransport(s.antigravityModelFetchProxyURL(auth)); errProxy == nil && transport != nil {
+	proxyURL, sourceIP := s.antigravityModelFetchEgress(auth)
+	if transport, _, errProxy := proxyutil.BuildHTTPTransportWithSourceIP(proxyURL, sourceIP); errProxy == nil && transport != nil {
 		client.Transport = transport
 	}
 
@@ -74,16 +75,24 @@ func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Contex
 	return antigravityModelCapabilityHints{}
 }
 
-func (s *Service) antigravityModelFetchProxyURL(auth *coreauth.Auth) string {
+func (s *Service) antigravityModelFetchEgress(auth *coreauth.Auth) (string, string) {
 	if auth != nil {
-		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
-			return proxyURL
+		proxyURL := strings.TrimSpace(auth.ProxyURL)
+		sourceIP := strings.TrimSpace(auth.SourceIP)
+		if proxyURL != "" {
+			if sourceIP == "" && s != nil && s.cfg != nil {
+				sourceIP = strings.TrimSpace(s.cfg.SourceIP)
+			}
+			return proxyURL, sourceIP
+		}
+		if sourceIP != "" {
+			return "", sourceIP
 		}
 	}
 	if s != nil && s.cfg != nil {
-		return strings.TrimSpace(s.cfg.ProxyURL)
+		return strings.TrimSpace(s.cfg.ProxyURL), strings.TrimSpace(s.cfg.SourceIP)
 	}
-	return ""
+	return "", ""
 }
 
 func antigravityModelBaseURLs(auth *coreauth.Auth) []string {

@@ -112,16 +112,30 @@ func NewDeviceFlowClientWithDeviceID(cfg *config.Config, deviceID string) *Devic
 // NewDeviceFlowClientWithDeviceIDAndProxyURL creates a new device flow client with a proxy override.
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg *config.Config, deviceID string, proxyURL string) *DeviceFlowClient {
+	return NewDeviceFlowClientWithDeviceIDAndEgress(cfg, deviceID, proxyURL, "")
+}
+
+// NewDeviceFlowClientWithDeviceIDAndEgress creates a new device flow client with egress overrides.
+// proxyURL takes precedence over cfg.ProxyURL when non-empty, and sourceIP binds direct egress.
+func NewDeviceFlowClientWithDeviceIDAndEgress(cfg *config.Config, deviceID string, proxyURL string, sourceIP string) *DeviceFlowClient {
 	client := &http.Client{Timeout: 30 * time.Second}
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	effectiveSourceIP := strings.TrimSpace(sourceIP)
 	var sdkCfg config.SDKConfig
 	if cfg != nil {
 		sdkCfg = cfg.SDKConfig
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
+		if effectiveSourceIP == "" {
+			effectiveSourceIP = strings.TrimSpace(cfg.SourceIP)
+		}
+	}
+	if strings.TrimSpace(proxyURL) == "" && strings.TrimSpace(sourceIP) != "" {
+		effectiveProxyURL = ""
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
+	sdkCfg.SourceIP = effectiveSourceIP
 	client = util.SetProxy(&sdkCfg, client)
 
 	resolvedDeviceID := strings.TrimSpace(deviceID)

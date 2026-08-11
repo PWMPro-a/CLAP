@@ -32,9 +32,9 @@ type utlsRoundTripper struct {
 func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
 	if cfg != nil {
-		proxyDialer, mode, errBuild := proxyutil.BuildDialer(cfg.ProxyURL)
+		proxyDialer, mode, errBuild := proxyutil.BuildDialerWithSourceIP(cfg.ProxyURL, cfg.SourceIP)
 		if errBuild != nil {
-			log.Errorf("failed to configure proxy dialer for %q: %v", proxyutil.Redact(cfg.ProxyURL), errBuild)
+			log.Errorf("failed to configure egress dialer for proxy %q and source IP %q: %v", proxyutil.Redact(cfg.ProxyURL), strings.TrimSpace(cfg.SourceIP), errBuild)
 		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
 			dialer = proxyDialer
 		}

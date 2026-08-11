@@ -92,6 +92,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			if len(auths) == 0 {
 				return nil
 			}
+			sourceIP := authFileStringValue(metadata, "source_ip", "source-ip", "sourceIp")
 			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
 			disabled, _ := metadata["disabled"].(bool)
@@ -110,6 +111,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 				auth.Attributes[coreauth.AttributePath] = fullPath
 				auth.Attributes[coreauth.AttributeSource] = fullPath
 				auth.Attributes[coreauth.AttributeSourceBackend] = coreauth.AuthSourceFile
+				if strings.TrimSpace(auth.SourceIP) == "" {
+					auth.SourceIP = sourceIP
+				}
 				if disabled {
 					auth.Disabled = true
 					auth.Status = coreauth.StatusDisabled
@@ -144,9 +148,8 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 
 	proxyURL := ""
-	if p, ok := metadata["proxy_url"].(string); ok {
-		proxyURL = p
-	}
+	proxyURL = authFileStringValue(metadata, "proxy_url", "proxy-url", "proxyUrl")
+	sourceIP := authFileStringValue(metadata, "source_ip", "source-ip", "sourceIp")
 
 	prefix := ""
 	if rawPrefix, ok := metadata["prefix"].(string); ok {
@@ -180,6 +183,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
 		},
 		ProxyURL:  proxyURL,
+		SourceIP:  sourceIP,
 		Metadata:  metadata,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -224,6 +228,15 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+func authFileStringValue(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := metadata[key].(string); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func parsePluginFileAuths(parser PluginAuthParser, req pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {

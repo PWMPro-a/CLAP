@@ -154,17 +154,31 @@ func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
 // NewClaudeAuthWithProxyURL creates a new Anthropic authentication service with a proxy override.
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth {
+	return NewClaudeAuthWithProxyURLAndSourceIP(cfg, proxyURL, "")
+}
+
+// NewClaudeAuthWithProxyURLAndSourceIP creates a new Anthropic authentication service with egress overrides.
+// proxyURL takes precedence over cfg.ProxyURL when non-empty, and sourceIP binds direct egress.
+func NewClaudeAuthWithProxyURLAndSourceIP(cfg *config.Config, proxyURL string, sourceIP string) *ClaudeAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
+	effectiveSourceIP := strings.TrimSpace(sourceIP)
 	var sdkCfg *config.SDKConfig
 	if cfg != nil {
 		sdkCfgCopy := cfg.SDKConfig
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
+		if effectiveSourceIP == "" {
+			effectiveSourceIP = strings.TrimSpace(cfg.SourceIP)
+		}
+		if strings.TrimSpace(proxyURL) == "" && strings.TrimSpace(sourceIP) != "" {
+			effectiveProxyURL = ""
+		}
 		sdkCfgCopy.ProxyURL = effectiveProxyURL
+		sdkCfgCopy.SourceIP = effectiveSourceIP
 		sdkCfg = &sdkCfgCopy
-	} else if effectiveProxyURL != "" {
-		sdkCfgCopy := config.SDKConfig{ProxyURL: effectiveProxyURL}
+	} else if effectiveProxyURL != "" || effectiveSourceIP != "" {
+		sdkCfgCopy := config.SDKConfig{ProxyURL: effectiveProxyURL, SourceIP: effectiveSourceIP}
 		sdkCfg = &sdkCfgCopy
 	}
 

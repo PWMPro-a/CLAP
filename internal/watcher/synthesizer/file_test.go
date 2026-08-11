@@ -73,6 +73,7 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 		"type":      "claude",
 		"email":     "test@example.com",
 		"proxy_url": "http://proxy.local",
+		"source_ip": "127.0.0.2",
 		"prefix":    "test-prefix",
 		"headers": map[string]string{
 			" X-Test ": " value ",
@@ -114,6 +115,9 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 	if auths[0].ProxyURL != "http://proxy.local" {
 		t.Errorf("expected proxy_url http://proxy.local, got %s", auths[0].ProxyURL)
+	}
+	if auths[0].SourceIP != "127.0.0.2" {
+		t.Errorf("expected source_ip 127.0.0.2, got %s", auths[0].SourceIP)
 	}
 	if got := auths[0].Attributes["header:X-Test"]; got != "value" {
 		t.Errorf("expected header:X-Test value, got %q", got)

@@ -11,15 +11,14 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// SetProxy configures the provided HTTP client with proxy settings from the configuration.
-// It supports SOCKS5, HTTP, and HTTPS proxies. The function modifies the client's transport
-// to route requests through the configured proxy server.
+// SetProxy configures the provided HTTP client with egress settings from the configuration.
+// It supports SOCKS5/HTTP/HTTPS proxies and direct source IP binding.
 func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
 	if cfg == nil || httpClient == nil {
 		return httpClient
 	}
 
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(cfg.ProxyURL)
+	transport, _, errBuild := proxyutil.BuildHTTPTransportWithSourceIP(cfg.ProxyURL, cfg.SourceIP)
 	if errBuild != nil {
 		log.Errorf("%v", errBuild)
 	}

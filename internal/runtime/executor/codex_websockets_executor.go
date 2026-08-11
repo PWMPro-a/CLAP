@@ -32,7 +32,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"golang.org/x/net/proxy"
 )
 
 const (
@@ -1352,14 +1351,8 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}).DialContext,
 	}
 
-	proxyURL := ""
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-	if proxyURL == "" {
+	proxyURL, sourceIP := helps.ResolveEgressSettings(cfg, auth)
+	if proxyURL == "" && sourceIP == "" {
 		return dialer
 	}
 
@@ -1372,28 +1365,29 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 	switch setting.Mode {
 	case proxyutil.ModeDirect:
 		dialer.Proxy = nil
+		if sourceIP != "" {
+			setWebsocketSourceDialer(dialer, proxyURL, sourceIP)
+		}
 		return dialer
 	case proxyutil.ModeProxy:
 	default:
+		if sourceIP != "" {
+			dialer.Proxy = nil
+			setWebsocketSourceDialer(dialer, proxyURL, sourceIP)
+		}
 		return dialer
 	}
 
 	switch setting.URL.Scheme {
 	case "socks5", "socks5h":
-		var proxyAuth *proxy.Auth
-		if setting.URL.User != nil {
-			username := setting.URL.User.Username()
-			password, _ := setting.URL.User.Password()
-			proxyAuth = &proxy.Auth{User: username, Password: password}
-		}
-		socksDialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
-		if errSOCKS5 != nil {
-			log.Errorf("codex websockets executor: create SOCKS5 dialer failed: %v", errSOCKS5)
+		proxyDialer, _, errBuild := proxyutil.BuildDialerWithSourceIP(proxyURL, sourceIP)
+		if errBuild != nil {
+			log.Errorf("codex websockets executor: create SOCKS dialer failed: %v", errBuild)
 			return dialer
 		}
 		dialer.Proxy = nil
 		dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
-			return socksDialer.Dial(network, addr)
+			return proxyDialer.Dial(network, addr)
 		}
 	case "http", "https":
 		dialer.Proxy = http.ProxyURL(setting.URL)
@@ -1402,6 +1396,23 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 	}
 
 	return dialer
+}
+
+func setWebsocketSourceDialer(dialer *websocket.Dialer, proxyURL string, sourceIP string) {
+	if dialer == nil {
+		return
+	}
+	sourceDialer, _, errBuild := proxyutil.BuildDialerWithSourceIP(proxyURL, sourceIP)
+	if errBuild != nil {
+		log.Errorf("codex websockets executor: create source IP dialer failed: %v", errBuild)
+		return
+	}
+	if sourceDialer == nil {
+		return
+	}
+	dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+		return sourceDialer.Dial(network, addr)
+	}
 }
 
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
@@ -1969,14 +1980,8 @@ func codexStatelessWebsocketPoolKey(auth *cliproxyauth.Auth, cfg *config.Config,
 	if authID == "" || wsURL == "" {
 		return ""
 	}
-	proxyURL := ""
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-	return authID + "\x00" + wsURL + "\x00" + proxyURL
+	proxyURL, sourceIP := helps.ResolveEgressSettings(cfg, auth)
+	return authID + "\x00" + wsURL + "\x00" + strings.TrimSpace(proxyURL) + "\x00" + strings.TrimSpace(sourceIP)
 }
 
 // acquireStatelessSession reserves an idle pooled session and returns it with

@@ -493,6 +493,12 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
+				if proxyURL := strings.TrimSpace(gjson.GetBytes(data, "proxy_url").String()); proxyURL != "" {
+					fileData["proxy_url"] = proxyURL
+				}
+				if sourceIP := authFileJSONSourceIP(data); sourceIP != "" {
+					fileData["source_ip"] = sourceIP
+				}
 				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 					switch pv.Type {
 					case gjson.Number:
@@ -583,6 +589,12 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		if account != "" {
 			entry["account"] = account
 		}
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		entry["proxy_url"] = proxyURL
+	}
+	if sourceIP := strings.TrimSpace(auth.SourceIP); sourceIP != "" {
+		entry["source_ip"] = sourceIP
 	}
 	if !auth.CreatedAt.IsZero() {
 		entry["created_at"] = auth.CreatedAt
@@ -2207,6 +2219,9 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 			auth.ProxyURL = strings.TrimSpace(proxyURL)
 		}
 	}
+	if authFileTouchedSourceIP(touchedRoots) {
+		auth.SourceIP = authFileMetadataSourceIP(auth.Metadata)
+	}
 	if _, ok := touchedRoots["headers"]; ok {
 		syncAuthFileHeaderAttributes(auth)
 	}
@@ -2222,6 +2237,36 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncAuthFileDisabledState(auth)
 	}
+}
+
+func authFileTouchedSourceIP(touchedRoots map[string]struct{}) bool {
+	for _, key := range []string{"source_ip", "source-ip", "sourceIp"} {
+		if _, ok := touchedRoots[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func authFileMetadataSourceIP(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	for _, key := range []string{"source_ip", "source-ip", "sourceIp"} {
+		if raw, ok := metadata[key].(string); ok {
+			return strings.TrimSpace(raw)
+		}
+	}
+	return ""
+}
+
+func authFileJSONSourceIP(data []byte) string {
+	for _, key := range []string{"source_ip", "source-ip", "sourceIp"} {
+		if value := strings.TrimSpace(gjson.GetBytes(data, key).String()); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func syncAuthFileHeaderAttributes(auth *coreauth.Auth) {
