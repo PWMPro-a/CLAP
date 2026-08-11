@@ -358,6 +358,24 @@ func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.O
 	return helps.DerivedSessionUUID("xai", opts.Metadata, req.Metadata)
 }
 
+// xaiWebsocketStateSessionID namespaces local response-ID and transcript state
+// by the downstream caller. Explicit prompt_cache_key values are client chosen
+// and therefore are not globally unique across gateway tenants.
+func xaiWebsocketStateSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	sessionID := xaiExecutionSessionID(req, opts)
+	if sessionID == "" {
+		return ""
+	}
+	callerScope := xaiMetadataString(opts.Metadata, cliproxyexecutor.CallerScopeMetadataKey)
+	if callerScope == "" {
+		callerScope = xaiMetadataString(req.Metadata, cliproxyexecutor.CallerScopeMetadataKey)
+	}
+	if callerScope == "" {
+		return sessionID
+	}
+	return callerScope + "\x00" + sessionID
+}
+
 func xaiRequiresIsolatedConversation(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), xaiComposerModelPrefix)
 }

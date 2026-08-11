@@ -190,6 +190,80 @@ func TestCodexWebsocketsStatelessPoolDropsCompletedResponseFrames(t *testing.T) 
 	}
 }
 
+func TestCodexWebsocketsExecutionSessionDropsCompletedResponseFrames(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer conn.Close()
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-session-stale-1"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","item":{"id":"item-session-stale-1"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","item_id":"item-session-stale-1","delta":"first"}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-session-stale-1","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
+
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","item_id":"item-session-stale-1","delta":"STALE_SESSION_SHOULD_NOT_LEAK"}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp-session-stale-1","output":[]}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp-session-fresh-2"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","item":{"id":"item-session-fresh-2"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","item_id":"item-session-fresh-2","delta":"fresh-session-second"}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-session-fresh-2","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
+	}))
+	defer server.Close()
+
+	store := &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec.store = store
+	defer exec.closeAllExecutionSessions("test_cleanup")
+	auth := &cliproxyauth.Auth{
+		ID: "auth-execution-session-stale-test",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}
+	lifecycle := &countingWebsocketLifecycle{}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:       sdktranslator.FromString("openai-response"),
+		ResponseFormat:     sdktranslator.FromString("openai-response"),
+		ExecutionLifecycle: lifecycle,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "named-stale-session",
+		},
+	}
+
+	firstResult, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("first ExecuteStream() error = %v", errExecute)
+	}
+	drainCodexWebsocketTestStream(t, firstResult)
+
+	secondResult, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("second ExecuteStream() error = %v", errExecute)
+	}
+	secondBody := drainCodexWebsocketTestStream(t, secondResult)
+	if strings.Contains(secondBody, "STALE_SESSION_SHOULD_NOT_LEAK") || strings.Contains(secondBody, "resp-session-stale-1") {
+		t.Fatalf("second execution-session stream leaked completed response frames: %s", secondBody)
+	}
+	if !strings.Contains(secondBody, "fresh-session-second") || !strings.Contains(secondBody, "resp-session-fresh-2") {
+		t.Fatalf("second execution-session stream missing fresh response events: %s", secondBody)
+	}
+}
+
 func TestCodexWebsocketsStatelessPoolReconnectsAfterCanceledResponse(t *testing.T) {
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}

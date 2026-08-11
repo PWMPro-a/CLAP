@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,9 +26,14 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy           string
-	sessionAffinity    bool
-	sessionAffinityTTL time.Duration
+	strategy                     string
+	sessionAffinity              bool
+	sessionAffinityTTL           time.Duration
+	sessionAffinityRendezvous    bool
+	sessionAffinityQuotaAware    bool
+	sessionAffinityStateFile     string
+	sessionAffinityPCKShadow     bool
+	sessionAffinityPCKShadowRate float64
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -51,6 +57,23 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 			state.sessionAffinityTTL = parsed
 		}
 	}
+	state.sessionAffinityRendezvous = cfg.Routing.SessionAffinityRendezvous
+	state.sessionAffinityQuotaAware = cfg.Routing.SessionAffinityQuotaAware
+	state.sessionAffinityPCKShadow = cfg.Routing.SessionAffinityPCKShadow
+	state.sessionAffinityPCKShadowRate = cfg.Routing.SessionAffinityPCKShadowSampleRate
+	if state.sessionAffinityPCKShadowRate <= 0 || state.sessionAffinityPCKShadowRate > 1 {
+		state.sessionAffinityPCKShadowRate = 0.01
+	}
+	if cfg.Routing.SessionAffinityPersist {
+		state.sessionAffinityStateFile = strings.TrimSpace(cfg.Routing.SessionAffinityStateFile)
+		if state.sessionAffinityStateFile == "" {
+			authDir := strings.TrimSpace(cfg.AuthDir)
+			if authDir == "" {
+				authDir = "auths"
+			}
+			state.sessionAffinityStateFile = filepath.Clean(authDir) + ".state/session-affinity.json"
+		}
+	}
 	return state
 }
 
@@ -66,8 +89,13 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	}
 	if state.sessionAffinity {
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback: selector,
-			TTL:      state.sessionAffinityTTL,
+			Fallback:            selector,
+			TTL:                 state.sessionAffinityTTL,
+			StateFile:           state.sessionAffinityStateFile,
+			Rendezvous:          state.sessionAffinityRendezvous,
+			QuotaAware:          state.sessionAffinityQuotaAware,
+			PCKShadow:           state.sessionAffinityPCKShadow,
+			PCKShadowSampleRate: state.sessionAffinityPCKShadowRate,
 		})
 	}
 	return selector

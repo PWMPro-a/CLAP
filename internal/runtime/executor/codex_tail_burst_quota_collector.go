@@ -34,8 +34,9 @@ type codexTailBurstQuotaCollectorSettings struct {
 }
 
 // StartCodexTailBurstQuotaCollector starts the asynchronous Codex usage
-// collector. The supplied config getter is read on every cycle so config reloads
-// take effect without replacing the service or touching active model requests.
+// collector shared by tail-burst and quota-aware session affinity. The supplied
+// config getter is read on every cycle so config reloads take effect without
+// replacing the service or touching active model requests.
 func StartCodexTailBurstQuotaCollector(
 	ctx context.Context,
 	manager *cliproxyauth.Manager,
@@ -90,7 +91,7 @@ func resolveCodexTailBurstQuotaCollectorSettings(cfg *config.Config) (codexTailB
 		timeout:        defaultCodexQuotaCollectorTimeout,
 		snapshotTTL:    defaultCodexQuotaCollectorSnapshotTTL,
 	}
-	if cfg == nil || !cfg.Codex.TailBurst.Enabled {
+	if cfg == nil || (!cfg.Codex.TailBurst.Enabled && !(cfg.Routing.SessionAffinity && cfg.Routing.SessionAffinityRendezvous && cfg.Routing.SessionAffinityQuotaAware)) {
 		return settings, false
 	}
 	collector := cfg.Codex.TailBurst.QuotaCollector

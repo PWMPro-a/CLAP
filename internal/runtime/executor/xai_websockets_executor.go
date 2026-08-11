@@ -431,7 +431,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
 	executionSessionID := executionSessionIDFromOptions(opts)
-	stateSessionID := xaiExecutionSessionID(req, opts)
+	stateSessionID := xaiWebsocketStateSessionID(req, opts)
 	if stateSessionID == "" {
 		stateSessionID = executionSessionID
 	}

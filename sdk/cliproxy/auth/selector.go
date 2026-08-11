@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -619,14 +621,28 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
+	fallback          Selector
+	cache             *SessionCache
+	cacheOptions      SessionCacheOptions
+	rendezvous        bool
+	quotaAware        bool
+	quotaHealthyRatio float64
+	quotaStopRatio    float64
+	pckShadow         bool
+	pckShadowRate     float64
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	TTL      time.Duration
+	Fallback            Selector
+	TTL                 time.Duration
+	StateFile           string
+	Rendezvous          bool
+	QuotaAware          bool
+	QuotaHealthyRatio   float64
+	QuotaStopRatio      float64
+	PCKShadow           bool
+	PCKShadowSampleRate float64
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -645,9 +661,29 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	if cfg.QuotaHealthyRatio <= 0 || cfg.QuotaHealthyRatio >= 1 {
+		cfg.QuotaHealthyRatio = 0.80
+	}
+	if cfg.QuotaStopRatio <= cfg.QuotaHealthyRatio || cfg.QuotaStopRatio >= 1 {
+		cfg.QuotaStopRatio = 0.85
+	}
+	if cfg.PCKShadowSampleRate <= 0 || cfg.PCKShadowSampleRate > 1 {
+		cfg.PCKShadowSampleRate = 0.01
+	}
+	cacheOptions := SessionCacheOptions{
+		TTL:       cfg.TTL,
+		StateFile: cfg.StateFile,
+	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		fallback:          cfg.Fallback,
+		cache:             NewSessionCacheWithOptions(cacheOptions),
+		cacheOptions:      cacheOptions,
+		rendezvous:        cfg.Rendezvous,
+		quotaAware:        cfg.QuotaAware,
+		quotaHealthyRatio: cfg.QuotaHealthyRatio,
+		quotaStopRatio:    cfg.QuotaStopRatio,
+		pckShadow:         cfg.PCKShadow,
+		pckShadowRate:     cfg.PCKShadowSampleRate,
 	}
 }
 
@@ -693,55 +729,225 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = sessionAffinityCacheKey(provider, fallbackID, model)
 	}
-	bind := func(authID string) {
+	bind := func(authID string) SessionBinding {
 		if fallbackKey != "" {
-			s.cache.SetAliases(authID, cacheKey, fallbackKey)
-			return
+			return s.cache.BindAliases(authID, cacheKey, fallbackKey)
 		}
-		s.cache.Set(cacheKey, authID)
+		return s.cache.BindAliases(authID, cacheKey)
 	}
 
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+	initialBinding, initialHit := s.cache.GetBinding(cacheKey, true)
+	forceReselect := false
+	if initialHit {
 		for _, auth := range available {
-			if auth.ID == cachedAuthID {
+			if auth.ID == initialBinding.AuthID {
 				if auth.consumeStickyBypass(cacheKey, now) {
 					s.cache.Invalidate(cacheKey)
+					forceReselect = true
 					break
 				}
-				bind(auth.ID)
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+				if fallbackKey != "" && !sessionBindingHasAlias(initialBinding, fallbackKey) {
+					break
+				}
+				s.recordAffinityDiagnostics(ctx, primaryID, opts.OriginalRequest, "cache_hit", initialBinding, auth, now)
+				entry.Debugf("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
-		if err != nil {
-			return nil, err
-		}
-		bind(auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
 	}
 
-	if fallbackKey != "" {
-		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
+	unlock := s.cache.lockSessions(cacheKey, fallbackKey)
+	defer unlock()
+
+	// Another request for the same session may have completed the cold bind or
+	// failover while this request was waiting for the shard lock.
+	if !forceReselect {
+		if current, ok := s.cache.GetBinding(cacheKey, true); ok {
 			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					bind(auth.ID)
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+				if auth.ID == current.AuthID {
+					outcome := "cache_hit"
+					if !initialHit || current.AuthID != initialBinding.AuthID || current.Generation != initialBinding.Generation {
+						outcome = "concurrent_reuse"
+					}
+					if fallbackKey != "" && !sessionBindingHasAlias(current, fallbackKey) {
+						current = bind(auth.ID)
+					}
+					s.recordAffinityDiagnostics(ctx, primaryID, opts.OriginalRequest, outcome, current, auth, now)
+					entry.Debugf("session-affinity: concurrent binding reused | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 					return auth, nil
 				}
 			}
 		}
+		if fallbackKey != "" {
+			if fallbackBinding, ok := s.cache.GetBinding(fallbackKey, false); ok {
+				for _, auth := range available {
+					if auth.ID == fallbackBinding.AuthID {
+						binding := bind(auth.ID)
+						s.recordAffinityDiagnostics(ctx, primaryID, opts.OriginalRequest, "fallback_alias_hit", binding, auth, now)
+						entry.Debugf("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+						return auth, nil
+					}
+				}
+			}
+		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, quotaSnapshot, err := s.pickBindingAuth(ctx, cacheKey, provider, model, opts, fallbackAuths, now)
 	if err != nil {
 		return nil, err
 	}
-	bind(auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	binding := bind(auth.ID)
+	outcome := "cold_bind"
+	if initialHit {
+		outcome = "failover"
+	}
+	s.recordAffinityDiagnosticsWithQuota(ctx, primaryID, opts.OriginalRequest, outcome, binding, quotaSnapshot)
+	if outcome == "failover" {
+		entry.Infof("session-affinity: %s | session=%s auth=%s provider=%s model=%s generation=%d", outcome, truncateSessionID(primaryID), auth.ID, provider, model, binding.Generation)
+	} else {
+		entry.Debugf("session-affinity: %s | session=%s auth=%s provider=%s model=%s generation=%d", outcome, truncateSessionID(primaryID), auth.ID, provider, model, binding.Generation)
+	}
 	return auth, nil
+}
+
+func sessionBindingHasAlias(binding SessionBinding, alias string) bool {
+	if alias == "" {
+		return true
+	}
+	for _, candidate := range binding.Aliases {
+		if candidate == alias {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SessionAffinitySelector) pickBindingAuth(ctx context.Context, cacheKey, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, now time.Time) (*Auth, CodexQuotaSnapshot, error) {
+	if !s.rendezvous || len(auths) == 0 {
+		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+		return auth, CodexQuotaSnapshot{}, err
+	}
+
+	type candidate struct {
+		auth     *Auth
+		snapshot CodexQuotaSnapshot
+		score    float64
+	}
+	eligible := make([]candidate, 0, len(auths))
+	deferred := make([]candidate, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		weight := float64(authWeight(auth))
+		if weight <= 0 {
+			continue
+		}
+		snapshot, hasSnapshot := CodexQuotaSnapshot{}, false
+		quotaFactor := 1.0
+		if s.quotaAware && strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			snapshot, hasSnapshot = auth.codexQuotaSnapshot(model, now)
+			if hasSnapshot {
+				switch {
+				case snapshot.UsedRatio >= s.quotaStopRatio:
+					quotaFactor = 0
+				case snapshot.UsedRatio > s.quotaHealthyRatio:
+					span := s.quotaStopRatio - s.quotaHealthyRatio
+					quotaFactor = 0.25 + 0.75*(s.quotaStopRatio-snapshot.UsedRatio)/span
+				}
+			}
+		}
+		u := sessionRendezvousUnit(cacheKey, auth.ID)
+		score := -math.Log(u) / (weight * max(quotaFactor, 0.000001))
+		item := candidate{auth: auth, snapshot: snapshot, score: score}
+		if quotaFactor == 0 {
+			deferred = append(deferred, item)
+		} else {
+			eligible = append(eligible, item)
+		}
+	}
+	if len(eligible) == 0 {
+		eligible = deferred
+	}
+	if len(eligible) == 0 {
+		return nil, CodexQuotaSnapshot{}, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+	best := eligible[0]
+	for index := 1; index < len(eligible); index++ {
+		if eligible[index].score < best.score || (eligible[index].score == best.score && eligible[index].auth.ID < best.auth.ID) {
+			best = eligible[index]
+		}
+	}
+	return best.auth, best.snapshot, nil
+}
+
+func sessionRendezvousUnit(sessionKey, authID string) float64 {
+	sum := sha256.Sum256([]byte(sessionKey + "\x00" + authID))
+	value := binary.BigEndian.Uint64(sum[:8])
+	return (float64(value) + 1) / (float64(^uint64(0)) + 2)
+}
+
+func (s *SessionAffinitySelector) recordAffinityDiagnostics(ctx context.Context, primaryID string, payload []byte, outcome string, binding SessionBinding, auth *Auth, now time.Time) {
+	snapshot := CodexQuotaSnapshot{}
+	if s.quotaAware && auth != nil {
+		snapshot, _ = auth.codexQuotaSnapshot("*", now)
+	}
+	s.recordAffinityDiagnosticsWithQuota(ctx, primaryID, payload, outcome, binding, snapshot)
+}
+
+func (s *SessionAffinitySelector) recordAffinityDiagnosticsWithQuota(ctx context.Context, primaryID string, payload []byte, outcome string, binding SessionBinding, snapshot CodexQuotaSnapshot) {
+	metadata := logging.RoutingUsageMetadata{
+		AffinityOutcome:   outcome,
+		SessionSource:     sessionAffinitySource(primaryID),
+		BindingGeneration: binding.Generation,
+	}
+	if !snapshot.SampledAt.IsZero() {
+		metadata.QuotaSnapshotPresent = true
+		metadata.QuotaUsedPercent = snapshot.UsedRatio * 100
+	}
+	if s.shouldSamplePCKShadow(ctx, primaryID, outcome) {
+		metadata.PCKShadowSampled = true
+		metadata.PCKOriginalHash = shortSHA256(strings.TrimPrefix(primaryID, "pck:"))
+		primaryHash, fallbackHash := extractMessageHashIDs(payload)
+		metadata.PCKPrefixGeneration = strings.TrimPrefix(primaryHash, "msg:")
+		metadata.PCKContextRootHash = strings.TrimPrefix(fallbackHash, "msg:")
+		if metadata.PCKContextRootHash == "" {
+			metadata.PCKContextRootHash = metadata.PCKPrefixGeneration
+		}
+	}
+	logging.SetRoutingUsageMetadata(ctx, metadata)
+}
+
+func (s *SessionAffinitySelector) shouldSamplePCKShadow(ctx context.Context, primaryID, outcome string) bool {
+	if !s.pckShadow || !strings.HasPrefix(primaryID, "pck:") {
+		return false
+	}
+	if outcome != "cache_hit" && outcome != "fallback_alias_hit" {
+		return true
+	}
+	seed := logging.GetRequestID(ctx)
+	if seed == "" {
+		seed = primaryID + time.Now().UTC().Format("200601021504")
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(seed))
+	return float64(h.Sum32()%10000) < s.pckShadowRate*10000
+}
+
+func sessionAffinitySource(primaryID string) string {
+	prefix, _, ok := strings.Cut(primaryID, ":")
+	if !ok || prefix == "" {
+		return "unknown"
+	}
+	return prefix
+}
+
+func shortSHA256(value string) string {
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:8])
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -767,6 +973,15 @@ func (s *SessionAffinitySelector) Stop() {
 	if s.cache != nil {
 		s.cache.Stop()
 	}
+}
+
+// PersistenceError returns the latest session-affinity state persistence
+// failure for health and management integrations.
+func (s *SessionAffinitySelector) PersistenceError() *SessionCachePersistenceError {
+	if s == nil || s.cache == nil {
+		return nil
+	}
+	return s.cache.PersistenceError()
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.

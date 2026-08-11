@@ -58,6 +58,43 @@ type homeResponsesWebsocketExecutor struct {
 	mu       sync.Mutex
 }
 
+type websocketSessionIsolationExecutor struct{}
+
+func (*websocketSessionIsolationExecutor) Identifier() string { return "session-isolation-provider" }
+
+func (*websocketSessionIsolationExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (*websocketSessionIsolationExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	marker := strings.TrimSpace(gjson.GetBytes(req.Payload, "input.0.content").String())
+	if marker == "socket-a" {
+		time.Sleep(40 * time.Millisecond)
+	} else {
+		time.Sleep(5 * time.Millisecond)
+	}
+	chunks := make(chan coreexecutor.StreamChunk, 1)
+	chunks <- coreexecutor.StreamChunk{Payload: []byte(fmt.Sprintf(
+		`{"type":"response.completed","response":{"id":%q,"output":[{"type":"message","content":[{"type":"output_text","text":%q}]}]}}`,
+		"resp-"+marker,
+		"reply-"+marker,
+	))}
+	close(chunks)
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*websocketSessionIsolationExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (*websocketSessionIsolationExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (*websocketSessionIsolationExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (*homeResponsesWebsocketExecutor) Identifier() string { return "codex" }
 
 func (*homeResponsesWebsocketExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
@@ -159,6 +196,75 @@ func TestResponsesWebsocketHomeSelectedAuthCallbackPinsAndReusesFirstSelection(t
 	}
 	if got := executor.calls.Load(); got != 2 {
 		t.Fatalf("executor calls = %d, want 2", got)
+	}
+}
+
+func TestResponsesWebsocketConcurrentConnectionsRemainIsolated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &websocketSessionIsolationExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "session-isolation-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "session-isolation-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	type outcome struct {
+		marker  string
+		payload []byte
+		err     error
+	}
+	outcomes := make(chan outcome, 2)
+	var start sync.WaitGroup
+	start.Add(1)
+	for _, marker := range []string{"socket-a", "socket-b"} {
+		marker := marker
+		go func() {
+			conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+			if errDial != nil {
+				outcomes <- outcome{marker: marker, err: errDial}
+				return
+			}
+			defer conn.Close()
+			start.Wait()
+			request := []byte(fmt.Sprintf(
+				`{"type":"response.create","model":"session-isolation-model","input":[{"type":"message","role":"user","content":%q}]}`,
+				marker,
+			))
+			if errWrite := conn.WriteMessage(websocket.TextMessage, request); errWrite != nil {
+				outcomes <- outcome{marker: marker, err: errWrite}
+				return
+			}
+			_, payload, errRead := conn.ReadMessage()
+			outcomes <- outcome{marker: marker, payload: payload, err: errRead}
+		}()
+	}
+	start.Done()
+
+	for range 2 {
+		result := <-outcomes
+		if result.err != nil {
+			t.Fatalf("%s websocket failed: %v", result.marker, result.err)
+		}
+		if got, want := gjson.GetBytes(result.payload, "response.id").String(), "resp-"+result.marker; got != want {
+			t.Fatalf("%s received response id %q, want %q: %s", result.marker, got, want, result.payload)
+		}
+		if got, want := gjson.GetBytes(result.payload, "response.output.0.content.0.text").String(), "reply-"+result.marker; got != want {
+			t.Fatalf("%s received response text %q, want %q: %s", result.marker, got, want, result.payload)
+		}
 	}
 }
 

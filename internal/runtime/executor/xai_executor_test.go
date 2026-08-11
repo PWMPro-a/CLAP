@@ -1893,6 +1893,30 @@ func TestXAIExecutionSessionIDUsesDerivedStableUUID(t *testing.T) {
 	}
 }
 
+func TestXAIWebsocketStateSessionIDScopesExplicitCacheKeyByCaller(t *testing.T) {
+	t.Parallel()
+
+	req := cliproxyexecutor.Request{Payload: []byte(`{"prompt_cache_key":"shared-client-session","input":"hello"}`)}
+	callerA := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey: "caller-scope-a",
+	}}
+	callerB := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey: "caller-scope-b",
+	}}
+
+	stateA := xaiWebsocketStateSessionID(req, callerA)
+	stateB := xaiWebsocketStateSessionID(req, callerB)
+	if stateA == stateB {
+		t.Fatalf("different callers shared xAI websocket state key %q", stateA)
+	}
+	if stateA != "caller-scope-a\x00shared-client-session" {
+		t.Fatalf("caller A state key = %q", stateA)
+	}
+	if got := xaiWebsocketStateSessionID(req, cliproxyexecutor.Options{}); got != "shared-client-session" {
+		t.Fatalf("unscoped internal state key = %q, want backward-compatible explicit key", got)
+	}
+}
+
 func TestXAIExecutorCompactUsesCompactEndpoint(t *testing.T) {
 	validEncryptedContent := testValidGrokEncryptedContent()
 	var gotPath string

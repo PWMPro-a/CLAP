@@ -221,6 +221,18 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
+  # Stable cold binding minimizes remapping when credentials are added or removed.
+  session-affinity-rendezvous: true
+  # Read asynchronous Codex quota snapshots only during cold binding and failover.
+  # The model request path never calls the quota endpoint.
+  session-affinity-quota-aware: true
+  # Persist bindings with a one-second write-behind worker. The default file is
+  # outside auth-dir so auth file watchers are not triggered.
+  session-affinity-persist: true
+  # session-affinity-state-file: "/var/lib/cli-proxy-api/session-affinity.json"
+  # Shadow-only PCK v2 diagnostics. This does not change the upstream key.
+  session-affinity-pck-shadow: true
+  session-affinity-pck-shadow-sample-rate: 0.01
 
 # Codex provider behavior.
 codex:

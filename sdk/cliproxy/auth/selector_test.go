@@ -1492,11 +1492,7 @@ func TestSessionAffinitySelectorPrimaryTrafficKeepsConversationAliasAlive(t *tes
 		t.Fatalf("combined Pick() error = %v", err)
 	}
 	conversationKey := provider + "::conv:conversation-session::" + model
-	selector.cache.mu.Lock()
-	conversationEntry := selector.cache.entries[conversationKey]
-	conversationEntry.expiresAt = time.Now().Add(-time.Second)
-	selector.cache.entries[conversationKey] = conversationEntry
-	selector.cache.mu.Unlock()
+	forceSessionCacheRefresh(t, selector.cache, conversationKey)
 
 	primary, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: promptOnly}, auths)
 	if err != nil {
@@ -1585,15 +1581,14 @@ func TestSessionCacheSharedPromptKeyCapsStableAliasesByRecency(t *testing.T) {
 		cache.SetAliases("auth-a", promptKey, conversation)
 	}
 
-	cache.mu.RLock()
-	defer cache.mu.RUnlock()
-	if len(cache.entries) > 65 {
-		t.Fatalf("cache entries = %d, want one prompt key plus at most 64 stable aliases", len(cache.entries))
+	entryCount := sessionCacheEntryCount(cache)
+	if entryCount > 65 {
+		t.Fatalf("cache entries = %d, want one prompt key plus at most 64 stable aliases", entryCount)
 	}
-	if _, ok := cache.entries["openai::conv:conversation-127::gpt-test"]; !ok {
+	if !sessionCacheHasAlias(cache, "openai::conv:conversation-127::gpt-test") {
 		t.Fatal("newest conversation alias was not retained")
 	}
-	if _, ok := cache.entries["openai::conv:conversation-000::gpt-test"]; ok {
+	if sessionCacheHasAlias(cache, "openai::conv:conversation-000::gpt-test") {
 		t.Fatal("oldest conversation alias was retained after stable-alias cap")
 	}
 }
@@ -1610,23 +1605,68 @@ func TestSessionCacheRotatingPrimaryEvictsObsoleteAliases(t *testing.T) {
 	latest := "openai::pck:cache-15::gpt-test"
 	oldest := "openai::pck:cache-00::gpt-test"
 
-	cache.mu.RLock()
-	defer cache.mu.RUnlock()
-	if len(cache.entries) != 2 {
-		t.Fatalf("cache entries = %d, want only latest primary and fallback", len(cache.entries))
+	entryCount := sessionCacheEntryCount(cache)
+	if entryCount != 2 {
+		t.Fatalf("cache entries = %d, want only latest primary and fallback", entryCount)
 	}
-	if _, ok := cache.entries[latest]; !ok {
+	if !sessionCacheHasAlias(cache, latest) {
 		t.Fatalf("latest primary %q was not retained", latest)
 	}
-	if _, ok := cache.entries[fallback]; !ok {
+	if !sessionCacheHasAlias(cache, fallback) {
 		t.Fatalf("fallback %q was not retained", fallback)
 	}
-	if _, ok := cache.entries[oldest]; ok {
+	if sessionCacheHasAlias(cache, oldest) {
 		t.Fatalf("obsolete primary %q was retained", oldest)
 	}
-	if aliases := cache.entries[fallback].aliases; len(aliases) != 2 {
+	if aliases := sessionCacheAliases(t, cache, fallback); len(aliases) != 2 {
 		t.Fatalf("fallback alias group = %#v, want exactly two active identifiers", aliases)
 	}
+}
+
+func forceSessionCacheRefresh(t *testing.T, cache *SessionCache, alias string) {
+	t.Helper()
+	rawSlot, ok := cache.entries.Load(alias)
+	if !ok {
+		t.Fatalf("session alias %q is missing", alias)
+	}
+	slot, ok := rawSlot.(*sessionSlot)
+	if !ok || slot == nil {
+		t.Fatalf("session alias %q has invalid slot", alias)
+	}
+	current := slot.current.Load()
+	if current == nil {
+		t.Fatalf("session alias %q has no binding", alias)
+	}
+	refreshable := *current
+	refreshable.refreshAtUnix = time.Now().Add(-time.Second).UnixNano()
+	slot.current.Store(&refreshable)
+}
+
+func sessionCacheEntryCount(cache *SessionCache) int {
+	count := 0
+	cache.entries.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+func sessionCacheHasAlias(cache *SessionCache, alias string) bool {
+	_, ok := cache.entries.Load(alias)
+	return ok
+}
+
+func sessionCacheAliases(t *testing.T, cache *SessionCache, alias string) []string {
+	t.Helper()
+	rawSlot, ok := cache.entries.Load(alias)
+	if !ok {
+		t.Fatalf("session alias %q is missing", alias)
+	}
+	slot, ok := rawSlot.(*sessionSlot)
+	if !ok || slot == nil || slot.current.Load() == nil {
+		t.Fatalf("session alias %q has invalid binding", alias)
+	}
+	return slot.current.Load().aliases
 }
 
 func TestSessionAffinitySelector_MultiModelSession(t *testing.T) {

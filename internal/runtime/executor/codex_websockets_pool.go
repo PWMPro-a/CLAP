@@ -61,11 +61,10 @@ func (s *codexWebsocketSession) acceptResponsePayload(payload []byte, scope *cod
 		itemID = strings.TrimSpace(gjson.GetBytes(payload, "item.id").String())
 	}
 	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
-	trackCompletedRoutes := s.tracksCompletedResponseRoutes()
 
 	s.completedRouteMu.Lock()
 	defer s.completedRouteMu.Unlock()
-	if trackCompletedRoutes && (s.isCompletedRouteLocked("response", responseID) || s.isCompletedRouteLocked("item", itemID)) {
+	if s.isCompletedRouteLocked("response", responseID) || s.isCompletedRouteLocked("item", itemID) {
 		return false
 	}
 	if scope.responseID != "" && responseID != "" && responseID != scope.responseID {
@@ -80,21 +79,13 @@ func (s *codexWebsocketSession) acceptResponsePayload(payload []byte, scope *cod
 		}
 		scope.itemIDs[itemID] = struct{}{}
 	}
-	if trackCompletedRoutes && (eventType == "response.completed" || eventType == "response.done") {
+	if eventType == "response.completed" || eventType == "response.done" {
 		s.rememberCompletedRouteLocked("response", scope.responseID)
 		for completedItemID := range scope.itemIDs {
 			s.rememberCompletedRouteLocked("item", completedItemID)
 		}
 	}
 	return true
-}
-
-func (s *codexWebsocketSession) tracksCompletedResponseRoutes() bool {
-	if s == nil {
-		return false
-	}
-	sessionID := strings.TrimSpace(s.sessionID)
-	return strings.HasPrefix(sessionID, "stateless-") || strings.HasPrefix(sessionID, "standby-")
 }
 
 func collectCodexWebsocketResponseScope(payload []byte, scope *codexWebsocketResponseScope) {
