@@ -11,9 +11,10 @@ import (
 )
 
 type runtimeLimitTestExecutor struct {
-	mu        sync.Mutex
-	calls     []string
-	callCount map[string]int
+	mu          sync.Mutex
+	startedOnce sync.Once
+	calls       []string
+	callCount   map[string]int
 
 	blockAuth string
 	started   chan struct{}
@@ -36,8 +37,7 @@ func (e *runtimeLimitTestExecutor) Execute(ctx context.Context, auth *Auth, req 
 	e.calls = append(e.calls, auth.ID)
 	block := auth.ID == e.blockAuth && callNumber == 1 && e.release != nil
 	if block && e.started != nil {
-		close(e.started)
-		e.started = nil
+		e.startedOnce.Do(func() { close(e.started) })
 	}
 	errFirst := e.firstErrors[auth.ID]
 	e.mu.Unlock()
@@ -209,6 +209,53 @@ func TestRuntimeLimits_StreamReleaseOnContextCancel(t *testing.T) {
 			t.Fatal("runtime slot was not released after context cancellation")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestRuntimeLimits_CountTokensAcquiresAndReleasesRuntimeSlot(t *testing.T) {
+	executor := &runtimeLimitTestExecutor{
+		blockAuth: "auth-a",
+		started:   make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	defer func() {
+		select {
+		case <-executor.release:
+		default:
+			close(executor.release)
+		}
+	}()
+	auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"max_concurrency": 1}}
+	manager := newRuntimeLimitManager(t, executor, auth)
+	manager.SetSelector(&FillFirstSelector{})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+		done <- err
+	}()
+
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("count tokens request did not start")
+	}
+	if got := auth.RuntimeLimitSnapshot(time.Now()).CurrentConcurrency; got != 1 {
+		close(executor.release)
+		t.Fatalf("current concurrency while count tokens is running = %d, want 1", got)
+	}
+
+	close(executor.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ExecuteCount() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("count tokens request did not finish")
+	}
+	if got := auth.RuntimeLimitSnapshot(time.Now()).CurrentConcurrency; got != 0 {
+		t.Fatalf("current concurrency after count tokens = %d, want 0", got)
 	}
 }
 

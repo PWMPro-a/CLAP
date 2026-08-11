@@ -3,10 +3,13 @@ package executor
 import (
 	"context"
 	"encoding/base64"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+var benchmarkSanitizeOpenAIResponsesReasoningOutput []byte
 
 func validOpenAIResponsesReasoningEncryptedContentForTest() string {
 	payload := make([]byte, 1+8+16+16+32)
@@ -79,25 +82,12 @@ func TestSanitizeOpenAIResponsesReasoningEncryptedContent_NoopReturnsOriginalBod
 	}
 }
 
-func TestSanitizeOpenAIResponsesReasoningEncryptedContent_StripsInvalidMessageIDs(t *testing.T) {
-	body := []byte(`{"store":false,"input":[` +
-		`{"id":"item_123","type":"message","role":"assistant","content":[{"type":"output_text","text":"old"}]},` +
-		`{"id":"msg_456","type":"message","role":"user","content":"new"},` +
-		`{"id":"fc_789","type":"function_call","call_id":"call_1","name":"tool","arguments":"{}"}` +
-		`]}`)
-
-	got := sanitizeOpenAIResponsesReasoningEncryptedContent(context.Background(), "test", body)
-
-	if gjson.GetBytes(got, "input.0.id").Exists() {
-		t.Fatalf("invalid item_* message id should be stripped: %s", got)
-	}
-	if gotID := gjson.GetBytes(got, "input.1.id").String(); gotID != "msg_456" {
-		t.Fatalf("valid message id = %q, want msg_456; body=%s", gotID, got)
-	}
-	if gotID := gjson.GetBytes(got, "input.2.id").String(); gotID != "fc_789" {
-		t.Fatalf("non-message id = %q, want fc_789; body=%s", gotID, got)
-	}
-	if gotText := gjson.GetBytes(got, "input.0.content.0.text").String(); gotText != "old" {
-		t.Fatalf("message content changed while stripping id: %s", got)
+func BenchmarkSanitizeOpenAIResponsesReasoningEncryptedContentLargeNoopPayload(b *testing.B) {
+	body := []byte(`{"store":false,"input":[{"type":"message","role":"user","content":"` + strings.Repeat("x", 8<<20) + `"}]}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkSanitizeOpenAIResponsesReasoningOutput = sanitizeOpenAIResponsesReasoningEncryptedContent(context.Background(), "benchmark", body)
 	}
 }

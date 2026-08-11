@@ -64,10 +64,13 @@ func TestWriteAuthFileExpandsSub2Bundle(t *testing.T) {
 		if errRead != nil {
 			t.Fatalf("ReadFile: %v", errRead)
 		}
-		auths := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
+		auths, errSynthesize := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
 			Config:  handler.cfg,
 			AuthDir: authDir,
 		}, filepath.Join(authDir, entry.Name()), data)
+		if errSynthesize != nil {
+			t.Fatalf("SynthesizeAuthFile(%q): %v", entry.Name(), errSynthesize)
+		}
 		if len(auths) != 1 || auths[0].Provider != "codex" {
 			t.Fatalf("generated file %q is not a runnable Codex auth", entry.Name())
 		}

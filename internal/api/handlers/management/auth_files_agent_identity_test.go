@@ -104,10 +104,13 @@ func TestWriteAuthFileExpandsAgentIdentityBundle(t *testing.T) {
 		if errRead != nil {
 			t.Fatalf("ReadFile: %v", errRead)
 		}
-		auths := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
+		auths, errSynthesize := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
 			Config:  handler.cfg,
 			AuthDir: authDir,
 		}, filepath.Join(authDir, entry.Name()), data)
+		if errSynthesize != nil {
+			t.Fatalf("SynthesizeAuthFile(%q): %v", entry.Name(), errSynthesize)
+		}
 		if len(auths) != 1 || auths[0].Runtime == nil {
 			t.Fatalf("generated file %q is not a runnable auth", entry.Name())
 		}

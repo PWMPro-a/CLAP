@@ -5,6 +5,10 @@ const (
 	terminalCredentialErrorCode = "credential_invalidated"
 )
 
+// connectionLifecycleErrorCode marks transport/session lifecycle failures that
+// must skip credential cooldown without being treated as request-scoped faults.
+const connectionLifecycleErrorCode = "connection_lifecycle"
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.

@@ -55,7 +55,10 @@ func TestSynthesizeAgentIdentityAuthFile(t *testing.T) {
 		Now:         time.Now(),
 		IDGenerator: NewStableIDGenerator(),
 	}
-	auths := SynthesizeAuthFile(ctx, path, data)
+	auths, errSynthesize := SynthesizeAuthFile(ctx, path, data)
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeAuthFile: %v", errSynthesize)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("auths = %d, want 1", len(auths))
 	}
@@ -185,12 +188,15 @@ func TestSynthesizeRestoresDeletedAgentIdentityRuntime(t *testing.T) {
 		agentIdentityRegistrationStateKey: codexauth.AgentIdentityRegistrationRuntimeDeleted,
 	}
 	data, _ := json.Marshal(metadata)
-	auths := SynthesizeAuthFile(&SynthesisContext{
+	auths, errSynthesize := SynthesizeAuthFile(&SynthesisContext{
 		Config:      &config.Config{},
 		AuthDir:     tempDir,
 		Now:         time.Now(),
 		IDGenerator: NewStableIDGenerator(),
 	}, path, data)
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeAuthFile: %v", errSynthesize)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("auths = %d, want 1", len(auths))
 	}
@@ -207,7 +213,7 @@ func TestSynthesizeRestoresDeletedAgentIdentityRuntime(t *testing.T) {
 func TestSynthesizeRejectsMalformedAgentIdentityKey(t *testing.T) {
 	data := []byte(`{"type":"codex","auth_mode":"agentIdentity","agent_runtime_id":"runtime-bad","agent_private_key":"bad"}`)
 	ctx := &SynthesisContext{Config: &config.Config{}, AuthDir: t.TempDir(), Now: time.Now()}
-	if auths := SynthesizeAuthFile(ctx, filepath.Join(ctx.AuthDir, "bad.json"), data); len(auths) != 0 {
+	if auths, _ := SynthesizeAuthFile(ctx, filepath.Join(ctx.AuthDir, "bad.json"), data); len(auths) != 0 {
 		t.Fatalf("auths = %d, want 0", len(auths))
 	}
 }
@@ -215,7 +221,10 @@ func TestSynthesizeRejectsMalformedAgentIdentityKey(t *testing.T) {
 func TestSynthesizeQuarantinesPendingAgentIdentityCredentials(t *testing.T) {
 	data := []byte(`{"type":"codex","auth_mode":"agentIdentity","account_id":"account-placeholder","email":"pending@example.com"}`)
 	ctx := &SynthesisContext{Config: &config.Config{}, AuthDir: t.TempDir(), Now: time.Now()}
-	auths := SynthesizeAuthFile(ctx, filepath.Join(ctx.AuthDir, "pending.json"), data)
+	auths, errSynthesize := SynthesizeAuthFile(ctx, filepath.Join(ctx.AuthDir, "pending.json"), data)
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeAuthFile: %v", errSynthesize)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("auths = %d, want 1", len(auths))
 	}

@@ -43,9 +43,11 @@ func TestAgentIdentityMetadataSkipsOAuthAutoRefreshBeforeRuntimeAttachment(t *te
 		ID:       "agent-startup",
 		Provider: "codex",
 		Metadata: map[string]any{
-			"auth_mode":        "agentIdentity",
-			"agent_runtime_id": "runtime-id",
+			"auth_mode":                "agentIdentity",
+			"agent_runtime_id":         "runtime-id",
+			"refresh_interval_seconds": 1,
 		},
+		LastRefreshedAt: time.Now().Add(-time.Hour),
 	}
 	manager := NewManager(nil, nil, nil)
 	now := time.Now()

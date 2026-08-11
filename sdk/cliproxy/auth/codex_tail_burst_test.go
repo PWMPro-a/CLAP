@@ -133,8 +133,7 @@ func (e *codexTailBurstStreamTestExecutor) ExecuteStream(ctx context.Context, au
 	callNumber := e.callCount[auth.ID]
 	block := auth.ID == e.blockAuth && callNumber == 1
 	if block && e.started != nil {
-		close(e.started)
-		e.started = nil
+		e.startedOnce.Do(func() { close(e.started) })
 	}
 	e.mu.Unlock()
 

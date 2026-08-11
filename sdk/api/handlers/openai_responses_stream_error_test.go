@@ -47,40 +47,44 @@ func TestBuildOpenAIResponsesStreamErrorChunkExtractsHTTPErrorBody(t *testing.T)
 	}
 }
 
-func TestBuildOpenAIResponsesStreamFailedChunk(t *testing.T) {
+func TestBuildOpenAIResponsesStreamFailedChunkPreservesNestedError(t *testing.T) {
 	chunk := BuildOpenAIResponsesStreamFailedChunk(
-		http.StatusTooManyRequests,
-		`{"error":{"message":"limit hit","type":"usage_limit_reached","code":"usage_limit_reached"}}`,
-		7,
+		http.StatusBadRequest,
+		`{"error":{"type":"invalid_request","code":"cyber_policy","message":"blocked","param":null}}`,
+		0,
 	)
-	var payload map[string]any
+
+	var payload struct {
+		Type           string `json:"type"`
+		SequenceNumber int    `json:"sequence_number"`
+		Response       struct {
+			Status string `json:"status"`
+			Error  struct {
+				Type    string `json:"type"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"response"`
+	}
 	if err := json.Unmarshal(chunk, &payload); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if payload["type"] != "response.failed" {
-		t.Fatalf("type = %v, want response.failed", payload["type"])
+	if payload.Type != "response.failed" {
+		t.Fatalf("type = %q, want %q", payload.Type, "response.failed")
 	}
-	if payload["sequence_number"] != float64(7) {
-		t.Fatalf("sequence_number = %v, want 7", payload["sequence_number"])
+	if payload.SequenceNumber != 0 {
+		t.Fatalf("sequence_number = %d, want 0", payload.SequenceNumber)
 	}
-	resp, ok := payload["response"].(map[string]any)
-	if !ok {
-		t.Fatalf("response missing or invalid: %#v", payload["response"])
+	if payload.Response.Status != "failed" {
+		t.Fatalf("response.status = %q, want %q", payload.Response.Status, "failed")
 	}
-	if resp["status"] != "failed" {
-		t.Fatalf("response.status = %v, want failed", resp["status"])
+	if payload.Response.Error.Type != "invalid_request" {
+		t.Fatalf("response.error.type = %q, want %q", payload.Response.Error.Type, "invalid_request")
 	}
-	errPayload, ok := resp["error"].(map[string]any)
-	if !ok {
-		t.Fatalf("response.error missing or invalid: %#v", resp["error"])
+	if payload.Response.Error.Code != "cyber_policy" {
+		t.Fatalf("response.error.code = %q, want %q", payload.Response.Error.Code, "cyber_policy")
 	}
-	if errPayload["message"] != "limit hit" {
-		t.Fatalf("error.message = %v, want limit hit", errPayload["message"])
-	}
-	if errPayload["type"] != "usage_limit_reached" {
-		t.Fatalf("error.type = %v, want usage_limit_reached", errPayload["type"])
-	}
-	if errPayload["code"] != "usage_limit_reached" {
-		t.Fatalf("error.code = %v, want usage_limit_reached", errPayload["code"])
+	if payload.Response.Error.Message != "blocked" {
+		t.Fatalf("response.error.message = %q, want %q", payload.Response.Error.Message, "blocked")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -37,8 +38,6 @@ type authRuntimeLimits struct {
 	codexQuotaSnapshots atomic.Value
 }
 
-var runtimeLimitsInitMu sync.Mutex
-
 type runtimeStickyBypassSessionContextKey struct{}
 
 const runtimeStickyBypassTTL = time.Hour
@@ -54,16 +53,19 @@ func (a *Auth) ensureRuntimeLimits() *authRuntimeLimits {
 	if a == nil {
 		return nil
 	}
-	if a.runtimeLimits != nil {
-		return a.runtimeLimits
+	// Auth is intentionally shallow-copyable, so runtimeLimits remains a plain
+	// pointer rather than atomic.Pointer (which must not be copied after use).
+	// Access the pointer atomically to keep lazy initialization lock-free and
+	// race-free when selectors inspect the same freshly constructed Auth.
+	slot := (*unsafe.Pointer)(unsafe.Pointer(&a.runtimeLimits))
+	if current := atomic.LoadPointer(slot); current != nil {
+		return (*authRuntimeLimits)(current)
 	}
-	runtimeLimitsInitMu.Lock()
-	defer runtimeLimitsInitMu.Unlock()
-	if a.runtimeLimits != nil {
-		return a.runtimeLimits
+	created := &authRuntimeLimits{}
+	if atomic.CompareAndSwapPointer(slot, nil, unsafe.Pointer(created)) {
+		return created
 	}
-	a.runtimeLimits = &authRuntimeLimits{}
-	return a.runtimeLimits
+	return (*authRuntimeLimits)(atomic.LoadPointer(slot))
 }
 
 func (a *Auth) runtimeLimitConfig() runtimeLimitConfig {
@@ -127,6 +129,43 @@ func (a *Auth) RuntimeLimitSnapshot(now time.Time) RuntimeLimitSnapshot {
 		RateLimitedUntil:   state.rateLimitedUntil,
 		LastSkipReason:     state.lastSkipReason,
 	}
+}
+
+func runtimeAuthBlockedForModel(auth *Auth, now time.Time) (bool, blockReason, time.Time) {
+	return runtimeAuthBlockedForModelWithTailBurst(auth, now, false)
+}
+
+func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, now time.Time, tailBurst bool) (bool, blockReason, time.Time) {
+	if auth == nil {
+		return true, blockReasonOther, time.Time{}
+	}
+	state := auth.ensureRuntimeLimits()
+	if state == nil {
+		return false, blockReasonNone, time.Time{}
+	}
+	cfg := auth.runtimeLimitConfig()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	state.compactRuntimeWindowLocked(now, cfg)
+	if !state.frozenUntil.IsZero() && state.frozenUntil.After(now) {
+		state.recordSkipLocked("frozen", state.frozenUntil, now)
+		return true, blockReasonCooldown, state.frozenUntil
+	}
+	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
+		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
+		return true, blockReasonOther, time.Time{}
+	}
+	if cfg.rateLimitMaxRequests > 0 && state.rateWindowCount >= cfg.rateLimitMaxRequests {
+		until := state.rateWindowStart.Add(time.Duration(cfg.rateLimitWindowSeconds) * time.Second)
+		if until.Before(now) {
+			until = now
+		}
+		state.rateLimitedUntil = until
+		state.recordSkipLocked("rate_limited", until, now)
+		return true, blockReasonCooldown, until
+	}
+	return false, blockReasonNone, time.Time{}
 }
 
 func contextWithRuntimeStickyBypassSession(ctx context.Context, sessionKey string) context.Context {
@@ -430,6 +469,11 @@ func wrapStreamResultWithRuntimeRelease(ctx context.Context, result *cliproxyexe
 			var ok bool
 			select {
 			case <-done:
+				// Release capacity immediately, but keep draining the wrapped stream so
+				// its accounting/error hooks can observe terminal tail chunks.
+				release()
+				for range result.Chunks {
+				}
 				return
 			case chunk, ok = <-result.Chunks:
 			}
@@ -438,6 +482,9 @@ func wrapStreamResultWithRuntimeRelease(ctx context.Context, result *cliproxyexe
 			}
 			select {
 			case <-done:
+				release()
+				for range result.Chunks {
+				}
 				return
 			case out <- chunk:
 			}

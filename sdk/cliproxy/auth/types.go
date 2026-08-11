@@ -274,8 +274,9 @@ func (a *Auth) Clone() *Auth {
 	if a == nil {
 		return nil
 	}
+	runtimeLimits := a.ensureRuntimeLimits()
 	copyAuth := *a
-	copyAuth.runtimeLimits = a.ensureRuntimeLimits()
+	copyAuth.runtimeLimits = runtimeLimits
 	if len(a.Attributes) > 0 {
 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
 		for key, value := range a.Attributes {
