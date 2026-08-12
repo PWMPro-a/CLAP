@@ -221,6 +221,9 @@ routing:
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
+  # High cache mode keeps routing stable for cache-heavy Codex/OpenAI workloads.
+  # It is off by default and only changes behavior when explicitly enabled.
+  high-cache-mode: false
 
 # Codex provider behavior.
 codex:

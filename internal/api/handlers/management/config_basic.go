@@ -319,6 +319,14 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 	h.persist(c)
 }
 
+// RoutingHighCacheMode
+func (h *Handler) GetRoutingHighCacheMode(c *gin.Context) {
+	c.JSON(200, gin.H{"high-cache-mode": h.cfg.Routing.HighCacheMode})
+}
+func (h *Handler) PutRoutingHighCacheMode(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.Routing.HighCacheMode = v })
+}
+
 // Proxy URL
 func (h *Handler) GetProxyURL(c *gin.Context) { c.JSON(200, gin.H{"proxy-url": h.cfg.ProxyURL}) }
 func (h *Handler) PutProxyURL(c *gin.Context) {

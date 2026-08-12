@@ -316,7 +316,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
-		execCtx = contextWithRuntimeStickyBypassSession(execCtx, runtimeStickyBypassSessionKey(provider, routeModel, opts))
+		stickyKey := runtimeStickyBypassSessionKey(provider, routeModel, opts)
+		if managerSelectorHighCacheMode(m.Selector()) {
+			stickyKey = highCacheRuntimeStickyBypassSessionKey(provider, routeModel, opts)
+		}
+		execCtx = contextWithRuntimeStickyBypassSession(execCtx, stickyKey)
 
 		tailBurst := codexTailBurstRequested(opts) && m.codexTailBurstActive(auth, routeModel, time.Now())
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAliasForTailBurst(auth, routeModel, tailBurst)
@@ -464,7 +468,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
-		execCtx = contextWithRuntimeStickyBypassSession(execCtx, runtimeStickyBypassSessionKey(provider, routeModel, opts))
+		stickyKey := runtimeStickyBypassSessionKey(provider, routeModel, opts)
+		if managerSelectorHighCacheMode(m.Selector()) {
+			stickyKey = highCacheRuntimeStickyBypassSessionKey(provider, routeModel, opts)
+		}
+		execCtx = contextWithRuntimeStickyBypassSession(execCtx, stickyKey)
 
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
@@ -665,7 +673,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		// Enrich before auth preparation so prepare-stage usage records observe the client request.
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
-		execCtx = contextWithRuntimeStickyBypassSession(execCtx, runtimeStickyBypassSessionKey(provider, routeModel, opts))
+		stickyKey := runtimeStickyBypassSessionKey(provider, routeModel, opts)
+		if managerSelectorHighCacheMode(m.Selector()) {
+			stickyKey = highCacheRuntimeStickyBypassSessionKey(provider, routeModel, opts)
+		}
+		execCtx = contextWithRuntimeStickyBypassSession(execCtx, stickyKey)
 		tailBurst := selection == nil && codexTailBurstRequested(opts) && m.codexTailBurstActive(auth, routeModel, time.Now())
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAliasForTailBurst(auth, routeModel, tailBurst)
 		if selection != nil && aliasResult.ForceMapping && responseAlias != "" {

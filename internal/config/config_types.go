@@ -250,6 +250,11 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
+	// HighCacheMode enables cache-first credential routing. It keeps the default
+	// behavior off, and when enabled it turns on session affinity with a caller-
+	// scoped fallback plus more conservative temporary failover handling.
+	HighCacheMode bool `yaml:"high-cache-mode,omitempty" json:"high-cache-mode,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

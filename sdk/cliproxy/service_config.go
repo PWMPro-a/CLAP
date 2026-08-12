@@ -28,6 +28,7 @@ type routingRuntimeState struct {
 	strategy           string
 	sessionAffinity    bool
 	sessionAffinityTTL time.Duration
+	highCacheMode      bool
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -46,6 +47,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		state.strategy = "fill-first"
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
+	state.highCacheMode = cfg.Routing.HighCacheMode
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
 			state.sessionAffinityTTL = parsed
@@ -64,10 +66,11 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
-	if state.sessionAffinity {
+	if state.sessionAffinity || state.highCacheMode {
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback: selector,
-			TTL:      state.sessionAffinityTTL,
+			Fallback:      selector,
+			TTL:           state.sessionAffinityTTL,
+			HighCacheMode: state.highCacheMode,
 		})
 	}
 	return selector

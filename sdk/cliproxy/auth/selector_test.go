@@ -938,7 +938,7 @@ func TestSessionAffinitySelector_DifferentSessionsDifferentAuths(t *testing.T) {
 	}
 }
 
-func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
+func TestSessionAffinitySelector_TemporaryFailoverPreservesOriginalBinding(t *testing.T) {
 	t.Parallel()
 
 	fallback := &RoundRobinSelector{}
@@ -963,16 +963,10 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 		t.Fatalf("Pick() error = %v", err)
 	}
 
-	// Remove the bound auth from available list (simulating rate limit)
-	availableWithoutFirst := make([]*Auth, 0, len(auths)-1)
-	for _, a := range auths {
-		if a.ID != first.ID {
-			availableWithoutFirst = append(availableWithoutFirst, a)
-		}
-	}
+	first.Unavailable = true
 
-	// With failover enabled, should pick a new auth
-	second, err := selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst)
+	// With failover enabled, should pick a new auth for the transient outage.
+	second, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
 	if err != nil {
 		t.Fatalf("Pick() after failover error = %v", err)
 	}
@@ -980,12 +974,195 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 		t.Fatalf("Pick() after failover returned same auth %q, expected different", first.ID)
 	}
 
-	// Subsequent picks should consistently return the new binding
+	// Subsequent picks while the original auth is still temporarily unavailable
+	// reuse the failover binding without overwriting the original binding.
 	for i := 0; i < 5; i++ {
-		got, _ := selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst)
+		got, _ := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
 		if got.ID != second.ID {
 			t.Fatalf("Pick() #%d after failover inconsistent: got %q, want %q", i, got.ID, second.ID)
 		}
+	}
+
+	// Once the original auth is available again, the hot session returns to its
+	// original binding instead of staying polluted by the temporary failover.
+	first.Unavailable = false
+	recovered, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() after recovery error = %v", err)
+	}
+	if recovered.ID != first.ID {
+		t.Fatalf("Pick() after recovery = %q, want original binding %q", recovered.ID, first.ID)
+	}
+}
+
+func TestSessionAffinitySelector_ResponseBindingPromotesTemporaryFailover(t *testing.T) {
+	t.Parallel()
+
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a"},
+		{ID: "auth-b"},
+		{ID: "auth-c"},
+	}
+
+	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"prompt_cache_key":"cache-session"}`)}
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("initial Pick() error = %v", err)
+	}
+
+	first.Unavailable = true
+	failover, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("temporary failover Pick() error = %v", err)
+	}
+	if failover.ID == first.ID {
+		t.Fatalf("temporary failover picked original auth %q", first.ID)
+	}
+
+	selector.BindAuthSession("codex", "gpt-5-codex", "pck:cache-session", failover.ID)
+	first.Unavailable = false
+	promoted, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() after response binding error = %v", err)
+	}
+	if promoted.ID != failover.ID {
+		t.Fatalf("Pick() after response binding = %q, want promoted failover %q", promoted.ID, failover.ID)
+	}
+}
+
+func TestSessionAffinitySelectorHighCacheModePrefersCallerScope(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:      &RoundRobinSelector{},
+		TTL:           time.Minute,
+		HighCacheMode: true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	firstOpts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey:            "caller-a",
+		cliproxyexecutor.DerivedSessionIDMetadataKey:       "ctx:v1:first-root",
+		cliproxyexecutor.ExecutionSessionMetadataKey + "x": "ignored",
+	}}
+	secondOpts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey:      "caller-a",
+		cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:second-root",
+	}}
+
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", firstOpts, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+	second, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", secondOpts, auths)
+	if err != nil {
+		t.Fatalf("second Pick() error = %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("same caller with different derived sessions changed auth from %q to %q", first.ID, second.ID)
+	}
+
+	otherCaller, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey: "caller-b",
+	}}, auths)
+	if err != nil {
+		t.Fatalf("other caller Pick() error = %v", err)
+	}
+	if otherCaller.ID == first.ID {
+		t.Fatalf("different caller unexpectedly reused auth %q; want round-robin next auth", otherCaller.ID)
+	}
+}
+
+func TestSessionAffinitySelectorHighCacheModeRuntimeFreezePreservesOriginalBinding(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:      &RoundRobinSelector{},
+		TTL:           time.Minute,
+		HighCacheMode: true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey: "caller-a",
+	}}
+
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("initial Pick() error = %v", err)
+	}
+	state := first.ensureRuntimeLimits()
+	state.mu.Lock()
+	state.frozenUntil = time.Now().Add(time.Minute)
+	state.mu.Unlock()
+
+	failover, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("runtime freeze Pick() error = %v", err)
+	}
+	if failover.ID == first.ID {
+		t.Fatalf("runtime freeze kept unavailable auth %q", first.ID)
+	}
+
+	state.mu.Lock()
+	state.frozenUntil = time.Time{}
+	state.mu.Unlock()
+	recovered, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("recovered Pick() error = %v", err)
+	}
+	if recovered.ID != first.ID {
+		t.Fatalf("recovered auth = %q, want original binding %q", recovered.ID, first.ID)
+	}
+}
+
+func TestSessionAffinitySelectorHighCacheModeQuotaCooldownRebinds(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:      &RoundRobinSelector{},
+		TTL:           time.Minute,
+		HighCacheMode: true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey: "caller-a",
+	}}
+
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("initial Pick() error = %v", err)
+	}
+	first.Quota.Exceeded = true
+	first.Quota.NextRecoverAt = time.Now().Add(time.Minute)
+
+	rebound, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("quota cooldown Pick() error = %v", err)
+	}
+	if rebound.ID == first.ID {
+		t.Fatalf("quota cooldown kept unavailable auth %q", first.ID)
+	}
+
+	first.Quota.Exceeded = false
+	first.Quota.NextRecoverAt = time.Time{}
+	afterRecover, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("post-quota-recovery Pick() error = %v", err)
+	}
+	if afterRecover.ID != rebound.ID {
+		t.Fatalf("post-quota-recovery auth = %q, want rebound binding %q", afterRecover.ID, rebound.ID)
 	}
 }
 

@@ -10,12 +10,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header) {
@@ -24,6 +22,10 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 }
 
 func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, headerSets ...http.Header) ([]byte, http.Header, error) {
+	return applyCodexPromptCacheHeadersWithConfig(ctx, nil, from, req, rawJSON, headerSets...)
+}
+
+func applyCodexPromptCacheHeadersWithConfig(ctx context.Context, cfg *config.Config, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, headerSets ...http.Header) ([]byte, http.Header, error) {
 	headers := http.Header{}
 	if len(rawJSON) == 0 {
 		return rawJSON, headers, nil
@@ -33,26 +35,9 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 	if len(headerSets) > 0 {
 		requestHeaders = headerSets[0]
 	}
-	var cache helps.CodexCache
-	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
-		if modelName == "" {
-			modelName = thinking.ParseSuffix(req.Model).ModelName
-		}
-		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, requestHeaders)
-		if errCache != nil {
-			return nil, nil, errCache
-		}
-		if ok {
-			cache = cached
-		}
-	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
-		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
-		}
-	}
-	if cache.ID == "" {
-		cache.ID = helps.ProviderSessionUUID("codex", req.Metadata)
+	cache, errCache := codexPromptCacheForRequest(ctx, cfg, from, req, rawJSON, requestHeaders)
+	if errCache != nil {
+		return nil, nil, errCache
 	}
 
 	if cache.ID != "" {

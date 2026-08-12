@@ -159,39 +159,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if len(headerSets) > 0 {
 		headers = headerSets[0]
 	}
-	var cache helps.CodexCache
-	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
-		if modelName == "" {
-			modelName = thinking.ParseSuffix(req.Model).ModelName
-		}
-		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, headers)
-		if errCache != nil {
-			return nil, nil, codexIdentityConfuseState{}, errCache
-		}
-		if ok {
-			cache = cached
-		}
-	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
-		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
-		if promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
-		}
-	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
-		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
-			cache.ID = strings.TrimSpace(promptCacheKey.String())
-		}
-		if cache.ID == "" {
-			cache.ID = helps.ProviderSessionUUID("codex", req.Metadata)
-		}
-		if cache.ID == "" {
-			if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
-				cache.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
-			}
-		}
-	}
-	if cache.ID == "" {
-		cache.ID = helps.ProviderSessionUUID("codex", req.Metadata)
+	cache, errCache := codexPromptCacheForRequest(ctx, e.cfg, from, req, rawJSON, headers)
+	if errCache != nil {
+		return nil, nil, codexIdentityConfuseState{}, errCache
 	}
 
 	if cache.ID != "" {
@@ -212,6 +182,63 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		httpReq.Header.Set("Session_id", cache.ID)
 	}
 	return httpReq, rawJSON, identityState, nil
+}
+
+func codexPromptCacheForRequest(ctx context.Context, cfg *config.Config, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, headers http.Header) (helps.CodexCache, error) {
+	var cache helps.CodexCache
+	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
+		modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+		if modelName == "" {
+			modelName = thinking.ParseSuffix(req.Model).ModelName
+		}
+		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, headers)
+		if errCache != nil {
+			return helps.CodexCache{}, errCache
+		}
+		if ok {
+			cache = cached
+		}
+	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
+		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
+		if promptCacheKey.Exists() {
+			cache.ID = promptCacheKey.String()
+		}
+	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
+		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
+			cache.ID = strings.TrimSpace(promptCacheKey.String())
+		}
+	}
+	if cache.ID == "" && codexHighCacheMode(cfg) {
+		cache.ID = codexHighCachePromptCacheID(ctx, req.Metadata)
+	}
+	if cache.ID == "" {
+		cache.ID = helps.ProviderSessionUUID("codex", req.Metadata)
+	}
+	if cache.ID == "" && sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
+		cache.ID = codexAPIKeyPromptCacheID(ctx)
+	}
+	return cache, nil
+}
+
+func codexHighCacheMode(cfg *config.Config) bool {
+	return cfg != nil && cfg.Routing.HighCacheMode
+}
+
+func codexHighCachePromptCacheID(ctx context.Context, metadata map[string]any) string {
+	if key := codexAPIKeyPromptCacheID(ctx); key != "" {
+		return key
+	}
+	if callerScope := strings.TrimSpace(metadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey)); callerScope != "" {
+		return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache-caller-scope:"+callerScope)).String()
+	}
+	return ""
+}
+
+func codexAPIKeyPromptCacheID(ctx context.Context) string {
+	if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+		return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
+	}
+	return ""
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
@@ -328,7 +355,7 @@ func codexIdentityConfuseEnabled(cfg *config.Config) bool {
 		return false
 	}
 	strategy := strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy))
-	return cfg.Routing.SessionAffinity || strategy == "fill-first" || strategy == "fillfirst" || strategy == "ff"
+	return cfg.Routing.SessionAffinity || cfg.Routing.HighCacheMode || strategy == "fill-first" || strategy == "fillfirst" || strategy == "ff"
 }
 
 func codexIdentityConfuseUUID(authID string, kind string, value string) string {

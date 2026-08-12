@@ -619,14 +619,17 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
+	fallback      Selector
+	cache         *SessionCache
+	failoverCache *SessionCache
+	highCacheMode bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	TTL      time.Duration
+	Fallback      Selector
+	TTL           time.Duration
+	HighCacheMode bool
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -646,8 +649,10 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cfg.TTL = time.Hour
 	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		fallback:      cfg.Fallback,
+		cache:         NewSessionCache(cfg.TTL),
+		failoverCache: NewSessionCache(cfg.TTL),
+		highCacheMode: cfg.HighCacheMode,
 	}
 }
 
@@ -665,7 +670,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
-	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	primaryID, fallbackID := s.extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	now := time.Now()
 	availabilityCandidates := auths
 	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
@@ -700,25 +705,67 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		s.cache.Set(cacheKey, authID)
 	}
+	bindFailover := func(authID string) {
+		if s.failoverCache == nil {
+			return
+		}
+		if fallbackKey != "" {
+			s.failoverCache.SetAliases(authID, cacheKey, fallbackKey)
+			return
+		}
+		s.failoverCache.Set(cacheKey, authID)
+	}
+	clearFailover := func() {
+		if s.failoverCache == nil {
+			return
+		}
+		s.failoverCache.Invalidate(cacheKey)
+		if fallbackKey != "" {
+			s.failoverCache.Invalidate(fallbackKey)
+		}
+	}
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				if auth.consumeStickyBypass(cacheKey, now) {
 					s.cache.Invalidate(cacheKey)
+					clearFailover()
 					break
 				}
 				bind(auth.ID)
+				clearFailover()
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
+		temporaryFailover := s.shouldUseTemporaryFailover(availabilityCandidates, cachedAuthID, model, now)
+		if temporaryFailover && s.failoverCache != nil {
+			if failoverAuthID, ok := s.failoverCache.GetAndRefresh(cacheKey); ok {
+				for _, auth := range fallbackAuths {
+					if auth.ID == failoverAuthID {
+						bindFailover(auth.ID)
+						entry.Infof("session-affinity: cache hit but auth temporarily unavailable, failover cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+						return auth, nil
+					}
+				}
+				s.failoverCache.Invalidate(cacheKey)
+			}
+		}
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
 		}
+		if temporaryFailover {
+			// Short upstream overloads and runtime availability misses should not
+			// permanently move a hot session onto another credential before the
+			// failover request succeeds.
+			bindFailover(auth.ID)
+			entry.Infof("session-affinity: cache hit but auth temporarily unavailable, failover selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
+		}
 		bind(auth.ID)
+		clearFailover()
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
@@ -728,6 +775,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					bind(auth.ID)
+					clearFailover()
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
@@ -740,8 +788,77 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	bind(auth.ID)
+	clearFailover()
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) shouldUseTemporaryFailover(auths []*Auth, cachedAuthID, model string, now time.Time) bool {
+	cachedAuthID = strings.TrimSpace(cachedAuthID)
+	if cachedAuthID == "" {
+		return false
+	}
+	for _, auth := range auths {
+		if auth == nil || auth.ID != cachedAuthID {
+			continue
+		}
+		blocked, reason, _ := isAuthBlockedForModel(auth, model, now)
+		if !blocked {
+			return false
+		}
+		if s != nil && s.highCacheMode {
+			return reason != blockReasonDisabled && !authQuotaExceeded(auth, model)
+		}
+		return reason == blockReasonOther
+	}
+	return false
+}
+
+func authQuotaExceeded(auth *Auth, model string) bool {
+	if auth == nil {
+		return false
+	}
+	if model != "" && len(auth.ModelStates) > 0 {
+		modelKey := canonicalModelKey(model)
+		for stateModel, state := range auth.ModelStates {
+			if state == nil || canonicalModelKey(stateModel) != modelKey {
+				continue
+			}
+			return state.Quota.Exceeded
+		}
+	}
+	return auth.Quota.Exceeded
+}
+
+func (s *SessionAffinitySelector) extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	primaryID, fallbackID := extractSessionIDs(headers, payload, metadata)
+	if s == nil || !s.highCacheMode {
+		return primaryID, fallbackID
+	}
+	callerID := highCacheCallerSessionID(metadata)
+	if callerID == "" {
+		return primaryID, fallbackID
+	}
+	if highCacheShouldPreferCallerSession(primaryID) {
+		return callerID, fallbackID
+	}
+	if fallbackID == "" && primaryID != callerID {
+		return primaryID, callerID
+	}
+	return primaryID, fallbackID
+}
+
+func highCacheShouldPreferCallerSession(primaryID string) bool {
+	primaryID = strings.TrimSpace(primaryID)
+	return primaryID == "" || strings.HasPrefix(primaryID, "derived:") || strings.HasPrefix(primaryID, "msg:")
+}
+
+func highCacheCallerSessionID(metadata map[string]any) string {
+	callerScope := normalizedSessionCandidate(stringMetadataValue(metadata, cliproxyexecutor.CallerScopeMetadataKey))
+	if callerScope == "" {
+		return ""
+	}
+	return "caller:" + callerScope
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -767,6 +884,9 @@ func (s *SessionAffinitySelector) Stop() {
 	if s.cache != nil {
 		s.cache.Stop()
 	}
+	if s.failoverCache != nil {
+		s.failoverCache.Stop()
+	}
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.
@@ -774,6 +894,9 @@ func (s *SessionAffinitySelector) Stop() {
 func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
+	}
+	if s.failoverCache != nil {
+		s.failoverCache.InvalidateAuth(authID)
 	}
 }
 
@@ -787,11 +910,19 @@ func (s *SessionAffinitySelector) BindAuthSession(provider, model, sessionID, au
 		return
 	}
 	s.cache.Set(cacheKey, strings.TrimSpace(authID))
+	if s.failoverCache != nil {
+		s.failoverCache.Invalidate(cacheKey)
+	}
 }
 
 func runtimeStickyBypassSessionKey(provider, model string, opts cliproxyexecutor.Options) string {
 	primary, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	return sessionAffinityCacheKey(provider, primary, model)
+}
+
+// HighCacheMode reports whether cache-first routing adjustments are enabled.
+func (s *SessionAffinitySelector) HighCacheMode() bool {
+	return s != nil && s.highCacheMode
 }
 
 func sessionAffinityCacheKey(provider, sessionID, model string) string {

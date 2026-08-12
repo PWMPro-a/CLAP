@@ -49,6 +49,28 @@ func isBuiltInSelector(selector Selector) bool {
 	}
 }
 
+func managerSelectorHighCacheMode(selector Selector) bool {
+	s, ok := selector.(*SessionAffinitySelector)
+	return ok && s.HighCacheMode()
+}
+
+func highCacheRuntimeStickyBypassSessionKey(provider, model string, opts cliproxyexecutor.Options) string {
+	primary, fallback := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if highCacheShouldPreferCallerSession(primary) {
+		if caller := highCacheCallerSessionID(opts.Metadata); caller != "" {
+			primary = caller
+			fallback = ""
+		}
+	}
+	if primary == "" {
+		primary = highCacheCallerSessionID(opts.Metadata)
+	}
+	if primary == "" {
+		primary = fallback
+	}
+	return sessionAffinityCacheKey(provider, primary, model)
+}
+
 type requiredAuthKindContextKey struct{}
 type credentialPolicyContextKey struct{}
 
@@ -338,9 +360,9 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 
 // availableAuthsForSelector reports the candidates handed to priority-scoped consumers such as
 // the plugin scheduler, plus the candidates handed to the configured selector. Both are equal
-// unless session affinity is active, in which case the selector additionally receives lower
-// priority tiers so an established binding can be validated instead of being preempted by a
-// recovered higher-priority credential.
+// unless session affinity is active, in which case the selector also receives blocked/lower
+// priority candidates so an established binding can distinguish temporary failover from
+// permanent rebinding.
 func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
 	if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
 		priorityAuths, err = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
@@ -351,14 +373,54 @@ func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, pr
 		return priorityAuths, priorityAuths, nil
 	}
 
-	// One availability pass and one clone pass serve both lists: the highest priority tier is a
-	// subset of the across-priority candidates, so it is narrowed from the same cloned auths.
-	selectorAuths, err = m.availableAuthsForRouteModelAcrossPriorities(auths, provider, routeModel, now)
+	// The plugin scheduler should still see only the highest available priority tier.
+	priorityAuths, err = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
 	if err != nil {
 		return nil, nil, err
 	}
-	selectorAuths = cloneAuthSlice(selectorAuths)
-	return highestPriorityAuths(selectorAuths), selectorAuths, nil
+	// Session affinity also needs the temporarily blocked bound credential so it can
+	// distinguish short overload/runtime misses from permanent rebinding events.
+	selectorAuths = m.cloneAuthsForSessionAffinitySelector(auths, routeModel)
+	return cloneAuthSlice(priorityAuths), selectorAuths, nil
+}
+
+func (m *Manager) cloneAuthsForSessionAffinitySelector(auths []*Auth, routeModel string) []*Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	out := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		clone := auth.Clone()
+		m.copySelectionModelStateForRouteModel(clone, auth, routeModel)
+		out = append(out, clone)
+	}
+	return out
+}
+
+func (m *Manager) copySelectionModelStateForRouteModel(target, source *Auth, routeModel string) {
+	routeKey := canonicalModelKey(routeModel)
+	if target == nil || source == nil || routeKey == "" || len(source.ModelStates) == 0 {
+		return
+	}
+	selectionKey := m.selectionModelKeyForAuth(source, routeModel)
+	if selectionKey == "" || selectionKey == routeKey {
+		return
+	}
+	selectionState := source.ModelStates[selectionKey]
+	if selectionState == nil {
+		return
+	}
+	if target.ModelStates == nil {
+		target.ModelStates = make(map[string]*ModelState, 1)
+	}
+	if existing := target.ModelStates[routeKey]; existing != nil {
+		mergeModelState(existing, selectionState.Clone())
+		return
+	}
+	target.ModelStates[routeKey] = selectionState.Clone()
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {

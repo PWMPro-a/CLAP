@@ -150,6 +150,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))
 	}
+	if oldCfg.Routing.HighCacheMode != newCfg.Routing.HighCacheMode {
+		changes = append(changes, fmt.Sprintf("routing.high-cache-mode: %t -> %t", oldCfg.Routing.HighCacheMode, newCfg.Routing.HighCacheMode))
+	}
 	if !reflect.DeepEqual(oldCfg.Payload, newCfg.Payload) {
 		changes = appendPayloadConfigChanges(changes, oldCfg.Payload, newCfg.Payload)
 	}

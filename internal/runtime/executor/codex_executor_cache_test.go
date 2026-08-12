@@ -70,6 +70,68 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	}
 }
 
+func TestCodexWebsocketPromptCacheHeaders_OpenAIChatCompletions_UsesExplicitPromptCacheKey(t *testing.T) {
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"chat-cache","messages":[{"role":"user","content":"hello"}]}`),
+	}
+
+	body, headers, err := applyCodexPromptCacheHeadersWithContext(
+		context.Background(),
+		sdktranslator.FormatOpenAI,
+		req,
+		[]byte(`{"model":"gpt-5.6-sol","input":[]}`),
+	)
+	if err != nil {
+		t.Fatalf("applyCodexPromptCacheHeadersWithContext() error = %v", err)
+	}
+	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != "chat-cache" {
+		t.Fatalf("prompt_cache_key = %q, want chat-cache; body=%s", gotKey, string(body))
+	}
+	if gotSession := headers["session_id"]; len(gotSession) != 1 || gotSession[0] != "chat-cache" {
+		t.Fatalf("session_id = %#v, want [chat-cache]", gotSession)
+	}
+	if gotConversation := headers.Get("Conversation_id"); gotConversation != "chat-cache" {
+		t.Fatalf("Conversation_id = %q, want chat-cache", gotConversation)
+	}
+}
+
+func TestCodexWebsocketPromptCacheHeaders_OpenAIChatCompletions_StablePromptCacheKeyFromAPIKey(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Set("userApiKey", "test-api-key")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`),
+	}
+	rawJSON := []byte(`{"model":"gpt-5.6-sol","input":[]}`)
+	expectedKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:test-api-key")).String()
+
+	firstBody, firstHeaders, err := applyCodexPromptCacheHeadersWithContext(ctx, sdktranslator.FormatOpenAI, req, rawJSON)
+	if err != nil {
+		t.Fatalf("first applyCodexPromptCacheHeadersWithContext() error = %v", err)
+	}
+	secondBody, secondHeaders, err := applyCodexPromptCacheHeadersWithContext(ctx, sdktranslator.FormatOpenAI, req, rawJSON)
+	if err != nil {
+		t.Fatalf("second applyCodexPromptCacheHeadersWithContext() error = %v", err)
+	}
+
+	if gotKey := gjson.GetBytes(firstBody, "prompt_cache_key").String(); gotKey != expectedKey {
+		t.Fatalf("first prompt_cache_key = %q, want %q; body=%s", gotKey, expectedKey, string(firstBody))
+	}
+	if gotKey := gjson.GetBytes(secondBody, "prompt_cache_key").String(); gotKey != expectedKey {
+		t.Fatalf("second prompt_cache_key = %q, want %q; body=%s", gotKey, expectedKey, string(secondBody))
+	}
+	if gotSession := firstHeaders["session_id"]; len(gotSession) != 1 || gotSession[0] != expectedKey {
+		t.Fatalf("first session_id = %#v, want [%q]", gotSession, expectedKey)
+	}
+	if gotSession := secondHeaders["session_id"]; len(gotSession) != 1 || gotSession[0] != expectedKey {
+		t.Fatalf("second session_id = %#v, want [%q]", gotSession, expectedKey)
+	}
+}
+
 func TestCodexExecutorCacheHelper_UsesDerivedSessionUUID(t *testing.T) {
 	t.Parallel()
 
@@ -93,6 +155,37 @@ func TestCodexExecutorCacheHelper_UsesDerivedSessionUUID(t *testing.T) {
 	}
 	if _, errParse := uuid.Parse(expectedKey); errParse != nil {
 		t.Fatalf("derived prompt cache key %q is not a UUID: %v", expectedKey, errParse)
+	}
+}
+
+func TestCodexExecutorCacheHelper_HighCacheModePrefersCallerScope(t *testing.T) {
+	t.Parallel()
+
+	callerScope := "caller-scope-a"
+	executor := &CodexExecutor{cfg: &config.Config{Routing: config.RoutingConfig{HighCacheMode: true}}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"hello"}]}`),
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey:      callerScope,
+			cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:derived-root",
+		},
+	}
+	expectedKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache-caller-scope:"+callerScope)).String()
+	derivedKey := helps.ProviderSessionUUID("codex", req.Metadata)
+
+	httpReq, body, _, err := executor.cacheHelper(context.Background(), sdktranslator.FormatOpenAIResponse, "https://example.com/responses", nil, req, req.Payload, []byte(`{"model":"gpt-5.4","stream":true}`))
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != expectedKey {
+		t.Fatalf("prompt_cache_key = %q, want caller-scope key %q", got, expectedKey)
+	}
+	if got := httpReq.Header.Get("Session_id"); got != expectedKey {
+		t.Fatalf("Session_id = %q, want %q", got, expectedKey)
+	}
+	if expectedKey == derivedKey {
+		t.Fatalf("caller-scope key unexpectedly equals derived key %q", expectedKey)
 	}
 }
 

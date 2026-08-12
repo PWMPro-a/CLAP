@@ -96,6 +96,13 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_RoutingHighCacheMode(t *testing.T) {
+	oldCfg := &config.Config{}
+	newCfg := &config.Config{Routing: config.RoutingConfig{HighCacheMode: true}}
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "routing.high-cache-mode: false -> true")
+}
+
 func TestBuildConfigChangeDetails_CodexLiveMediaRelay(t *testing.T) {
 	oldCfg := &config.Config{Codex: config.CodexConfig{LiveMediaRelay: config.CodexLiveMediaRelayConfig{
 		Enabled:     false,
