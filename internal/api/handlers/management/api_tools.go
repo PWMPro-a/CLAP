@@ -30,13 +30,15 @@ const (
 var antigravityOAuthTokenURL = "https://oauth2.googleapis.com/token"
 
 type apiCallRequest struct {
-	AuthIndexSnake  *string           `json:"auth_index"`
-	AuthIndexCamel  *string           `json:"authIndex"`
-	AuthIndexPascal *string           `json:"AuthIndex"`
-	Method          string            `json:"method"`
-	URL             string            `json:"url"`
-	Header          map[string]string `json:"header"`
-	Data            string            `json:"data"`
+	AuthIndexSnake   *string           `json:"auth_index"`
+	AuthIndexCamel   *string           `json:"authIndex"`
+	AuthIndexPascal  *string           `json:"AuthIndex"`
+	EnsureFreshSnake *bool             `json:"ensure_fresh_token"`
+	EnsureFreshCamel *bool             `json:"ensureFreshToken"`
+	Method           string            `json:"method"`
+	URL              string            `json:"url"`
+	Header           map[string]string `json:"header"`
+	Data             string            `json:"data"`
 }
 
 type apiCallResponse struct {
@@ -121,6 +123,16 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
+	if firstBool(body.EnsureFreshSnake, body.EnsureFreshCamel) && auth != nil && h.authManager != nil {
+		refreshed, errRefresh := h.authManager.EnsureFreshAuthToken(c.Request.Context(), auth.ID, 2*time.Minute)
+		if errRefresh != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
+			return
+		}
+		if refreshed != nil {
+			auth = refreshed
+		}
+	}
 	httpClient := &http.Client{
 		Timeout:   defaultAPICallTimeout,
 		Transport: h.apiCallTransport(auth),
@@ -315,6 +327,15 @@ func firstNonEmptyString(values ...*string) string {
 		}
 	}
 	return ""
+}
+
+func firstBool(values ...*bool) bool {
+	for _, value := range values {
+		if value != nil {
+			return *value
+		}
+	}
+	return false
 }
 
 func tokenValueForAuth(auth *coreauth.Auth) string {

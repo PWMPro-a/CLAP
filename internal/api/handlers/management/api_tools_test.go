@@ -9,11 +9,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
@@ -138,6 +140,78 @@ func TestAPICallNormalOAuthKeepsBearerTokenReplacement(t *testing.T) {
 	if upstreamAuthorization != "Bearer oauth-token" {
 		t.Fatalf("Authorization = %q, want ordinary bearer token", upstreamAuthorization)
 	}
+}
+
+func TestAPICallEnsureFreshTokenUsesRefreshedCredential(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamAuthorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuthorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	executor := &countingManagementRefreshExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{
+		ID:       "oauth-refresh",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"access_token":  "stale-token",
+			"refresh_token": "refresh-token",
+			"expires_at":    time.Now().Add(-time.Minute).Unix(),
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	status, response := invokeManagementAPICall(t, handler, map[string]any{
+		"auth_index":         auth.Index,
+		"ensure_fresh_token": true,
+		"method":             http.MethodGet,
+		"url":                upstream.URL,
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+		},
+	})
+
+	if status != http.StatusOK || response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status=%d upstream_status=%d body=%s", status, response.StatusCode, response.Body)
+	}
+	if upstreamAuthorization != "Bearer refreshed-token" || executor.refreshCalls != 1 {
+		t.Fatalf("authorization=%q refresh_calls=%d", upstreamAuthorization, executor.refreshCalls)
+	}
+}
+
+type countingManagementRefreshExecutor struct {
+	refreshCalls int
+}
+
+func (e *countingManagementRefreshExecutor) Identifier() string { return "codex" }
+
+func (e *countingManagementRefreshExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, nil
+}
+
+func (e *countingManagementRefreshExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *countingManagementRefreshExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	e.refreshCalls++
+	auth.Metadata["access_token"] = "refreshed-token"
+	auth.Metadata["expires_at"] = time.Now().Add(time.Hour).Unix()
+	return auth, nil
+}
+
+func (e *countingManagementRefreshExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, nil
+}
+
+func (e *countingManagementRefreshExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
 }
 
 func TestAPICallAgentIdentityQueuesRejectedTaskWithoutLeakingDetails(t *testing.T) {

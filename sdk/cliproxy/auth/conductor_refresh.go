@@ -490,6 +490,41 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	_, _ = m.refreshAuthForRequest(ctx, id, "")
 }
 
+// EnsureFreshAuthToken returns the current credential after refreshing it when
+// its access token is missing or expires within minValidity. Management-side
+// collectors use this path so quota probes share the same refresh lock and
+// persistence semantics as request execution without entering the hot path.
+func (m *Manager) EnsureFreshAuthToken(ctx context.Context, id string, minValidity time.Duration) (*Auth, error) {
+	if m == nil {
+		return nil, errors.New("auth manager is nil")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, errors.New("auth id is empty")
+	}
+	if minValidity < 0 {
+		minValidity = 0
+	}
+
+	m.mu.RLock()
+	auth := m.auths[id]
+	m.mu.RUnlock()
+	if auth == nil {
+		return nil, errors.New("auth not found")
+	}
+	if !authHasRefreshCredential(auth) {
+		return auth.Clone(), nil
+	}
+
+	tokenMissing := authAccessToken(auth) == ""
+	expiresAt, hasExpiry := auth.ExpirationTime()
+	expiresSoon := hasExpiry && !expiresAt.After(time.Now().Add(minValidity))
+	if !tokenMissing && !expiresSoon {
+		return auth.Clone(), nil
+	}
+	return m.refreshAuthForRequest(ctx, id, "")
+}
+
 // refreshAuthForRequest performs a synchronous credential refresh for the given auth.
 // failedAccessToken lets concurrent callers reuse a refresh that already replaced the
 // access token that produced the unauthorized response.

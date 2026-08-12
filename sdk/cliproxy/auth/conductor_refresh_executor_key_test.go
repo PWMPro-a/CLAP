@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -12,6 +13,58 @@ import (
 type countingRefreshExecutor struct {
 	id           string
 	refreshCalls atomic.Int32
+}
+
+func TestEnsureFreshAuthTokenRefreshesExpiredCredential(t *testing.T) {
+	executor := &countingRefreshExecutor{id: "codex"}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &Auth{
+		ID:       "expired-auth",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"access_token":  "stale-token",
+			"refresh_token": "refresh-token",
+			"expires_at":    time.Now().Add(-time.Minute).Unix(),
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	refreshed, err := manager.EnsureFreshAuthToken(context.Background(), auth.ID, 2*time.Minute)
+	if err != nil {
+		t.Fatalf("EnsureFreshAuthToken() error = %v", err)
+	}
+	if refreshed == nil || executor.refreshCalls.Load() != 1 {
+		t.Fatalf("refreshed=%#v calls=%d, want one refresh", refreshed, executor.refreshCalls.Load())
+	}
+}
+
+func TestEnsureFreshAuthTokenKeepsValidCredential(t *testing.T) {
+	executor := &countingRefreshExecutor{id: "codex"}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &Auth{
+		ID:       "valid-auth",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"access_token":  "valid-token",
+			"refresh_token": "refresh-token",
+			"expires_at":    time.Now().Add(time.Hour).Unix(),
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	current, err := manager.EnsureFreshAuthToken(context.Background(), auth.ID, 2*time.Minute)
+	if err != nil {
+		t.Fatalf("EnsureFreshAuthToken() error = %v", err)
+	}
+	if current == nil || executor.refreshCalls.Load() != 0 {
+		t.Fatalf("current=%#v calls=%d, want no refresh", current, executor.refreshCalls.Load())
+	}
 }
 
 func (e *countingRefreshExecutor) Identifier() string { return e.id }
