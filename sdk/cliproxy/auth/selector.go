@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cacheaffinity"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 )
@@ -619,17 +620,24 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback      Selector
-	cache         *SessionCache
-	failoverCache *SessionCache
-	highCacheMode bool
+	fallback               Selector
+	cache                  *SessionCache
+	failoverCache          *SessionCache
+	highCacheMode          bool
+	cacheAffinityEnabled   bool
+	quotaPreemptUsedRatio  float64
+	quotaHardStopUsedRatio float64
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback      Selector
-	TTL           time.Duration
-	HighCacheMode bool
+	Fallback               Selector
+	TTL                    time.Duration
+	HighCacheMode          bool
+	CacheAffinityEnabled   bool
+	MaxEntries             int
+	QuotaPreemptUsedRatio  float64
+	QuotaHardStopUsedRatio float64
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -648,11 +656,20 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	if cfg.QuotaPreemptUsedRatio <= 0 || cfg.QuotaPreemptUsedRatio >= 1 {
+		cfg.QuotaPreemptUsedRatio = 0.97
+	}
+	if cfg.QuotaHardStopUsedRatio <= cfg.QuotaPreemptUsedRatio || cfg.QuotaHardStopUsedRatio > 1 {
+		cfg.QuotaHardStopUsedRatio = 0.99
+	}
 	return &SessionAffinitySelector{
-		fallback:      cfg.Fallback,
-		cache:         NewSessionCache(cfg.TTL),
-		failoverCache: NewSessionCache(cfg.TTL),
-		highCacheMode: cfg.HighCacheMode,
+		fallback:               cfg.Fallback,
+		cache:                  NewSessionCacheWithLimit(cfg.TTL, cfg.MaxEntries),
+		failoverCache:          NewSessionCacheWithLimit(cfg.TTL, cfg.MaxEntries),
+		highCacheMode:          cfg.HighCacheMode,
+		cacheAffinityEnabled:   cfg.CacheAffinityEnabled,
+		quotaPreemptUsedRatio:  cfg.QuotaPreemptUsedRatio,
+		quotaHardStopUsedRatio: cfg.QuotaHardStopUsedRatio,
 	}
 }
 
@@ -691,7 +708,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
-	fallbackAuths := highestPriorityAuths(available)
+	fallbackAvailable := s.cacheAffinityNewSessionAuths(available, model, now)
+	fallbackAuths := highestPriorityAuths(fallbackAvailable)
 
 	cacheKey := sessionAffinityCacheKey(provider, primaryID, model)
 	fallbackKey := ""
@@ -728,6 +746,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				if s.cacheAffinityHardStopped(auth, model, now) {
+					break
+				}
 				if auth.consumeStickyBypass(cacheKey, now) {
 					s.cache.Invalidate(cacheKey)
 					clearFailover()
@@ -793,6 +814,32 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	return auth, nil
 }
 
+func (s *SessionAffinitySelector) cacheAffinityNewSessionAuths(auths []*Auth, model string, now time.Time) []*Auth {
+	if s == nil || !s.cacheAffinityEnabled || len(auths) == 0 {
+		return auths
+	}
+	filtered := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		snapshot, ok := auth.codexQuotaSnapshot(model, now)
+		if ok && snapshot.UsedRatio >= s.quotaPreemptUsedRatio {
+			continue
+		}
+		filtered = append(filtered, auth)
+	}
+	return filtered
+}
+
+func (s *SessionAffinitySelector) cacheAffinityHardStopped(auth *Auth, model string, now time.Time) bool {
+	if s == nil || !s.cacheAffinityEnabled || auth == nil {
+		return false
+	}
+	snapshot, ok := auth.codexQuotaSnapshot(model, now)
+	return ok && snapshot.UsedRatio >= s.quotaHardStopUsedRatio
+}
+
 func (s *SessionAffinitySelector) shouldUseTemporaryFailover(auths []*Auth, cachedAuthID, model string, now time.Time) bool {
 	cachedAuthID = strings.TrimSpace(cachedAuthID)
 	if cachedAuthID == "" {
@@ -831,6 +878,9 @@ func authQuotaExceeded(auth *Auth, model string) bool {
 }
 
 func (s *SessionAffinitySelector) extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	if routeKey := cacheaffinity.MetadataValue(metadata, cliproxyexecutor.CacheAffinityRouteKeyMetadataKey); routeKey != "" {
+		return "cache-affinity:" + routeKey, ""
+	}
 	primaryID, fallbackID := extractSessionIDs(headers, payload, metadata)
 	if s == nil || !s.highCacheMode {
 		return primaryID, fallbackID

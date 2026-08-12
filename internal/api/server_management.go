@@ -122,6 +122,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/high-cache-mode", s.mgmt.GetRoutingHighCacheMode)
 		mgmt.PUT("/routing/high-cache-mode", s.mgmt.PutRoutingHighCacheMode)
 		mgmt.PATCH("/routing/high-cache-mode", s.mgmt.PutRoutingHighCacheMode)
+		mgmt.GET("/codex/cache-affinity/stats", s.mgmt.GetCodexCacheAffinityStats)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)

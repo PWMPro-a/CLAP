@@ -7,6 +7,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cacheaffinity"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
@@ -25,10 +26,14 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy           string
-	sessionAffinity    bool
-	sessionAffinityTTL time.Duration
-	highCacheMode      bool
+	strategy                string
+	sessionAffinity         bool
+	sessionAffinityTTL      time.Duration
+	highCacheMode           bool
+	cacheAffinityEnabled    bool
+	cacheAffinityMaxEntries int
+	quotaPreemptUsedRatio   float64
+	quotaHardStopUsedRatio  float64
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -48,6 +53,11 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	state.highCacheMode = cfg.Routing.HighCacheMode
+	cacheSettings := cacheaffinity.Settings(cfg)
+	state.cacheAffinityEnabled = cacheSettings.Enabled && !cacheSettings.Shadow
+	state.cacheAffinityMaxEntries = cacheSettings.MaxEntries
+	state.quotaPreemptUsedRatio = cacheSettings.QuotaPreemptUsedRatio
+	state.quotaHardStopUsedRatio = cacheSettings.QuotaHardStopUsedRatio
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
 			state.sessionAffinityTTL = parsed
@@ -66,11 +76,15 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
-	if state.sessionAffinity || state.highCacheMode {
+	if state.sessionAffinity || state.highCacheMode || state.cacheAffinityEnabled {
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback:      selector,
-			TTL:           state.sessionAffinityTTL,
-			HighCacheMode: state.highCacheMode,
+			Fallback:               selector,
+			TTL:                    state.sessionAffinityTTL,
+			HighCacheMode:          state.highCacheMode,
+			CacheAffinityEnabled:   state.cacheAffinityEnabled,
+			MaxEntries:             state.cacheAffinityMaxEntries,
+			QuotaPreemptUsedRatio:  state.quotaPreemptUsedRatio,
+			QuotaHardStopUsedRatio: state.quotaHardStopUsedRatio,
 		})
 	}
 	return selector

@@ -52,6 +52,14 @@ const (
 	DerivedSessionIDMetadataKey = "derived_session_id"
 	// CallerScopeMetadataKey isolates inferred session identities between downstream callers.
 	CallerScopeMetadataKey = "caller_scope"
+	// CacheAffinityRouteKeyMetadataKey stores the coordinator's stable local routing key.
+	CacheAffinityRouteKeyMetadataKey = "__cliproxy_cache_affinity_route_key"
+	// CacheAffinityUpstreamKeyMetadataKey stores the stable upstream prompt-cache identity.
+	CacheAffinityUpstreamKeyMetadataKey = "__cliproxy_cache_affinity_upstream_key"
+	// CacheAffinityPoolKeyMetadataKey stores the websocket slot-affinity identity.
+	CacheAffinityPoolKeyMetadataKey = "__cliproxy_cache_affinity_pool_key"
+	// CacheAffinityActiveMetadataKey reports whether coordinator decisions are active rather than shadow-only.
+	CacheAffinityActiveMetadataKey = "__cliproxy_cache_affinity_active"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.

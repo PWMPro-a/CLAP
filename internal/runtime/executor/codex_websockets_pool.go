@@ -10,6 +10,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cacheaffinity"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -158,17 +160,21 @@ func (e *CodexWebsocketsExecutor) tryAcquireExecutionSession(sessionID string) (
 	return sess, true
 }
 
-func codexStatelessWebsocketPoolKey(auth *cliproxyauth.Auth, cfg *config.Config, authID, wsURL string) string {
+func codexStatelessWebsocketPoolKey(auth *cliproxyauth.Auth, cfg *config.Config, authID, wsURL string, metadata ...map[string]any) string {
 	authID = strings.TrimSpace(authID)
 	wsURL = strings.TrimSpace(wsURL)
 	if authID == "" || wsURL == "" {
 		return ""
 	}
 	proxyURL, sourceIP := helps.ResolveEgressSettings(cfg, auth)
-	return authID + "\x00" + wsURL + "\x00" + strings.TrimSpace(proxyURL) + "\x00" + strings.TrimSpace(sourceIP)
+	poolKey := ""
+	if len(metadata) > 0 {
+		poolKey = cacheaffinity.MetadataValue(metadata[0], cliproxyexecutor.CacheAffinityPoolKeyMetadataKey)
+	}
+	return authID + "\x00" + wsURL + "\x00" + strings.TrimSpace(proxyURL) + "\x00" + strings.TrimSpace(sourceIP) + "\x00" + poolKey
 }
 
-func (e *CodexWebsocketsExecutor) acquireStatelessSession(poolKey string) (*codexWebsocketSession, bool) {
+func (e *CodexWebsocketsExecutor) acquireStatelessSession(poolKey string, limits ...int) (*codexWebsocketSession, bool) {
 	if e == nil || strings.TrimSpace(poolKey) == "" {
 		return nil, false
 	}
@@ -187,13 +193,25 @@ func (e *CodexWebsocketsExecutor) acquireStatelessSession(poolKey string) (*code
 			return sess, true
 		}
 	}
-	if len(pool) >= codexStatelessWebsocketPoolSlots {
+	limit := codexStatelessWebsocketPoolSlots
+	if len(limits) > 0 && limits[0] > 0 && limits[0] < limit {
+		limit = limits[0]
+	}
+	if len(pool) >= limit {
 		return nil, false
 	}
 	sess := &codexWebsocketSession{sessionID: "stateless-" + uuid.NewString(), upstreamDisconnectCh: make(chan error, 1)}
 	sess.reqMu.Lock()
 	store.stateless[poolKey] = append(pool, sess)
 	return sess, true
+}
+
+func codexWebsocketPoolSlots(cfg *config.Config) int {
+	settings := cacheaffinity.Settings(cfg)
+	if settings.Enabled && !settings.Shadow {
+		return settings.WebsocketPoolSlots
+	}
+	return codexStatelessWebsocketPoolSlots
 }
 
 func (e *CodexWebsocketsExecutor) prewarmParallelSessions(auth *cliproxyauth.Auth, poolKey, authID, wsURL string, headers http.Header) {

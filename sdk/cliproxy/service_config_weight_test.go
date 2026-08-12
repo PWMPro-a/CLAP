@@ -33,6 +33,24 @@ func TestHighCacheRoutingSelector(t *testing.T) {
 	defer selector.Stop()
 }
 
+func TestCacheAffinityBuildsSessionSelectorWithoutLegacyHighCacheMode(t *testing.T) {
+	state := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+			Enabled:               true,
+			MaxEntries:            4096,
+			QuotaPreemptUsedRatio: 0.96,
+		}},
+	})
+	selector, ok := newRoutingSelector(state).(*coreauth.SessionAffinitySelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", newRoutingSelector(state))
+	}
+	if selector.HighCacheMode() {
+		t.Fatal("cache affinity unexpectedly enabled legacy high-cache caller fallback")
+	}
+	defer selector.Stop()
+}
+
 func TestServiceRejectsInvalidCredentialWeightConfigCommit(t *testing.T) {
 	originalCfg := &internalconfig.Config{}
 	service := &Service{cfg: originalCfg}

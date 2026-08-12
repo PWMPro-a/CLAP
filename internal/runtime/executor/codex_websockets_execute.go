@@ -103,10 +103,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	executionSessionID := executionSessionIDFromOptions(opts)
-	parallelPoolKey := codexStatelessWebsocketPoolKey(auth, e.cfg, authID, wsURL)
+	parallelPoolKey := codexStatelessWebsocketPoolKey(auth, e.cfg, authID, wsURL, opts.Metadata)
 	sess, sessionLocked := e.tryAcquireExecutionSession(executionSessionID)
 	if executionSessionID != "" && !sessionLocked {
-		sess, sessionLocked = e.acquireStatelessSession(parallelPoolKey)
+		sess, sessionLocked = e.acquireStatelessSession(parallelPoolKey, codexWebsocketPoolSlots(e.cfg))
 	}
 	unlockSession := func() {
 		if sess != nil && sessionLocked {

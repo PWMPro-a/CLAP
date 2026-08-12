@@ -232,6 +232,20 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # Independent cache-affinity coordinator. Shadow mode computes stable route,
+  # upstream cache, websocket pool, and prefix fingerprints without changing routing.
+  cache-affinity:
+    enabled: false
+    shadow: true
+    max-entries: 65536
+    # Caps credential attempts for one logical Codex request when active.
+    max-retry-credentials: 2
+    # Bounded hot websocket slots per auth/egress/model/session pool.
+    websocket-pool-slots: 8
+    # New sessions avoid credentials at or above this collected usage ratio.
+    quota-preempt-used-ratio: 0.97
+    # Existing warm sessions leave a credential at or above this ratio.
+    quota-hard-stop-used-ratio: 0.99
   # Temporarily prioritize a credential after an external quota collector reports
   # that the current model window is almost exhausted.
   tail-burst:
@@ -241,6 +255,8 @@ codex:
     # The OAuth usage endpoint is polled independently of model requests.
     # It never waits for, buffers, or shares an upstream Responses WebSocket.
     quota-collector:
+      # Enable for cache-affinity quota preemption even when tail-burst is off.
+      enabled: false
       interval: "45s"
       max-concurrency: 4
       timeout: "8s"

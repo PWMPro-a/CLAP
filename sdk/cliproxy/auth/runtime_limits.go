@@ -365,6 +365,49 @@ func (a *Auth) maybeFreezeRuntimeResult(result Result, now time.Time, stickySess
 	state.mu.Unlock()
 }
 
+func (a *Auth) freezeUsageLimit(now time.Time, retryAfter *time.Duration) {
+	if a == nil {
+		return
+	}
+	until := now.Add(5 * time.Minute)
+	if retryAfter != nil && *retryAfter > 0 {
+		until = now.Add(*retryAfter)
+	}
+	state := a.ensureRuntimeLimits()
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if state.frozenUntil.Before(until) {
+		state.frozenUntil = until
+	}
+	state.recordSkipLocked("usage_limit_reached", until, now)
+	state.mu.Unlock()
+}
+
+func (a *Auth) updateQuotaPreempt(now time.Time, until time.Time, active bool) {
+	if a == nil {
+		return
+	}
+	state := a.ensureRuntimeLimits()
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if active && !until.IsZero() && until.After(now) {
+		if state.frozenUntil.Before(until) || state.lastSkipReason == "quota_preempt" {
+			state.frozenUntil = until
+		}
+		state.recordSkipLocked("quota_preempt", until, now)
+	} else if state.lastSkipReason == "quota_preempt" {
+		state.frozenUntil = time.Time{}
+		state.lastSkipReason = ""
+		state.lastSkipRecordedAt = time.Time{}
+		state.lastSkipRecoveryTarget = time.Time{}
+	}
+	state.mu.Unlock()
+}
+
 func shouldFreezeRuntimeAuthResult(err *Error) bool {
 	if err == nil {
 		return false

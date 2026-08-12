@@ -98,15 +98,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	authType, authValue = auth.AccountInfo()
 
 	executionSessionID := executionSessionIDFromOptions(opts)
-	parallelPoolKey := codexStatelessWebsocketPoolKey(auth, e.cfg, authID, wsURL)
+	parallelPoolKey := codexStatelessWebsocketPoolKey(auth, e.cfg, authID, wsURL, opts.Metadata)
 	sess, streamSessionLocked := e.tryAcquireExecutionSession(executionSessionID)
 	if executionSessionID != "" && !streamSessionLocked {
 		// One logical execution session may use several physical upstream slots;
 		// a busy primary borrows a hot standby instead of queueing.
-		sess, streamSessionLocked = e.acquireStatelessSession(parallelPoolKey)
+		sess, streamSessionLocked = e.acquireStatelessSession(parallelPoolKey, codexWebsocketPoolSlots(e.cfg))
 	} else if executionSessionID == "" && !cliproxyexecutor.DownstreamWebsocket(ctx) {
 		// Plain HTTP SSE requests reuse authenticated upstream WebSocket slots.
-		sess, streamSessionLocked = e.acquireStatelessSession(parallelPoolKey)
+		sess, streamSessionLocked = e.acquireStatelessSession(parallelPoolKey, codexWebsocketPoolSlots(e.cfg))
 	}
 	unlockStreamSession := func() {
 		if sess != nil && streamSessionLocked {

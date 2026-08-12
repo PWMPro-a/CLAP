@@ -66,3 +66,39 @@ func TestResolveCodexTailBurstQuotaCollectorSettings(t *testing.T) {
 		t.Fatalf("max concurrency = %d, want 16", settings.maxConcurrency)
 	}
 }
+
+func TestResolveCodexTailBurstQuotaCollectorSettingsForCacheAffinity(t *testing.T) {
+	settings, enabled := resolveCodexTailBurstQuotaCollectorSettings(&config.Config{
+		Codex: config.CodexConfig{
+			CacheAffinity: config.CodexCacheAffinityConfig{Enabled: true},
+			TailBurst: config.CodexTailBurstConfig{QuotaCollector: config.CodexTailBurstQuotaCollectorConfig{
+				Enabled:        true,
+				Interval:       "15s",
+				MaxConcurrency: 2,
+			}},
+		},
+	})
+	if !enabled {
+		t.Fatal("collector disabled while cache affinity is enabled")
+	}
+	if settings.interval != 15*time.Second || settings.maxConcurrency != 2 {
+		t.Fatalf("unexpected cache-affinity collector settings: %#v", settings)
+	}
+}
+
+func TestParseCodexTailBurstQuotaSnapshotIncludesResetAt(t *testing.T) {
+	sampledAt := time.Unix(1_700_000_000, 0).UTC()
+	snapshot, ok := parseCodexTailBurstQuotaSnapshot([]byte(`{
+		"rate_limit":{
+			"primary_window":{"used_percent":98,"reset_at":1700003600},
+			"secondary_window":{"used_percent":20,"reset_after_seconds":7200}
+		}
+	}`), sampledAt, time.Minute)
+	if !ok {
+		t.Fatal("quota snapshot was not parsed")
+	}
+	want := time.Unix(1_700_003_600, 0).UTC()
+	if !snapshot.ResetAt.Equal(want) {
+		t.Fatalf("reset_at = %v, want %v", snapshot.ResetAt, want)
+	}
+}

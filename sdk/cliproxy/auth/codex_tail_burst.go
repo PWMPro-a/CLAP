@@ -29,6 +29,7 @@ type CodexQuotaSnapshot struct {
 	Window         string    `json:"window,omitempty"`
 	SampledAt      time.Time `json:"sampled_at"`
 	ExpiresAt      time.Time `json:"expires_at"`
+	ResetAt        time.Time `json:"reset_at,omitempty"`
 	Generation     uint64    `json:"generation"`
 }
 
@@ -226,6 +227,8 @@ func (m *Manager) UpdateCodexQuotaSnapshot(authID, model string, snapshot CodexQ
 	}
 	stored, accepted := auth.setCodexQuotaSnapshot(model, snapshot)
 	if accepted {
+		cacheSettings := m.cacheAffinitySettings()
+		auth.updateQuotaPreempt(now, snapshot.ResetAt, cacheSettings.active && snapshot.UsedRatio >= cacheSettings.hardStopRatio)
 		m.refreshCodexTailBurstCandidates()
 	}
 	return stored, accepted, nil
@@ -268,6 +271,8 @@ func (m *Manager) UpdateCodexQuotaSnapshots(updates []CodexQuotaSnapshotUpdate) 
 			continue
 		}
 		if _, accepted := auth.setCodexQuotaSnapshot(strings.TrimSpace(update.Model), snapshot); accepted {
+			cacheSettings := m.cacheAffinitySettings()
+			auth.updateQuotaPreempt(now, snapshot.ResetAt, cacheSettings.active && snapshot.UsedRatio >= cacheSettings.hardStopRatio)
 			acceptedCount++
 		}
 	}

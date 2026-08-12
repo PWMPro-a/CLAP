@@ -134,6 +134,9 @@ type AntigravityConfig struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// CacheAffinity coordinates stable routing, upstream cache identity, and
+	// websocket pooling without adding network work to the request path.
+	CacheAffinity CodexCacheAffinityConfig `yaml:"cache-affinity" json:"cache-affinity"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
 	// OptimizeMultiAgentV2 optimizes official Codex multi-agent requests.
@@ -142,6 +145,18 @@ type CodexConfig struct {
 	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
 	// TailBurst enables quota-tail draining for credentials near a tracked usage-window limit.
 	TailBurst CodexTailBurstConfig `yaml:"tail-burst" json:"tail-burst"`
+}
+
+// CodexCacheAffinityConfig controls the independent Codex cache-affinity
+// coordinator. Shadow mode computes diagnostics while preserving legacy keys.
+type CodexCacheAffinityConfig struct {
+	Enabled                bool    `yaml:"enabled" json:"enabled"`
+	Shadow                 bool    `yaml:"shadow" json:"shadow"`
+	MaxEntries             int     `yaml:"max-entries" json:"max-entries"`
+	MaxRetryCredentials    int     `yaml:"max-retry-credentials" json:"max-retry-credentials"`
+	WebsocketPoolSlots     int     `yaml:"websocket-pool-slots" json:"websocket-pool-slots"`
+	QuotaPreemptUsedRatio  float64 `yaml:"quota-preempt-used-ratio" json:"quota-preempt-used-ratio"`
+	QuotaHardStopUsedRatio float64 `yaml:"quota-hard-stop-used-ratio" json:"quota-hard-stop-used-ratio"`
 }
 
 // CodexTailBurstConfig controls the temporary high-concurrency drain mode for
@@ -156,6 +171,7 @@ type CodexTailBurstConfig struct {
 
 // CodexTailBurstQuotaCollectorConfig controls the asynchronous OAuth usage collector.
 type CodexTailBurstQuotaCollectorConfig struct {
+	Enabled        bool   `yaml:"enabled" json:"enabled"`
 	Interval       string `yaml:"interval" json:"interval"`
 	MaxConcurrency int    `yaml:"max-concurrency" json:"max-concurrency"`
 	Timeout        string `yaml:"timeout" json:"timeout"`

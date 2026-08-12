@@ -90,10 +90,13 @@ func resolveCodexTailBurstQuotaCollectorSettings(cfg *config.Config) (codexTailB
 		timeout:        defaultCodexQuotaCollectorTimeout,
 		snapshotTTL:    defaultCodexQuotaCollectorSnapshotTTL,
 	}
-	if cfg == nil || !cfg.Codex.TailBurst.Enabled {
+	if cfg == nil {
 		return settings, false
 	}
 	collector := cfg.Codex.TailBurst.QuotaCollector
+	if !cfg.Codex.TailBurst.Enabled && !collector.Enabled {
+		return settings, false
+	}
 	if interval, err := time.ParseDuration(strings.TrimSpace(collector.Interval)); err == nil && interval > 0 {
 		settings.interval = interval
 	}
@@ -299,5 +302,17 @@ func parseCodexTailBurstQuotaSnapshot(body []byte, sampledAt time.Time, ttl time
 		Window:         bestWindow,
 		SampledAt:      sampledAt,
 		ExpiresAt:      sampledAt.Add(ttl),
+		ResetAt:        codexQuotaWindowResetAt(body, bestWindow, sampledAt),
 	}, true
+}
+
+func codexQuotaWindowResetAt(body []byte, windowName string, sampledAt time.Time) time.Time {
+	path := "rate_limit." + strings.TrimSpace(windowName) + "_window"
+	if resetAt := gjson.GetBytes(body, path+".reset_at").Int(); resetAt > 0 {
+		return time.Unix(resetAt, 0).UTC()
+	}
+	if resetAfter := gjson.GetBytes(body, path+".reset_after_seconds").Int(); resetAfter > 0 {
+		return sampledAt.Add(time.Duration(resetAfter) * time.Second)
+	}
+	return time.Time{}
 }

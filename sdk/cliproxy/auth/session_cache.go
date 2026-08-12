@@ -17,22 +17,29 @@ type sessionEntry struct {
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
 type SessionCache struct {
-	mu      sync.RWMutex
-	entries map[string]sessionEntry
-	ttl     time.Duration
-	stopCh  chan struct{}
+	mu         sync.RWMutex
+	entries    map[string]sessionEntry
+	ttl        time.Duration
+	maxEntries int
+	stopCh     chan struct{}
 }
 
 // NewSessionCache creates a cache with the specified TTL.
 // A background goroutine periodically cleans expired entries.
 func NewSessionCache(ttl time.Duration) *SessionCache {
+	return NewSessionCacheWithLimit(ttl, 0)
+}
+
+// NewSessionCacheWithLimit creates a cache with a bounded number of aliases.
+func NewSessionCacheWithLimit(ttl time.Duration, maxEntries int) *SessionCache {
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
 	c := &SessionCache{
-		entries: make(map[string]sessionEntry),
-		ttl:     ttl,
-		stopCh:  make(chan struct{}),
+		entries:    make(map[string]sessionEntry),
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		stopCh:     make(chan struct{}),
 	}
 	go c.cleanupLoop()
 	return c
@@ -126,6 +133,27 @@ func (c *SessionCache) SetAliases(authID string, sessionIDs ...string) {
 		return
 	}
 	c.replaceAliasGroupsLocked(authID, now.Add(c.ttl), aliases, previousGroups...)
+	c.enforceLimitLocked()
+}
+
+func (c *SessionCache) enforceLimitLocked() {
+	if c == nil || c.maxEntries <= 0 {
+		return
+	}
+	for len(c.entries) > c.maxEntries {
+		var oldest sessionEntry
+		found := false
+		for _, entry := range c.entries {
+			if !found || entry.expiresAt.Before(oldest.expiresAt) {
+				oldest = entry
+				found = true
+			}
+		}
+		if !found {
+			return
+		}
+		c.removeAliasGroupLocked(oldest)
+	}
 }
 
 func (c *SessionCache) replaceAliasGroupsLocked(authID string, expiresAt time.Time, aliases []string, previousGroups ...sessionEntry) {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cacheaffinity"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -55,6 +56,9 @@ func managerSelectorHighCacheMode(selector Selector) bool {
 }
 
 func highCacheRuntimeStickyBypassSessionKey(provider, model string, opts cliproxyexecutor.Options) string {
+	if routeKey := cacheaffinity.MetadataValue(opts.Metadata, cliproxyexecutor.CacheAffinityRouteKeyMetadataKey); routeKey != "" {
+		return sessionAffinityCacheKey(provider, "cache-affinity:"+routeKey, model)
+	}
 	primary, fallback := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if highCacheShouldPreferCallerSession(primary) {
 		if caller := highCacheCallerSessionID(opts.Metadata); caller != "" {

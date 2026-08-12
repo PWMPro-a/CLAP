@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -343,6 +344,31 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	}
 	if gotMetadataWindowID := gjson.Get(gotHeaderMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
 		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
+	}
+}
+
+func TestCodexIdentityConfuseDerivedCacheKeyDoesNotLeakAsClientIdentity(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{HighCacheMode: true},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{ID: "auth-derived-cache"}
+	userPayload := []byte(`{"model":"gpt-5.6-sol","input":"hello"}`)
+	rawJSON := []byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"coordinated-cache","input":"hello"}`)
+
+	upstream, state := applyCodexIdentityConfuseBody(cfg, auth, userPayload, rawJSON)
+	if state.promptCacheKey == "" {
+		t.Fatal("derived prompt cache key was not auth-namespaced")
+	}
+	if state.originalPromptCacheKey != "" {
+		t.Fatalf("original prompt cache key = %q, want empty", state.originalPromptCacheKey)
+	}
+	if got := gjson.GetBytes(upstream, "prompt_cache_key").String(); got != state.promptCacheKey {
+		t.Fatalf("upstream prompt_cache_key = %q, want %q", got, state.promptCacheKey)
+	}
+	client := applyCodexIdentityExposeResponsePayload([]byte(`{"prompt_cache_key":"`+state.promptCacheKey+`"}`), state)
+	if !bytes.Contains(client, []byte(state.promptCacheKey)) {
+		t.Fatalf("derived key was unexpectedly rewritten in client payload: %s", client)
 	}
 }
 

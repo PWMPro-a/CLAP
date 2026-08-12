@@ -45,8 +45,10 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, false)
 	}
+	req, opts = m.enrichCacheAffinity(normalized, req, opts)
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+	maxRetryCredentials = m.effectiveMaxRetryCredentials(maxRetryCredentials, normalized)
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
@@ -90,8 +92,10 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, true)
 	}
+	req, opts = m.enrichCacheAffinity(normalized, req, opts)
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+	maxRetryCredentials = m.effectiveMaxRetryCredentials(maxRetryCredentials, normalized)
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
@@ -131,8 +135,12 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	if !m.HomeEnabled() {
+		req, opts = m.enrichCacheAffinity(normalized, req, opts)
+	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+	maxRetryCredentials = m.effectiveMaxRetryCredentials(maxRetryCredentials, normalized)
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
@@ -407,6 +415,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			m.bindSessionAffinityFromResponsePayload(execCtx, provider, routeModel, auth.ID, resp.Payload)
+			m.confirmCacheAffinityBinding(provider, routeModel, auth.ID, opts.Metadata)
 			releaseRuntimeSlot(releaseRuntime)
 			return resp, nil
 		}
@@ -563,6 +572,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			m.bindSessionAffinityFromResponsePayload(execCtx, provider, routeModel, auth.ID, resp.Payload)
+			m.confirmCacheAffinityBinding(provider, routeModel, auth.ID, opts.Metadata)
 			releaseRuntimeSlot(releaseRuntime)
 			return resp, nil
 		}
