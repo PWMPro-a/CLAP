@@ -771,6 +771,24 @@ func TestExtractSessionID(t *testing.T) {
 	}
 }
 
+func TestAuthSubsetByIDReusesClonedSessionCandidates(t *testing.T) {
+	t.Parallel()
+
+	authA := &Auth{ID: "auth-a", Attributes: map[string]string{"key": "a"}}
+	authB := &Auth{ID: "auth-b", Attributes: map[string]string{"key": "b"}}
+	cloned := cloneAuthSlice([]*Auth{authA, authB})
+	subset := authSubsetByID(cloned, []*Auth{authB})
+	if len(subset) != 1 || subset[0].ID != authB.ID {
+		t.Fatalf("subset = %#v, want auth-b", subset)
+	}
+	if subset[0] != cloned[1] {
+		t.Fatal("subset did not reuse the existing session-affinity clone")
+	}
+	if subset[0] == authB {
+		t.Fatal("subset leaked the live auth pointer")
+	}
+}
+
 func TestSessionAffinitySelector_SameSessionSameAuth(t *testing.T) {
 	t.Parallel()
 

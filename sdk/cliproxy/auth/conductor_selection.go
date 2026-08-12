@@ -381,7 +381,29 @@ func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, pr
 	// Session affinity also needs the temporarily blocked bound credential so it can
 	// distinguish short overload/runtime misses from permanent rebinding events.
 	selectorAuths = m.cloneAuthsForSessionAffinitySelector(auths, routeModel)
-	return cloneAuthSlice(priorityAuths), selectorAuths, nil
+	return authSubsetByID(selectorAuths, priorityAuths), selectorAuths, nil
+}
+
+func authSubsetByID(auths, subset []*Auth) []*Auth {
+	if len(auths) == 0 || len(subset) == 0 {
+		return nil
+	}
+	wanted := make(map[string]struct{}, len(subset))
+	for _, auth := range subset {
+		if auth != nil {
+			wanted[auth.ID] = struct{}{}
+		}
+	}
+	out := make([]*Auth, 0, len(wanted))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if _, ok := wanted[auth.ID]; ok {
+			out = append(out, auth)
+		}
+	}
+	return out
 }
 
 func (m *Manager) cloneAuthsForSessionAffinitySelector(auths []*Auth, routeModel string) []*Auth {
