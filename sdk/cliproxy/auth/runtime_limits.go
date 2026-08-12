@@ -365,9 +365,9 @@ func (a *Auth) maybeFreezeRuntimeResult(result Result, now time.Time, stickySess
 	state.mu.Unlock()
 }
 
-func (a *Auth) freezeUsageLimit(now time.Time, retryAfter *time.Duration) {
+func (a *Auth) freezeUsageLimit(now time.Time, retryAfter *time.Duration) bool {
 	if a == nil {
-		return
+		return false
 	}
 	until := now.Add(5 * time.Minute)
 	if retryAfter != nil && *retryAfter > 0 {
@@ -375,14 +375,19 @@ func (a *Auth) freezeUsageLimit(now time.Time, retryAfter *time.Duration) {
 	}
 	state := a.ensureRuntimeLimits()
 	if state == nil {
-		return
+		return false
 	}
 	state.mu.Lock()
-	if state.frozenUntil.Before(until) {
+	// Repeated responses carrying resets_in_seconds calculate nearly identical
+	// absolute deadlines from slightly different arrival times. Treat sub-second
+	// drift as the same freeze window so a concurrent failure burst is deduplicated.
+	extended := state.frozenUntil.Before(until.Add(-time.Second))
+	if extended {
 		state.frozenUntil = until
 	}
-	state.recordSkipLocked("usage_limit_reached", until, now)
+	state.recordSkipLocked("usage_limit_reached", state.frozenUntil, now)
 	state.mu.Unlock()
+	return extended
 }
 
 func (a *Auth) updateQuotaPreempt(now time.Time, until time.Time, active bool) {

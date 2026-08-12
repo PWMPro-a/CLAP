@@ -285,7 +285,9 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		return nil
 	}
 	auth = auth.Clone()
-	s.ensureExecutorsForAuthWithContext(ctx, auth, false)
+	if !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+		s.ensureExecutorsForAuthWithContext(ctx, auth, false)
+	}
 
 	// IMPORTANT: Update coreManager FIRST, before model registration.
 	// This ensures that configuration changes (proxy_url, prefix, etc.) take effect
@@ -310,13 +312,24 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 	if err != nil {
 		log.Errorf("failed to %s auth %s: %v", op, auth.ID, err)
 		current, ok := s.coreManager.GetByID(auth.ID)
-		if !ok || current.Disabled {
+		if !ok || current.Disabled || current.Status == coreauth.StatusDisabled {
 			GlobalModelRegistry().UnregisterClient(auth.ID)
 			return nil
 		}
 		auth = current
 	}
-	startAuthRuntimeRecovery(auth.Runtime)
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		GlobalModelRegistry().UnregisterClient(auth.ID)
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			executor.CloseCodexWebsocketSessionsForAuthID(auth.ID, "auth_disabled")
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+			executor.CloseXAIWebsocketSessionsForAuthID(auth.ID, "auth_disabled")
+		}
+	}
+	if !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+		startAuthRuntimeRecovery(auth.Runtime)
+	}
 	return auth
 }
 
@@ -331,6 +344,13 @@ func (s *Service) completeModelRegistrationForAuthWithCache(ctx context.Context,
 	if ctx != nil && ctx.Err() != nil {
 		return
 	}
+	latest, ok := s.latestAuthForModelRegistration(auth.ID)
+	if !ok || latest.Disabled || latest.Status == coreauth.StatusDisabled {
+		GlobalModelRegistry().UnregisterClient(auth.ID)
+		s.coreManager.RefreshSchedulerEntry(auth.ID)
+		return
+	}
+	auth = latest
 	s.registerModelsForAuthWithCache(ctx, auth, compatCache)
 	if ctx != nil && ctx.Err() != nil {
 		return

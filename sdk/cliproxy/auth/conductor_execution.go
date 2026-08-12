@@ -61,6 +61,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 			return cliproxyexecutor.Response{}, errExec
 		}
 		lastErr = errExec
+		if m.cacheAffinityActive(normalized) {
+			break
+		}
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
 			break
@@ -108,6 +111,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 			return cliproxyexecutor.Response{}, errExec
 		}
 		lastErr = errExec
+		if m.cacheAffinityActive(normalized) {
+			break
+		}
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
 			break
@@ -153,6 +159,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return nil, errStream
 		}
 		lastErr = errStream
+		if m.cacheAffinityActive(normalized) {
+			break
+		}
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
 			break

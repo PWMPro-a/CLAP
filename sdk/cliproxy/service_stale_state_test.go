@@ -2,11 +2,13 @@ package cliproxy
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -70,6 +72,49 @@ func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeSt
 	}
 	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) == 0 {
 		t.Fatalf("expected re-added auth to re-register models in global registry")
+	}
+}
+
+func TestServiceAuthModifyToDisabledImmediatelyLeavesRoutingAndRegistry(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	authID := "service-hot-disabled-auth"
+	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(authID) })
+
+	service.handleAuthUpdate(context.Background(), watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionAdd,
+		ID:     authID,
+		Auth: &coreauth.Auth{
+			ID:       authID,
+			Provider: "codex",
+			Status:   coreauth.StatusActive,
+		},
+	})
+	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) == 0 {
+		t.Fatal("active auth did not register models")
+	}
+
+	service.handleAuthUpdate(context.Background(), watcher.AuthUpdate{
+		Action: watcher.AuthUpdateActionModify,
+		ID:     authID,
+		Auth: &coreauth.Auth{
+			ID:       authID,
+			Provider: "codex",
+			Status:   coreauth.StatusDisabled,
+			Disabled: true,
+		},
+	})
+	updated, ok := service.coreManager.GetByID(authID)
+	if !ok || updated == nil || !updated.Disabled || updated.Status != coreauth.StatusDisabled {
+		t.Fatalf("runtime auth = %#v, want disabled", updated)
+	}
+	if models := registry.GetGlobalRegistry().GetModelsForClient(authID); len(models) != 0 {
+		t.Fatalf("disabled auth retained %d registered models", len(models))
+	}
+	if providers := service.coreManager.AvailableProviders(); slices.Contains(providers, "codex") {
+		t.Fatalf("disabled-only provider remained selectable: %v", providers)
 	}
 }
 

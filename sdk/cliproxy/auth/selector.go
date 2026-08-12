@@ -756,6 +756,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 				bind(auth.ID)
 				clearFailover()
+				if s.cacheAffinityEnabled {
+					cacheaffinity.RecordRouteHit()
+				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
@@ -766,6 +769,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				for _, auth := range fallbackAuths {
 					if auth.ID == failoverAuthID {
 						bindFailover(auth.ID)
+						if s.cacheAffinityEnabled {
+							cacheaffinity.RecordRouteFailover()
+						}
 						entry.Infof("session-affinity: cache hit but auth temporarily unavailable, failover cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 						return auth, nil
 					}
@@ -782,11 +788,17 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			// permanently move a hot session onto another credential before the
 			// failover request succeeds.
 			bindFailover(auth.ID)
+			if s.cacheAffinityEnabled {
+				cacheaffinity.RecordRouteFailover()
+			}
 			entry.Infof("session-affinity: cache hit but auth temporarily unavailable, failover selected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 			return auth, nil
 		}
 		bind(auth.ID)
 		clearFailover()
+		if s.cacheAffinityEnabled {
+			cacheaffinity.RecordRouteRebind()
+		}
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
@@ -797,6 +809,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				if auth.ID == cachedAuthID {
 					bind(auth.ID)
 					clearFailover()
+					if s.cacheAffinityEnabled {
+						cacheaffinity.RecordRouteHit()
+					}
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
@@ -810,6 +825,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	bind(auth.ID)
 	clearFailover()
+	if s.cacheAffinityEnabled {
+		cacheaffinity.RecordRouteMiss()
+	}
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
 }

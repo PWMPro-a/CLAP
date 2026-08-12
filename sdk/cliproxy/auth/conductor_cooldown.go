@@ -17,6 +17,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cacheaffinity"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -712,8 +713,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
-		if cacheAffinityUsageLimitResult(result) {
-			auth.freezeUsageLimit(now, result.RetryAfter)
+		if m.cacheAffinitySettings().active && cacheAffinityUsageLimitResult(result) {
+			cacheaffinity.RecordUsageLimitFreeze(auth.freezeUsageLimit(now, result.RetryAfter))
 		}
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil

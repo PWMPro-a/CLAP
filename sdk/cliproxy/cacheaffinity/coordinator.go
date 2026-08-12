@@ -14,14 +14,16 @@ import (
 	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 	"github.com/tidwall/gjson"
 )
 
 const (
-	defaultMaxEntries = 65536
-	shardCount        = 64
+	defaultMaxEntries     = 65536
+	shardCount            = 64
+	prefixInspectInterval = 5 * time.Second
 )
 
 // Decision separates local routing, upstream prompt caching, and websocket reuse.
@@ -35,36 +37,59 @@ type Decision struct {
 	PrefixChanged bool   `json:"prefix_changed"`
 }
 
-// Stats is a lock-free operational snapshot apart from bounded entry counts.
+// Stats is a lock-free operational snapshot.
 type Stats struct {
-	Resolved             uint64  `json:"resolved"`
-	Active               uint64  `json:"active"`
-	Shadow               uint64  `json:"shadow"`
-	Explicit             uint64  `json:"explicit"`
-	Execution            uint64  `json:"execution"`
-	Derived              uint64  `json:"derived"`
-	CallerFallback       uint64  `json:"caller_fallback"`
-	PrefixChanged        uint64  `json:"prefix_changed"`
-	TrackedRoutes        int     `json:"tracked_routes"`
-	ResolveNanoseconds   uint64  `json:"resolve_nanoseconds"`
-	AverageResolveMicros float64 `json:"average_resolve_micros"`
+	Resolved              uint64  `json:"resolved"`
+	Active                uint64  `json:"active"`
+	Shadow                uint64  `json:"shadow"`
+	Explicit              uint64  `json:"explicit"`
+	Execution             uint64  `json:"execution"`
+	Derived               uint64  `json:"derived"`
+	CallerFallback        uint64  `json:"caller_fallback"`
+	ClientRequestFallback uint64  `json:"client_request_fallback"`
+	PrefixChanged         uint64  `json:"prefix_changed"`
+	PrefixInspected       uint64  `json:"prefix_inspected"`
+	PrefixSkipped         uint64  `json:"prefix_skipped"`
+	UsageLimitSignals     uint64  `json:"usage_limit_signals"`
+	UsageLimitFreezes     uint64  `json:"usage_limit_freezes"`
+	UsageLimitDeduped     uint64  `json:"usage_limit_deduped"`
+	RouteRebinds          uint64  `json:"route_rebinds"`
+	RouteHits             uint64  `json:"route_hits"`
+	RouteMisses           uint64  `json:"route_misses"`
+	RouteFailovers        uint64  `json:"route_failovers"`
+	TrackedRoutes         int     `json:"tracked_routes"`
+	ResolveNanoseconds    uint64  `json:"resolve_nanoseconds"`
+	AverageResolveMicros  float64 `json:"average_resolve_micros"`
 }
 
 type counters struct {
-	resolved       atomic.Uint64
-	active         atomic.Uint64
-	shadow         atomic.Uint64
-	explicit       atomic.Uint64
-	execution      atomic.Uint64
-	derived        atomic.Uint64
-	callerFallback atomic.Uint64
-	prefixChanged  atomic.Uint64
-	resolveNanos   atomic.Uint64
+	resolved              atomic.Uint64
+	active                atomic.Uint64
+	shadow                atomic.Uint64
+	explicit              atomic.Uint64
+	execution             atomic.Uint64
+	derived               atomic.Uint64
+	callerFallback        atomic.Uint64
+	clientRequestFallback atomic.Uint64
+	prefixChanged         atomic.Uint64
+	prefixInspected       atomic.Uint64
+	prefixSkipped         atomic.Uint64
+	usageLimitSignals     atomic.Uint64
+	usageLimitFreezes     atomic.Uint64
+	usageLimitDeduped     atomic.Uint64
+	routeRebinds          atomic.Uint64
+	routeHits             atomic.Uint64
+	routeMisses           atomic.Uint64
+	routeFailovers        atomic.Uint64
+	resolveNanos          atomic.Uint64
+	trackedRoutes         atomic.Uint64
 }
 
 type prefixEntry struct {
 	fingerprint string
 	lastSeen    time.Time
+	nextInspect time.Time
+	inspecting  bool
 }
 
 type prefixShard struct {
@@ -93,13 +118,28 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, cfg *in
 	if requested := metadataString(opts.Metadata, cliproxyexecutor.RequestedModelMetadataKey); requested != "" {
 		model = requested
 	}
-	identity, source := resolveIdentity(opts.Headers, payload, opts.Metadata)
+	identity, source, promptCacheKey := resolveIdentityBeforeBody(opts.Headers, opts.Metadata)
+	var root gjson.Result
+	rootParsed := false
+	if identity == "" {
+		root = util.ParseGJSONBytesNoCopy(payload)
+		rootParsed = true
+		promptCacheKey = explicitPromptCacheKey(root)
+		identity, source = resolveIdentityFromBody(opts.Headers, root, promptCacheKey, opts.Metadata)
+	}
 	if identity == "" {
 		return req, opts, Decision{}
 	}
+	if promptCacheKey == "" && source != "execution" && source != "derived" {
+		if !rootParsed {
+			root = util.ParseGJSONBytesNoCopy(payload)
+			rootParsed = true
+		}
+		promptCacheKey = explicitPromptCacheKey(root)
+	}
 	modelFamily := canonicalModelFamily(model)
 	routeKey := stableID("route", identity)
-	upstreamKey := explicitPromptCacheKey(payload)
+	upstreamKey := promptCacheKey
 	if upstreamKey == "" {
 		upstreamKey = stableID("prompt-cache", modelFamily, identity)
 	}
@@ -109,12 +149,11 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, cfg *in
 		// Physical websocket slots are shared by model family while the upstream
 		// cache identity remains conversation-scoped. This avoids one socket pool
 		// per conversation without coupling connection churn to prompt caching.
-		PoolKey:  stableID("pool", modelFamily),
-		PrefixFP: prefixFingerprint(modelFamily, payload),
-		Source:   source,
-		Active:   !settings.Shadow,
+		PoolKey: stableID("pool", modelFamily),
+		Source:  source,
+		Active:  !settings.Shadow,
 	}
-	decision.PrefixChanged = observePrefix(routeKey, decision.PrefixFP, settings.MaxEntries)
+	decision.PrefixFP, decision.PrefixChanged = inspectPrefixPayload(routeKey, modelFamily, payload, root, rootParsed, settings.MaxEntries)
 	publishCounters(decision, time.Since(started))
 
 	metadata := cloneMetadata(opts.Metadata, 4)
@@ -192,24 +231,27 @@ func MetadataValue(metadata map[string]any, key string) string {
 func Snapshot() Stats {
 	resolved := global.counters.resolved.Load()
 	nanos := global.counters.resolveNanos.Load()
-	tracked := 0
-	for i := range global.shards {
-		shard := &global.shards[i]
-		shard.mu.Lock()
-		tracked += len(shard.entries)
-		shard.mu.Unlock()
-	}
 	stats := Stats{
-		Resolved:           resolved,
-		Active:             global.counters.active.Load(),
-		Shadow:             global.counters.shadow.Load(),
-		Explicit:           global.counters.explicit.Load(),
-		Execution:          global.counters.execution.Load(),
-		Derived:            global.counters.derived.Load(),
-		CallerFallback:     global.counters.callerFallback.Load(),
-		PrefixChanged:      global.counters.prefixChanged.Load(),
-		TrackedRoutes:      tracked,
-		ResolveNanoseconds: nanos,
+		Resolved:              resolved,
+		Active:                global.counters.active.Load(),
+		Shadow:                global.counters.shadow.Load(),
+		Explicit:              global.counters.explicit.Load(),
+		Execution:             global.counters.execution.Load(),
+		Derived:               global.counters.derived.Load(),
+		CallerFallback:        global.counters.callerFallback.Load(),
+		ClientRequestFallback: global.counters.clientRequestFallback.Load(),
+		PrefixChanged:         global.counters.prefixChanged.Load(),
+		PrefixInspected:       global.counters.prefixInspected.Load(),
+		PrefixSkipped:         global.counters.prefixSkipped.Load(),
+		UsageLimitSignals:     global.counters.usageLimitSignals.Load(),
+		UsageLimitFreezes:     global.counters.usageLimitFreezes.Load(),
+		UsageLimitDeduped:     global.counters.usageLimitDeduped.Load(),
+		RouteRebinds:          global.counters.routeRebinds.Load(),
+		RouteHits:             global.counters.routeHits.Load(),
+		RouteMisses:           global.counters.routeMisses.Load(),
+		RouteFailovers:        global.counters.routeFailovers.Load(),
+		TrackedRoutes:         int(global.counters.trackedRoutes.Load()),
+		ResolveNanoseconds:    nanos,
 	}
 	if resolved > 0 {
 		stats.AverageResolveMicros = float64(nanos) / float64(resolved) / 1000
@@ -217,32 +259,82 @@ func Snapshot() Stats {
 	return stats
 }
 
-func resolveIdentity(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
-	for _, name := range []string{"X-Claude-Code-Session-Id", "Session-Id", "Session_id", "X-Session-ID", "X-Session-Affinity", "X-Client-Request-Id"} {
+// RecordUsageLimitFreeze records whether a usage-limit signal extended the
+// credential freeze window or was deduplicated by an existing window.
+func RecordUsageLimitFreeze(extended bool) {
+	global.counters.usageLimitSignals.Add(1)
+	if extended {
+		global.counters.usageLimitFreezes.Add(1)
+		return
+	}
+	global.counters.usageLimitDeduped.Add(1)
+}
+
+// RecordRouteRebind records a permanent session move after its bound auth became unavailable.
+func RecordRouteRebind() {
+	global.counters.routeRebinds.Add(1)
+}
+
+// RecordRouteHit records a successful reuse of an established route binding.
+func RecordRouteHit() {
+	global.counters.routeHits.Add(1)
+}
+
+// RecordRouteMiss records the first binding for a route.
+func RecordRouteMiss() {
+	global.counters.routeMisses.Add(1)
+}
+
+// RecordRouteFailover records a temporary failover that preserves the primary binding.
+func RecordRouteFailover() {
+	global.counters.routeFailovers.Add(1)
+}
+
+func resolveIdentityBeforeBody(headers http.Header, metadata map[string]any) (string, string, string) {
+	for _, name := range []string{"X-Claude-Code-Session-Id", "Session-Id", "Session_id", "X-Session-ID", "X-Session-Affinity"} {
 		if value := cliproxysession.NormalizeExplicitID(headerValue(headers, name)); value != "" {
-			return strings.ToLower(name) + ":" + value, "explicit"
+			return strings.ToLower(name) + ":" + value, "session_header", ""
 		}
 	}
 	if turnMetadata := strings.TrimSpace(headerValue(headers, "X-Codex-Turn-Metadata")); turnMetadata != "" {
 		for _, path := range []string{"prompt_cache_key", "window_id", "conversation_id"} {
 			if value := cliproxysession.NormalizeExplicitID(gjson.Get(turnMetadata, path).String()); value != "" {
-				return "codex-turn:" + value, "explicit"
+				promptCacheKey := ""
+				if path == "prompt_cache_key" {
+					promptCacheKey = value
+				}
+				return "codex-turn:" + value, "codex_turn", promptCacheKey
 			}
 		}
 	}
-	for _, path := range []string{"session_id", "sessionId", "conversation_id", "prompt_cache_key", "conversation.id"} {
-		if value := cliproxysession.NormalizeExplicitID(gjson.GetBytes(payload, path).String()); value != "" {
-			return path + ":" + value, "explicit"
-		}
-	}
-	if value := cliproxysession.ClaudeMetadataSessionID(payload); value != "" {
-		return "claude:" + value, "explicit"
+	if value := cliproxysession.NormalizeExplicitID(headerValue(headers, "X-Codex-Window-Id")); value != "" {
+		return "codex-window:" + value, "codex_turn", ""
 	}
 	if value := metadataString(metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
-		return "execution:" + value, "execution"
+		return "execution:" + value, "execution", ""
 	}
 	if value := cliproxysession.DerivedID(metadata); value != "" {
-		return "derived:" + value, "derived"
+		return "derived:" + value, "derived", ""
+	}
+	return "", "", ""
+}
+
+func resolveIdentityFromBody(headers http.Header, root gjson.Result, promptCacheKey string, metadata map[string]any) (string, string) {
+	if promptCacheKey != "" {
+		return "prompt_cache_key:" + promptCacheKey, "body_session"
+	}
+	for _, path := range []string{"session_id", "sessionId", "conversation_id", "conversation.id"} {
+		if value := cliproxysession.NormalizeExplicitID(root.Get(path).String()); value != "" {
+			return path + ":" + value, "body_session"
+		}
+	}
+	if value := claudeMetadataSessionID(root); value != "" {
+		return "claude:" + value, "body_session"
+	}
+	// X-Client-Request-Id is request-scoped for several Codex clients. It is a
+	// useful legacy fallback, but stable conversation signals must outrank it.
+	if value := cliproxysession.NormalizeExplicitID(headerValue(headers, "X-Client-Request-Id")); value != "" {
+		return "client-request:" + value, "client_request"
 	}
 	if value := metadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey); value != "" {
 		return "caller:" + value, "caller"
@@ -263,17 +355,17 @@ func stableID(kind string, values ...string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
 }
 
-func explicitPromptCacheKey(payload []byte) string {
-	return cliproxysession.NormalizeExplicitID(gjson.GetBytes(payload, "prompt_cache_key").String())
+func explicitPromptCacheKey(root gjson.Result) string {
+	return cliproxysession.NormalizeExplicitID(root.Get("prompt_cache_key").String())
 }
 
-func prefixFingerprint(modelFamily string, payload []byte) string {
+func prefixFingerprint(modelFamily string, root gjson.Result) string {
 	hash := sha256.New()
 	writeFingerprintField(hash, "model", modelFamily)
-	writeFingerprintField(hash, "instructions", gjson.GetBytes(payload, "instructions").Raw)
-	writeFingerprintField(hash, "tools", gjson.GetBytes(payload, "tools").Raw)
+	writeFingerprintField(hash, "instructions", root.Get("instructions").Raw)
+	writeFingerprintField(hash, "tools", root.Get("tools").Raw)
 	for _, collection := range []string{"input", "messages"} {
-		items := gjson.GetBytes(payload, collection)
+		items := root.Get(collection)
 		if !items.IsArray() {
 			continue
 		}
@@ -302,33 +394,97 @@ func writeFingerprintField(writer stringWriter, name, value string) {
 	_, _ = writer.Write([]byte{0})
 }
 
-func observePrefix(routeKey, fingerprint string, maxEntries int) bool {
-	if routeKey == "" || fingerprint == "" {
-		return false
+func inspectPrefix(routeKey, modelFamily string, root gjson.Result, maxEntries int) (string, bool) {
+	return inspectPrefixAt(routeKey, modelFamily, root, maxEntries, time.Now(), prefixInspectInterval)
+}
+
+func inspectPrefixAt(routeKey, modelFamily string, root gjson.Result, maxEntries int, now time.Time, interval time.Duration) (string, bool) {
+	return inspectPrefixWith(routeKey, maxEntries, now, interval, func() string {
+		return prefixFingerprint(modelFamily, root)
+	})
+}
+
+func inspectPrefixPayload(routeKey, modelFamily string, payload []byte, root gjson.Result, rootParsed bool, maxEntries int) (string, bool) {
+	return inspectPrefixWith(routeKey, maxEntries, time.Now(), prefixInspectInterval, func() string {
+		if !rootParsed {
+			root = util.ParseGJSONBytesNoCopy(payload)
+		}
+		return prefixFingerprint(modelFamily, root)
+	})
+}
+
+func inspectPrefixWith(routeKey string, maxEntries int, now time.Time, interval time.Duration, fingerprint func() string) (string, bool) {
+	if routeKey == "" {
+		return "", false
 	}
 	sum := sha256.Sum256([]byte(routeKey))
 	shard := &global.shards[int(sum[0])%shardCount]
-	now := time.Now()
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
 	if shard.entries == nil {
 		shard.entries = make(map[string]prefixEntry)
 	}
 	previous, exists := shard.entries[routeKey]
-	changed := exists && previous.fingerprint != fingerprint
-	if !exists && len(shard.entries) >= maxEntries/shardCount+1 {
-		var oldestKey string
-		var oldest time.Time
-		for key, entry := range shard.entries {
-			if oldestKey == "" || entry.lastSeen.Before(oldest) {
-				oldestKey = key
-				oldest = entry.lastSeen
+	if exists {
+		previous.lastSeen = now
+		if previous.inspecting || now.Before(previous.nextInspect) {
+			shard.entries[routeKey] = previous
+			shard.mu.Unlock()
+			global.counters.prefixSkipped.Add(1)
+			return previous.fingerprint, false
+		}
+		previous.inspecting = true
+		previous.nextInspect = now.Add(interval)
+		shard.entries[routeKey] = previous
+		shard.mu.Unlock()
+	} else {
+		capacity := maxEntries/shardCount + 1
+		if capacity < 1 {
+			capacity = 1
+		}
+		replaced := false
+		if len(shard.entries) >= capacity {
+			var oldestKey string
+			var oldest time.Time
+			for key, entry := range shard.entries {
+				if entry.inspecting {
+					continue
+				}
+				if oldestKey == "" || entry.lastSeen.Before(oldest) {
+					oldestKey = key
+					oldest = entry.lastSeen
+				}
+			}
+			if oldestKey != "" {
+				delete(shard.entries, oldestKey)
+				replaced = true
+			} else {
+				shard.mu.Unlock()
+				global.counters.prefixSkipped.Add(1)
+				return "", false
 			}
 		}
-		delete(shard.entries, oldestKey)
+		shard.entries[routeKey] = prefixEntry{lastSeen: now, nextInspect: now.Add(interval), inspecting: true}
+		if !replaced {
+			global.counters.trackedRoutes.Add(1)
+		}
+		shard.mu.Unlock()
 	}
-	shard.entries[routeKey] = prefixEntry{fingerprint: fingerprint, lastSeen: now}
-	return changed
+
+	currentFingerprint := fingerprint()
+	global.counters.prefixInspected.Add(1)
+	shard.mu.Lock()
+	current, stillTracked := shard.entries[routeKey]
+	if !stillTracked {
+		shard.mu.Unlock()
+		return currentFingerprint, false
+	}
+	changed := current.fingerprint != "" && current.fingerprint != currentFingerprint
+	current.fingerprint = currentFingerprint
+	current.lastSeen = now
+	current.inspecting = false
+	shard.entries[routeKey] = current
+	shard.mu.Unlock()
+	return currentFingerprint, changed
 }
 
 func publishCounters(decision Decision, elapsed time.Duration) {
@@ -340,7 +496,7 @@ func publishCounters(decision Decision, elapsed time.Duration) {
 		global.counters.shadow.Add(1)
 	}
 	switch decision.Source {
-	case "explicit":
+	case "session_header", "codex_turn", "body_session":
 		global.counters.explicit.Add(1)
 	case "execution":
 		global.counters.execution.Add(1)
@@ -348,10 +504,28 @@ func publishCounters(decision Decision, elapsed time.Duration) {
 		global.counters.derived.Add(1)
 	case "caller":
 		global.counters.callerFallback.Add(1)
+	case "client_request":
+		global.counters.explicit.Add(1)
+		global.counters.clientRequestFallback.Add(1)
 	}
 	if decision.PrefixChanged {
 		global.counters.prefixChanged.Add(1)
 	}
+}
+
+func claudeMetadataSessionID(root gjson.Result) string {
+	userID := strings.TrimSpace(root.Get("metadata.user_id").String())
+	if userID == "" {
+		return ""
+	}
+	if strings.HasPrefix(userID, "{") {
+		return cliproxysession.NormalizeExplicitID(gjson.Get(userID, "session_id").String())
+	}
+	const marker = "_session_"
+	if index := strings.LastIndex(userID, marker); index >= 0 {
+		return cliproxysession.NormalizeExplicitID(userID[index+len(marker):])
+	}
+	return ""
 }
 
 func cloneMetadata(source map[string]any, extra int) map[string]any {

@@ -127,7 +127,9 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, af
 			if chunk.Err != nil && !failed {
 				failed = true
 				rerr := resultErrorFromError(chunk.Err)
-				m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}, auth, ephemeralResult)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result.RetryAfter = retryAfterFromError(chunk.Err)
+				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			}
 			if !forward {
 				return false

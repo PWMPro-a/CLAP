@@ -28,7 +28,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	if ctx.Err() != nil {
 		return
 	}
-	if a.Disabled {
+	if a.Disabled || a.Status == coreauth.StatusDisabled {
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
 	}
@@ -304,7 +304,7 @@ func (s *Service) refreshModelRegistrationForAuthWithContext(ctx context.Context
 	if ctx.Err() != nil {
 		return false
 	}
-	if !current.Disabled {
+	if !current.Disabled && current.Status != coreauth.StatusDisabled {
 		s.ensureExecutorsForAuthWithContext(ctx, current, false)
 	}
 	s.registerModelsForAuthWithCache(ctx, current, compatCache)
@@ -314,7 +314,7 @@ func (s *Service) refreshModelRegistrationForAuthWithContext(ctx context.Context
 	}
 
 	latest, ok := s.latestAuthForModelRegistration(current.ID)
-	if !ok || latest.Disabled {
+	if !ok || latest.Disabled || latest.Status == coreauth.StatusDisabled {
 		GlobalModelRegistry().UnregisterClient(current.ID)
 		s.coreManager.RefreshSchedulerEntry(current.ID)
 		return false

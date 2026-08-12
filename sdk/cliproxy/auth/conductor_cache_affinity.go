@@ -32,6 +32,15 @@ func (m *Manager) effectiveMaxRetryCredentials(configured int, providers []strin
 	return configured
 }
 
+func (m *Manager) cacheAffinityActive(providers []string) bool {
+	if m == nil || !hasCodexProvider(providers) {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	settings := cacheaffinity.Settings(cfg)
+	return settings.Enabled && !settings.Shadow
+}
+
 func (m *Manager) confirmCacheAffinityBinding(provider, model, authID string, metadata map[string]any) {
 	routeKey := cacheaffinity.MetadataValue(metadata, cliproxyexecutor.CacheAffinityRouteKeyMetadataKey)
 	if routeKey == "" || strings.TrimSpace(authID) == "" {

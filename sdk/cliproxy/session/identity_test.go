@@ -346,3 +346,32 @@ func TestEnrichCarriesRequestPayloadIntoSelectionOptions(t *testing.T) {
 		t.Fatalf("DerivedSessionID = %q, want explicit conversation to remain authoritative", got)
 	}
 }
+
+func TestEnrichDerivesStableSessionDespiteChangingClientRequestID(t *testing.T) {
+	firstPayload := []byte(`{"model":"gpt-5.6-sol","instructions":"stable","input":"hello"}`)
+	secondPayload := []byte(`{"model":"gpt-5.6-sol","instructions":"stable","input":"hello"}`)
+	firstReq, firstOpts := Enrich(
+		cliproxyexecutor.Request{Payload: firstPayload},
+		cliproxyexecutor.Options{
+			Headers:         http.Header{"X-Client-Request-Id": []string{"request-1"}},
+			OriginalRequest: firstPayload,
+			SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		},
+	)
+	secondReq, secondOpts := Enrich(
+		cliproxyexecutor.Request{Payload: secondPayload},
+		cliproxyexecutor.Options{
+			Headers:         http.Header{"X-Client-Request-Id": []string{"request-2"}},
+			OriginalRequest: secondPayload,
+			SourceFormat:    sdktranslator.FormatOpenAIResponse,
+		},
+	)
+	first := firstNormalizedMetadataID(cliproxyexecutor.DerivedSessionIDMetadataKey, firstReq.Metadata, firstOpts.Metadata)
+	second := firstNormalizedMetadataID(cliproxyexecutor.DerivedSessionIDMetadataKey, secondReq.Metadata, secondOpts.Metadata)
+	if first == "" || second == "" {
+		t.Fatalf("derived IDs = %q, %q; want non-empty", first, second)
+	}
+	if first != second {
+		t.Fatalf("changing request IDs split derived session: %q != %q", first, second)
+	}
+}

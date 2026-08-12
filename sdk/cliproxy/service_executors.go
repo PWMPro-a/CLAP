@@ -261,7 +261,7 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	// Skip disabled auth entries when (re)binding executors.
 	// Disabled auths can linger during config reloads (e.g., removed OpenAI-compat entries)
 	// and must not override active provider executors.
-	if a.Disabled {
+	if a.Disabled || a.Status == coreauth.StatusDisabled {
 		return
 	}
 	if compatProviderKey, _, isCompat := openAICompatInfoFromAuth(a); isCompat {
@@ -420,6 +420,13 @@ func shouldUpgradeOpenAICompatToPluginRefresh(existing, next coreauth.ProviderEx
 func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey string, models []*ModelInfo) {
 	if a == nil || a.ID == "" {
 		return
+	}
+	if s != nil && s.coreManager != nil {
+		latest, ok := s.coreManager.GetByID(a.ID)
+		if !ok || latest.Disabled || latest.Status == coreauth.StatusDisabled {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+			return
+		}
 	}
 	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
 	if providerKey == "" {
