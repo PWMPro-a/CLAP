@@ -232,6 +232,32 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # Protect selected Codex OAuth auth files before credential selection. Add
+  # `codex_cli_only: true` to each Team account that should use this gate.
+  client-restriction:
+    force-codex-cli: false
+    min-codex-version: ""
+    max-codex-version: ""
+    allow-app-server-clients: false
+    whitelist: []
+    blacklist: []
+    # Required rows are ANDed; variants within one row are ORed. With no
+    # required rows the engine fingerprint check is disabled.
+    engine-fingerprint-signals:
+      - type: header_prefix
+        match: ["x-codex-"]
+        required: true
+      - type: header_exact
+        match: ["session-id", "session_id"]
+        required: false
+      - type: header_exact
+        match: ["thread-id", "thread_id"]
+        required: false
+      - type: body_path
+        match:
+          - "client_metadata.x-codex-window-id"
+          - "client_metadata.x-codex-installation-id"
+        required: false
   # Independent cache-affinity coordinator. Shadow mode computes stable route,
   # upstream cache, websocket pool, and prefix fingerprints without changing routing.
   cache-affinity:

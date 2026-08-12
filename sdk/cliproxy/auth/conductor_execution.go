@@ -42,6 +42,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	opts = m.enrichCodexClientRestriction(normalized, req, opts)
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, false)
 	}
@@ -92,6 +93,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	opts = m.enrichCodexClientRestriction(normalized, req, opts)
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, true)
 	}
@@ -141,6 +143,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	opts = m.enrichCodexClientRestriction(normalized, req, opts)
 	if !m.HomeEnabled() {
 		req, opts = m.enrichCacheAffinity(normalized, req, opts)
 	}
@@ -321,7 +324,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
-
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
@@ -474,7 +476,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
-
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
@@ -648,6 +649,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, lastErr
 			}
 			return nil, errPick
+		}
+		if selection != nil {
+			homeAuthCount = selection.DispatchCount()
 		}
 		if auth == nil || executor == nil {
 			if selection != nil {

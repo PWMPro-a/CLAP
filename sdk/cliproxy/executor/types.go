@@ -158,10 +158,18 @@ type Options struct {
 	Alt string
 	// Headers are forwarded to the provider request builder.
 	Headers http.Header
+	// OriginalHeaders preserves inbound client headers before request interceptors.
+	// Selection-time client policy must prefer this snapshot over rewritten headers.
+	OriginalHeaders http.Header
+	// OriginalClientSnapshotCaptured distinguishes an intentionally empty inbound
+	// snapshot from SDK calls that did not provide one.
+	OriginalClientSnapshotCaptured bool
 	// Query contains optional query string parameters.
 	Query url.Values
 	// OriginalRequest preserves the inbound request bytes prior to translation.
 	OriginalRequest []byte
+	// OriginalClientRequest preserves inbound request bytes before request interceptors.
+	OriginalClientRequest []byte
 	// SourceFormat identifies the inbound schema.
 	SourceFormat sdktranslator.Format
 	// ResponseFormat identifies the downstream response schema.

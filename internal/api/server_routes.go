@@ -327,7 +327,8 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 	_ = json.Unmarshal(body, &routing)
 	upstreamRequestBody := sanitizeCodexAlphaSearchBody(body)
 
-	selectionHeaders := c.Request.Header.Clone()
+	originalHeaders := c.Request.Header.Clone()
+	selectionHeaders := originalHeaders.Clone()
 	if sessionID := strings.TrimSpace(routing.ID); sessionID != "" {
 		selectionHeaders.Set("X-Session-ID", sessionID)
 	}
@@ -338,7 +339,13 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		c.JSON(clienterror.HTTPStatusFromErrorOr(errRoute, http.StatusServiceUnavailable), gin.H{"error": errRoute.Error()})
 		return
 	}
-	selectionOpts := coreexecutor.Options{Headers: selectionHeaders, OriginalRequest: body}
+	selectionOpts := coreexecutor.Options{
+		Headers:                        selectionHeaders,
+		OriginalHeaders:                originalHeaders,
+		OriginalClientSnapshotCaptured: true,
+		OriginalRequest:                body,
+		OriginalClientRequest:          append([]byte(nil), body...),
+	}
 	var selection *auth.HomeDispatchSelection
 	var selected *auth.Auth
 	if s.handlers.AuthManager.HomeEnabled() {

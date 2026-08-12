@@ -440,7 +440,7 @@ func withCodexTailBurstSelected(opts cliproxyexecutor.Options) cliproxyexecutor.
 	return opts
 }
 
-func (m *Manager) pickCodexTailBurstAuth(model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, bool) {
+func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, bool) {
 	if m == nil || m.HomeEnabled() || !codexTailBurstRequested(opts) || pinnedAuthIDFromMetadata(opts.Metadata) != "" || disallowFreeAuthFromMetadata(opts.Metadata) {
 		return nil, nil, false
 	}
@@ -459,6 +459,7 @@ func (m *Manager) pickCodexTailBurstAuth(model string, opts cliproxyexecutor.Opt
 	start := int(m.codexTailBurstSequence.Add(1)-1) % len(candidates)
 	now := time.Now()
 	registryRef := registry.GetGlobalRegistry()
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -472,7 +473,7 @@ func (m *Manager) pickCodexTailBurstAuth(model string, opts cliproxyexecutor.Opt
 			continue
 		}
 		auth := m.auths[authID]
-		if auth == nil || auth.Disabled || !m.authSupportsRouteModel(registryRef, auth, model) || !m.codexTailBurstActive(auth, model, now) {
+		if auth == nil || auth.Disabled || !eligibility.allows(auth) || !m.authSupportsRouteModel(registryRef, auth, model) || !m.codexTailBurstActive(auth, model, now) {
 			continue
 		}
 		if blocked, _, _ := isAuthBlockedForModelWithTailBurst(auth, model, now, true); blocked {

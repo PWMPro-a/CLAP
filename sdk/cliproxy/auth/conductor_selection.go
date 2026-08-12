@@ -79,9 +79,12 @@ type requiredAuthKindContextKey struct{}
 type credentialPolicyContextKey struct{}
 
 type authSelectionEligibility struct {
-	requiredKind     string
-	credentialPolicy string
-	disallowFreeAuth bool
+	requiredKind                    string
+	credentialPolicy                string
+	disallowFreeAuth                bool
+	codexClientRestrictionEvaluated bool
+	codexClientAllowed              bool
+	codexAppServerAllowed           bool
 }
 
 func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Context {
@@ -102,6 +105,11 @@ func credentialPolicyFromContext(ctx context.Context) string {
 
 func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecutor.Options) authSelectionEligibility {
 	eligibility := authSelectionEligibility{disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata)}
+	if len(opts.Metadata) > 0 {
+		eligibility.codexClientRestrictionEvaluated, _ = opts.Metadata[codexClientRestrictionEvaluatedMetadataKey].(bool)
+		eligibility.codexClientAllowed, _ = opts.Metadata[codexClientRestrictionAllowedMetadataKey].(bool)
+		eligibility.codexAppServerAllowed, _ = opts.Metadata[codexClientRestrictionAppServerAllowedMetadataKey].(bool)
+	}
 	if ctx != nil {
 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
@@ -118,6 +126,15 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 	}
 	if e.credentialPolicy != "" && !credentialPolicyAllows(e.credentialPolicy, auth) {
 		return false
+	}
+	if e.codexClientRestrictionEvaluated && codexClientRestrictionEnabledForAuth(auth) {
+		if codexClientRestrictionAppServerEnabledForAuth(auth) {
+			if !e.codexAppServerAllowed {
+				return false
+			}
+		} else if !e.codexClientAllowed {
+			return false
+		}
 	}
 	return !e.disallowFreeAuth || !isFreeCodexAuth(auth)
 }
@@ -1144,7 +1161,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
+		restrictionErr := m.codexClientRestrictionError(ctx, map[string]struct{}{provider: {}}, model, opts, tried, pinnedAuthID)
 		m.mu.RUnlock()
+		if restrictionErr != nil {
+			return nil, nil, restrictionErr
+		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
@@ -1189,6 +1210,7 @@ func (m *Manager) SelectAuth(ctx context.Context, provider, model string, opts c
 	if m != nil && m.HomeEnabled() {
 		return nil, &Error{Code: "home_unavailable", Message: "legacy auth selection is unavailable while Home is enabled", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	opts = m.enrichCodexClientRestriction([]string{provider}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
 	selected, _, errPick := m.pickNextLegacy(ctx, provider, model, opts, nil)
 	if errPick != nil {
 		return nil, errPick
@@ -1210,6 +1232,7 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 		return nil, &Error{Code: "invalid_auth_kind", Message: "required auth kind is invalid", HTTPStatus: http.StatusBadRequest}
 	}
 
+	opts = m.enrichCodexClientRestriction([]string{provider}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
 	selectionCtx := withRequiredAuthKind(ctx, requiredKind)
 	selected, _, errPick := m.pickNextLegacy(selectionCtx, provider, model, opts, nil)
 	if errPick != nil {
@@ -1236,6 +1259,7 @@ func (m *Manager) SelectAuthWithCredentialPolicy(ctx context.Context, provider, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	opts = m.enrichCodexClientRestriction([]string{provider}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
 	selectionCtx := withCredentialPolicy(ctx, policy)
 	selected, _, errPick := m.pickNextLegacy(selectionCtx, provider, model, opts, nil)
 	if errPick != nil {
@@ -1262,6 +1286,7 @@ func (m *Manager) SelectHomeAuthWithCredentialPolicy(ctx context.Context, provid
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	opts = m.enrichCodexClientRestriction([]string{provider}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
 	selectionCtx := withCredentialPolicy(ctx, policy)
 	homeAuthCount := homeAuthCountFromMetadata(opts.Metadata)
 	tried := make(map[string]struct{})
@@ -1271,6 +1296,7 @@ func (m *Manager) SelectHomeAuthWithCredentialPolicy(ctx context.Context, provid
 		if errSelection != nil {
 			return nil, errSelection
 		}
+		homeAuthCount = selection.DispatchCount()
 		providerMatches := strings.TrimSpace(provider) == "" || strings.EqualFold(strings.TrimSpace(selection.Provider), strings.TrimSpace(provider))
 		policyMatches := credentialPolicyAllows(policy, selection.Auth)
 		if providerMatches && policyMatches {
@@ -1308,6 +1334,7 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 	if m == nil || !m.HomeEnabled() {
 		return nil, &Error{Code: "home_unavailable", Message: "home control center unavailable", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	opts = m.enrichCodexClientRestriction([]string{provider}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
 
 	homeAuthCount := homeAuthCountFromMetadata(opts.Metadata)
 	tried := make(map[string]struct{})
@@ -1317,6 +1344,7 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 		if errSelection != nil {
 			return nil, errSelection
 		}
+		homeAuthCount = selection.DispatchCount()
 		providerMatches := strings.TrimSpace(provider) == "" || strings.EqualFold(strings.TrimSpace(selection.Provider), strings.TrimSpace(provider))
 		selectionAuth := selection.CloneAuth()
 		kindMatches := selectionAuth != nil && selectionAuth.AuthKind() == requiredKind
@@ -1348,7 +1376,7 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
-		if auth, executor, ok := m.pickCodexTailBurstAuth(model, opts, tried); ok {
+		if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
 			return auth, executor, nil
 		}
 	}
@@ -1390,6 +1418,12 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	}
 	if errPick != nil {
+		m.mu.RLock()
+		restrictionErr := m.codexClientRestrictionError(ctx, map[string]struct{}{provider: {}}, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
+		m.mu.RUnlock()
+		if restrictionErr != nil {
+			return nil, nil, restrictionErr
+		}
 		return nil, nil, errPick
 	}
 	if selected == nil {
@@ -1469,7 +1503,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
+		restrictionErr := m.codexClientRestrictionError(ctx, providerSet, model, opts, tried, pinnedAuthID)
 		m.mu.RUnlock()
+		if restrictionErr != nil {
+			return nil, nil, "", restrictionErr
+		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
@@ -1481,6 +1519,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 	if errPick != nil {
+		m.mu.RLock()
+		restrictionErr := m.codexClientRestrictionError(ctx, providerSet, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
+		m.mu.RUnlock()
+		if restrictionErr != nil {
+			return nil, nil, "", restrictionErr
+		}
 		return nil, nil, "", errPick
 	}
 	if !handled {
@@ -1515,7 +1559,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if hasCodexProvider(providers) {
-		if auth, executor, ok := m.pickCodexTailBurstAuth(model, opts, tried); ok {
+		if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
 			return auth, executor, "codex", nil
 		}
 	}
@@ -1580,6 +1624,16 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 	}
 	if errPick != nil {
+		providerSet := make(map[string]struct{}, len(eligibleProviders))
+		for _, eligibleProvider := range eligibleProviders {
+			providerSet[eligibleProvider] = struct{}{}
+		}
+		m.mu.RLock()
+		restrictionErr := m.codexClientRestrictionError(ctx, providerSet, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
+		m.mu.RUnlock()
+		if restrictionErr != nil {
+			return nil, nil, "", restrictionErr
+		}
 		return nil, nil, "", errPick
 	}
 	if selected == nil {

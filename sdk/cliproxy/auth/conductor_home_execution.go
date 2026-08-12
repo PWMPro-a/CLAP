@@ -27,6 +27,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			}
 			return cliproxyexecutor.Response{}, errSelection
 		}
+		homeAuthCount = selection.DispatchCount()
 		auth := selection.CloneAuthForRoute(routeModel)
 		if auth == nil || selection.Executor == nil {
 			selection.End("missing_execution_target")

@@ -144,12 +144,20 @@ type HomeDispatchSelection struct {
 	authMu           sync.RWMutex
 	scope            *executionregistry.Scope
 	accountedModel   string
+	dispatchCount    int
 	resources        *executionResources
 	attemptCancels   *attemptCancels
 	once             sync.Once
 	retained         atomic.Bool
 	runtimeAuthBound atomic.Bool
 	ended            atomic.Bool
+}
+
+func (s *HomeDispatchSelection) DispatchCount() int {
+	if s == nil || s.dispatchCount < 1 {
+		return 1
+	}
+	return s.dispatchCount
 }
 
 func newHomeDispatchSelection(auth *Auth, executor ProviderExecutor, provider string, scope *executionregistry.Scope) (*HomeDispatchSelection, error) {

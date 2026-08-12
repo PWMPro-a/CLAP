@@ -134,6 +134,9 @@ type AntigravityConfig struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// ClientRestriction protects selected Codex OAuth credentials with client
+	// identity, version, and engine fingerprint checks before credential selection.
+	ClientRestriction CodexClientRestrictionConfig `yaml:"client-restriction" json:"client-restriction"`
 	// CacheAffinity coordinates stable routing, upstream cache identity, and
 	// websocket pooling without adding network work to the request path.
 	CacheAffinity CodexCacheAffinityConfig `yaml:"cache-affinity" json:"cache-affinity"`
@@ -145,6 +148,30 @@ type CodexConfig struct {
 	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
 	// TailBurst enables quota-tail draining for credentials near a tracked usage-window limit.
 	TailBurst CodexTailBurstConfig `yaml:"tail-burst" json:"tail-burst"`
+}
+
+// CodexClientRestrictionConfig controls the request policy applied only to
+// Codex OAuth credentials whose auth file enables codex_cli_only.
+type CodexClientRestrictionConfig struct {
+	ForceAllow               bool                           `yaml:"force-codex-cli" json:"force-codex-cli"`
+	MinCodexVersion          string                         `yaml:"min-codex-version" json:"min-codex-version"`
+	MaxCodexVersion          string                         `yaml:"max-codex-version" json:"max-codex-version"`
+	AllowAppServerClients    bool                           `yaml:"allow-app-server-clients" json:"allow-app-server-clients"`
+	Whitelist                []CodexClientRestrictionEntry  `yaml:"whitelist" json:"whitelist"`
+	Blacklist                []CodexClientRestrictionEntry  `yaml:"blacklist" json:"blacklist"`
+	EngineFingerprintSignals []CodexEngineFingerprintSignal `yaml:"engine-fingerprint-signals" json:"engine-fingerprint-signals"`
+}
+
+type CodexClientRestrictionEntry struct {
+	Originator            string   `yaml:"originator" json:"originator"`
+	UAContains            []string `yaml:"ua-contains" json:"ua-contains"`
+	SkipEngineFingerprint bool     `yaml:"skip-engine-fingerprint" json:"skip-engine-fingerprint"`
+}
+
+type CodexEngineFingerprintSignal struct {
+	Type     string   `yaml:"type" json:"type"`
+	Match    []string `yaml:"match" json:"match"`
+	Required bool     `yaml:"required" json:"required"`
 }
 
 // CodexCacheAffinityConfig controls the independent Codex cache-affinity

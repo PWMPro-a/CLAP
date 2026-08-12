@@ -728,6 +728,40 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 }
 
 func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	baseCount := homeAuthCountFromMetadata(opts.Metadata)
+	if baseCount < 1 {
+		baseCount = 1
+	}
+	triedRestricted := make(map[string]struct{})
+	for offset := 0; ; offset++ {
+		selectionOpts := withHomeAuthCount(opts, baseCount+offset)
+		selection, errSelection := m.pickHomeDispatchSelectionOnce(ctx, model, selectionOpts)
+		if errSelection != nil {
+			return nil, errSelection
+		}
+		auth := selection.CloneAuth()
+		if codexClientRestrictionAllowsAuth(opts, auth) {
+			return selection, nil
+		}
+
+		authID := ""
+		if auth != nil {
+			authID = strings.TrimSpace(auth.ID)
+		}
+		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "codex_client_restricted"); errEnd != nil {
+			return nil, errEnd
+		}
+		if authID == "" {
+			return nil, &Error{Code: "invalid_auth", Message: "home returned auth without id", HTTPStatus: http.StatusBadGateway}
+		}
+		if _, repeated := triedRestricted[authID]; repeated {
+			return nil, &Error{Code: "codex_client_restricted", Message: codexClientRestrictionMessage, HTTPStatus: http.StatusForbidden}
+		}
+		triedRestricted[authID] = struct{}{}
+	}
+}
+
+func (m *Manager) pickHomeDispatchSelectionOnce(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
 	if m == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -938,6 +972,7 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 	if envelope.Present {
 		selection.accountedModel = envelope.Tuple.Model
 	}
+	selection.dispatchCount = homeAuthCountFromMetadata(opts.Metadata)
 	if executionSessionID := homeExecutionSessionIDFromMetadata(opts.Metadata); executionSessionID != "" && cliproxyexecutor.DownstreamWebsocket(ctx) {
 		if errEnd := m.endMismatchedHomeSessionSelections(ctx, executionSessionID, strings.TrimSpace(auth.ID), requestedModel, true); errEnd != nil {
 			selection.End("target_change_release_failed")
