@@ -15,6 +15,8 @@ import (
 const (
 	defaultRuntimeSelectionFreezeSeconds = 30
 	defaultRuntimeRateLimitWindowSeconds = 60
+	runtimeSkipReasonQuotaPreempt        = "quota_preempt"
+	runtimeSkipReasonUsageLimitReached   = "usage_limit_reached"
 )
 
 type authRuntimeLimits struct {
@@ -25,13 +27,15 @@ type authRuntimeLimits struct {
 	rateWindowStart time.Time
 	rateWindowCount int
 
-	frozenUntil            time.Time
-	rateLimitedUntil       time.Time
-	stickyBypassNext       bool
-	stickyBypassSessions   map[string]time.Time
-	lastSkipReason         string
-	lastSkipRecordedAt     time.Time
-	lastSkipRecoveryTarget time.Time
+	frozenUntil             time.Time
+	usageLimitFreezeUntil   time.Time
+	quotaPreemptFreezeUntil time.Time
+	rateLimitedUntil        time.Time
+	stickyBypassNext        bool
+	stickyBypassSessions    map[string]time.Time
+	lastSkipReason          string
+	lastSkipRecordedAt      time.Time
+	lastSkipRecoveryTarget  time.Time
 
 	// codexQuotaSnapshots is replaced atomically by the asynchronous quota
 	// collector. Request-time reads remain lock-free.
@@ -117,17 +121,16 @@ func (a *Auth) RuntimeLimitSnapshot(now time.Time) RuntimeLimitSnapshot {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.compactRuntimeWindowLocked(now, a.runtimeLimitConfig())
-	if !state.frozenUntil.IsZero() && !state.frozenUntil.After(now) {
-		state.frozenUntil = time.Time{}
-	}
-	if !state.rateLimitedUntil.IsZero() && !state.rateLimitedUntil.After(now) {
-		state.rateLimitedUntil = time.Time{}
+	frozenUntil, freezeReason := state.activeFreezeLocked(now)
+	lastSkipReason := state.lastSkipReason
+	if freezeReason != "" {
+		lastSkipReason = freezeReason
 	}
 	return RuntimeLimitSnapshot{
 		CurrentConcurrency: state.currentConcurrency,
-		FrozenUntil:        state.frozenUntil,
+		FrozenUntil:        frozenUntil,
 		RateLimitedUntil:   state.rateLimitedUntil,
-		LastSkipReason:     state.lastSkipReason,
+		LastSkipReason:     lastSkipReason,
 	}
 }
 
@@ -148,9 +151,9 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, now time.Time, tailBurs
 	defer state.mu.Unlock()
 
 	state.compactRuntimeWindowLocked(now, cfg)
-	if !state.frozenUntil.IsZero() && state.frozenUntil.After(now) {
-		state.recordSkipLocked("frozen", state.frozenUntil, now)
-		return true, blockReasonCooldown, state.frozenUntil
+	if frozenUntil, reason := state.activeFreezeLocked(now); frozenUntil.After(now) {
+		state.recordSkipLocked(reason, frozenUntil, now)
+		return true, blockReasonCooldown, frozenUntil
 	}
 	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
@@ -245,9 +248,9 @@ func (a *Auth) acquireRuntimeSlotWithTailBurst(now time.Time, tailBurst bool) (r
 	defer state.mu.Unlock()
 
 	state.compactRuntimeWindowLocked(now, cfg)
-	if !state.frozenUntil.IsZero() && state.frozenUntil.After(now) {
-		state.recordSkipLocked("frozen", state.frozenUntil, now)
-		return nil, false, "frozen", state.frozenUntil
+	if frozenUntil, reason := state.activeFreezeLocked(now); frozenUntil.After(now) {
+		state.recordSkipLocked(reason, frozenUntil, now)
+		return nil, false, "frozen", frozenUntil
 	}
 	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
@@ -296,6 +299,12 @@ func (state *authRuntimeLimits) compactRuntimeWindowLocked(now time.Time, cfg ru
 	if !state.frozenUntil.IsZero() && !state.frozenUntil.After(now) {
 		state.frozenUntil = time.Time{}
 	}
+	if !state.usageLimitFreezeUntil.IsZero() && !state.usageLimitFreezeUntil.After(now) {
+		state.usageLimitFreezeUntil = time.Time{}
+	}
+	if !state.quotaPreemptFreezeUntil.IsZero() && !state.quotaPreemptFreezeUntil.After(now) {
+		state.quotaPreemptFreezeUntil = time.Time{}
+	}
 	if !state.rateLimitedUntil.IsZero() && !state.rateLimitedUntil.After(now) {
 		state.rateLimitedUntil = time.Time{}
 	}
@@ -319,6 +328,39 @@ func (state *authRuntimeLimits) recordSkipLocked(reason string, until time.Time,
 	state.lastSkipReason = reason
 	state.lastSkipRecordedAt = now
 	state.lastSkipRecoveryTarget = until
+}
+
+func (state *authRuntimeLimits) activeFreezeLocked(now time.Time) (time.Time, string) {
+	if state == nil {
+		return time.Time{}, ""
+	}
+	until := state.frozenUntil
+	reason := "frozen"
+	if state.usageLimitFreezeUntil.After(until) {
+		until = state.usageLimitFreezeUntil
+		reason = runtimeSkipReasonUsageLimitReached
+	}
+	if state.quotaPreemptFreezeUntil.After(until) {
+		until = state.quotaPreemptFreezeUntil
+		reason = runtimeSkipReasonQuotaPreempt
+	}
+	if !until.After(now) {
+		return time.Time{}, ""
+	}
+	return until, reason
+}
+
+func runtimeAuthHasPersistentQuotaFreeze(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	state := auth.ensureRuntimeLimits()
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.usageLimitFreezeUntil.After(now) || state.quotaPreemptFreezeUntil.After(now)
 }
 
 func (state *authRuntimeLimits) pruneStickyBypassSessionsLocked(now time.Time) {
@@ -381,11 +423,12 @@ func (a *Auth) freezeUsageLimit(now time.Time, retryAfter *time.Duration) bool {
 	// Repeated responses carrying resets_in_seconds calculate nearly identical
 	// absolute deadlines from slightly different arrival times. Treat sub-second
 	// drift as the same freeze window so a concurrent failure burst is deduplicated.
-	extended := state.frozenUntil.Before(until.Add(-time.Second))
+	extended := state.usageLimitFreezeUntil.Before(until.Add(-time.Second))
 	if extended {
-		state.frozenUntil = until
+		state.usageLimitFreezeUntil = until
 	}
-	state.recordSkipLocked("usage_limit_reached", state.frozenUntil, now)
+	frozenUntil, reason := state.activeFreezeLocked(now)
+	state.recordSkipLocked(reason, frozenUntil, now)
 	state.mu.Unlock()
 	return extended
 }
@@ -400,15 +443,14 @@ func (a *Auth) updateQuotaPreempt(now time.Time, until time.Time, active bool) {
 	}
 	state.mu.Lock()
 	if active && !until.IsZero() && until.After(now) {
-		if state.frozenUntil.Before(until) || state.lastSkipReason == "quota_preempt" {
-			state.frozenUntil = until
+		if state.quotaPreemptFreezeUntil.Before(until) {
+			state.quotaPreemptFreezeUntil = until
 		}
-		state.recordSkipLocked("quota_preempt", until, now)
-	} else if state.lastSkipReason == "quota_preempt" {
-		state.frozenUntil = time.Time{}
-		state.lastSkipReason = ""
-		state.lastSkipRecordedAt = time.Time{}
-		state.lastSkipRecoveryTarget = time.Time{}
+	} else {
+		state.quotaPreemptFreezeUntil = time.Time{}
+	}
+	if frozenUntil, reason := state.activeFreezeLocked(now); frozenUntil.After(now) {
+		state.recordSkipLocked(reason, frozenUntil, now)
 	}
 	state.mu.Unlock()
 }

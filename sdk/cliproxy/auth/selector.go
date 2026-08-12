@@ -872,7 +872,9 @@ func (s *SessionAffinitySelector) shouldUseTemporaryFailover(auths []*Auth, cach
 			return false
 		}
 		if s != nil && s.highCacheMode {
-			return reason != blockReasonDisabled && !authQuotaExceeded(auth, model)
+			return reason != blockReasonDisabled &&
+				!authQuotaExceeded(auth, model) &&
+				!runtimeAuthHasPersistentQuotaFreeze(auth, now)
 		}
 		return reason == blockReasonOther
 	}

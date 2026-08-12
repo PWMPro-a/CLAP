@@ -184,6 +184,86 @@ func TestRuntimeLimits_RuntimeFreezeSkipsFailedAuth(t *testing.T) {
 	}
 }
 
+func TestRuntimeLimits_PersistentQuotaFreezeReasonSurvivesBlockedChecks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		freezeAuth func(*Auth, time.Time)
+		wantReason string
+	}{
+		{
+			name: "usage limit reached",
+			freezeAuth: func(auth *Auth, now time.Time) {
+				retryAfter := time.Hour
+				auth.freezeUsageLimit(now, &retryAfter)
+			},
+			wantReason: runtimeSkipReasonUsageLimitReached,
+		},
+		{
+			name: "quota preempt",
+			freezeAuth: func(auth *Auth, now time.Time) {
+				auth.updateQuotaPreempt(now, now.Add(time.Hour), true)
+			},
+			wantReason: runtimeSkipReasonQuotaPreempt,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Now()
+			auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}
+			test.freezeAuth(auth, now)
+
+			blocked, _, _ := runtimeAuthBlockedForModel(auth, now.Add(time.Second))
+			if !blocked {
+				t.Fatal("runtime freeze did not block auth")
+			}
+			if _, acquired, _, _ := auth.acquireRuntimeSlot(now.Add(2 * time.Second)); acquired {
+				t.Fatal("runtime slot acquired while auth was frozen")
+			}
+			if got := auth.RuntimeLimitSnapshot(now.Add(3 * time.Second)).LastSkipReason; got != test.wantReason {
+				t.Fatalf("last skip reason = %q, want %q", got, test.wantReason)
+			}
+		})
+	}
+}
+
+func TestRuntimeLimits_PersistentQuotaFreezeSourcesRecoverIndependently(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}
+	usageUntil := now.Add(10 * time.Minute)
+	quotaUntil := now.Add(time.Hour)
+	retryAfter := 10 * time.Minute
+	auth.freezeUsageLimit(now, &retryAfter)
+	auth.updateQuotaPreempt(now, quotaUntil, true)
+	auth.updateQuotaPreempt(now.Add(time.Minute), now.Add(5*time.Minute), true)
+
+	state := auth.ensureRuntimeLimits()
+	state.mu.Lock()
+	if !state.usageLimitFreezeUntil.Equal(usageUntil) || !state.quotaPreemptFreezeUntil.Equal(quotaUntil) {
+		state.mu.Unlock()
+		t.Fatalf("independent freeze deadlines = usage:%v quota:%v, want usage:%v quota:%v", state.usageLimitFreezeUntil, state.quotaPreemptFreezeUntil, usageUntil, quotaUntil)
+	}
+	state.mu.Unlock()
+
+	auth.updateQuotaPreempt(now.Add(time.Minute), time.Time{}, false)
+	if !runtimeAuthHasPersistentQuotaFreeze(auth, now.Add(time.Minute)) {
+		t.Fatal("usage-limit freeze was cleared when quota-preempt recovered")
+	}
+
+	state.mu.Lock()
+	state.usageLimitFreezeUntil = time.Time{}
+	state.mu.Unlock()
+	if runtimeAuthHasPersistentQuotaFreeze(auth, now.Add(2*time.Minute)) {
+		t.Fatal("persistent quota freeze remained after both sources recovered")
+	}
+}
+
 func TestRuntimeLimits_StreamReleaseOnContextCancel(t *testing.T) {
 	auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"max_concurrency": 1}}
 	release, acquired, reason, _ := auth.acquireRuntimeSlot(time.Now())

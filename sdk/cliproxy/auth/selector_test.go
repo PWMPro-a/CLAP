@@ -1184,6 +1184,122 @@ func TestSessionAffinitySelectorHighCacheModeQuotaCooldownRebinds(t *testing.T) 
 	}
 }
 
+func TestSessionAffinitySelectorHighCacheModePersistentQuotaFreezeRebinds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		freezeAuth func(*Auth, time.Time)
+	}{
+		{
+			name: "usage limit reached",
+			freezeAuth: func(auth *Auth, now time.Time) {
+				retryAfter := time.Hour
+				auth.freezeUsageLimit(now, &retryAfter)
+			},
+		},
+		{
+			name: "quota preempt",
+			freezeAuth: func(auth *Auth, now time.Time) {
+				auth.updateQuotaPreempt(now, now.Add(time.Hour), true)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+				Fallback:      &RoundRobinSelector{},
+				TTL:           time.Minute,
+				HighCacheMode: true,
+			})
+			defer selector.Stop()
+
+			auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+			opts := cliproxyexecutor.Options{Metadata: map[string]any{
+				cliproxyexecutor.CallerScopeMetadataKey: "persistent-quota-caller",
+			}}
+			first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+			if err != nil {
+				t.Fatalf("initial Pick() error = %v", err)
+			}
+
+			now := time.Now()
+			test.freezeAuth(first, now)
+			rebound, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+			if err != nil {
+				t.Fatalf("quota freeze Pick() error = %v", err)
+			}
+			if rebound.ID == first.ID {
+				t.Fatalf("persistent quota freeze kept unavailable auth %q", first.ID)
+			}
+
+			state := first.ensureRuntimeLimits()
+			state.mu.Lock()
+			state.frozenUntil = time.Time{}
+			state.usageLimitFreezeUntil = time.Time{}
+			state.quotaPreemptFreezeUntil = time.Time{}
+			state.lastSkipReason = ""
+			state.mu.Unlock()
+			afterRecovery, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+			if err != nil {
+				t.Fatalf("post-recovery Pick() error = %v", err)
+			}
+			if afterRecovery.ID != rebound.ID {
+				t.Fatalf("post-recovery auth = %q, want rebound binding %q", afterRecovery.ID, rebound.ID)
+			}
+		})
+	}
+}
+
+func TestSessionAffinitySelectorHighCacheModeConcurrencyLimitUsesTemporaryFailover(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:      &RoundRobinSelector{},
+		TTL:           time.Minute,
+		HighCacheMode: true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a", Metadata: map[string]any{"max_concurrency": 1}},
+		{ID: "auth-b"},
+	}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey: "concurrency-caller",
+	}}
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("initial Pick() error = %v", err)
+	}
+	release, acquired, reason, _ := first.acquireRuntimeSlot(time.Now())
+	if !acquired {
+		t.Fatalf("runtime slot was not acquired: %s", reason)
+	}
+
+	failover, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		release()
+		t.Fatalf("concurrency failover Pick() error = %v", err)
+	}
+	if failover.ID == first.ID {
+		release()
+		t.Fatalf("concurrency failover kept saturated auth %q", first.ID)
+	}
+
+	release()
+	recovered, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("post-concurrency Pick() error = %v", err)
+	}
+	if recovered.ID != first.ID {
+		t.Fatalf("post-concurrency auth = %q, want original binding %q", recovered.ID, first.ID)
+	}
+}
+
 func TestExtractSessionID_ClaudeCodePriorityOverHeader(t *testing.T) {
 	t.Parallel()
 
