@@ -35,6 +35,11 @@ const GenerateMetadataKey = "generate"
 // is executing in the credential's quota-tail drain mode.
 const CodexTailBurstMetadataKey = "__cliproxy_codex_tail_burst"
 
+// CodexAppServerMetadataKey is an internal proof that the inbound request has
+// already passed CPA access authentication and may use the Codex app-server
+// compatibility path. HTTP headers never populate this value directly.
+const CodexAppServerMetadataKey = "__cliproxy_codex_app_server"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

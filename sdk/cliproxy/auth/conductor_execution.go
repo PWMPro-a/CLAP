@@ -43,6 +43,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	opts = m.enrichCodexClientRestriction(normalized, req, opts)
+	req = attachCodexAppServerMetadata(req, opts)
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, false)
 	}
@@ -94,6 +95,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	opts = m.enrichCodexClientRestriction(normalized, req, opts)
+	req = attachCodexAppServerMetadata(req, opts)
 	if m.HomeEnabled() {
 		return m.executeHome(ctx, normalized, req, opts, true)
 	}
@@ -144,6 +146,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	opts = m.enrichCodexClientRestriction(normalized, req, opts)
+	req = attachCodexAppServerMetadata(req, opts)
 	if !m.HomeEnabled() {
 		req, opts = m.enrichCacheAffinity(normalized, req, opts)
 	}

@@ -41,11 +41,30 @@ func (m *Manager) enrichCodexClientRestriction(providers []string, req cliproxye
 		}
 	}
 	request := codexclientpolicy.Request{Headers: headers, Body: body}
-	result := codexclientpolicy.Evaluate(request, policy)
+	// Official-client identity is always evaluated without the app-server
+	// fallback. The latter is activated only by the internal post-auth marker.
+	officialPolicy := policy
+	officialPolicy.AllowAppServerClients = false
+	result := codexclientpolicy.Evaluate(request, officialPolicy)
 	appServerResult := result
-	if !result.Allowed && !policy.AllowAppServerClients {
-		policy.AllowAppServerClients = true
-		appServerResult = codexclientpolicy.Evaluate(request, policy)
+	trustedAppServer, _ := opts.Metadata[cliproxyexecutor.CodexAppServerMetadataKey].(bool)
+	if trustedAppServer {
+		appServerRequest := codexAppServerPolicyRequest(request)
+		if policy.AllowAppServerClients && !result.Allowed {
+			result = codexclientpolicy.Evaluate(appServerRequest, policy)
+		}
+		if !policy.AllowAppServerClients {
+			appServerPolicy := policy
+			appServerPolicy.AllowAppServerClients = true
+			appServerResult = codexclientpolicy.Evaluate(appServerRequest, appServerPolicy)
+		} else {
+			appServerResult = result
+		}
+	} else if !result.Allowed {
+		// App-server admission is backed by an internal post-authentication
+		// marker. Client-controlled headers alone must not activate the account
+		// or global app-server exception.
+		appServerResult = result
 	}
 
 	metadata := cloneSchedulerAnyMap(opts.Metadata)
@@ -58,6 +77,39 @@ func (m *Manager) enrichCodexClientRestriction(providers []string, req cliproxye
 	metadata[codexClientRestrictionReasonMetadataKey] = result.Reason
 	opts.Metadata = metadata
 	return opts
+}
+
+func codexAppServerPolicyRequest(request codexclientpolicy.Request) codexclientpolicy.Request {
+	headers := request.Headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	// Keep this identity outside the official-client namespace. The policy can
+	// admit it only through the explicit app-server switch.
+	headers.Set("User-Agent", "cpa-app-server/1.0")
+	headers.Del("Originator")
+	headers.Set("X-Codex-App-Server", "authenticated")
+	headers.Set("Session-Id", "cpa-app-server-session")
+	headers.Set("Thread-Id", "cpa-app-server-thread")
+	body := []byte(`{"client_metadata":{"x-codex-installation-id":"cpa-app-server"}}`)
+	return codexclientpolicy.Request{Headers: headers, Body: body}
+}
+
+func attachCodexAppServerMetadata(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Request {
+	trusted, _ := opts.Metadata[cliproxyexecutor.CodexAppServerMetadataKey].(bool)
+	if !trusted {
+		return req
+	}
+	metadata := cloneSchedulerAnyMap(req.Metadata)
+	if metadata == nil {
+		metadata = make(map[string]any, 1)
+	}
+	metadata[cliproxyexecutor.CodexAppServerMetadataKey] = true
+	if callerScope, ok := opts.Metadata[cliproxyexecutor.CallerScopeMetadataKey]; ok {
+		metadata[cliproxyexecutor.CallerScopeMetadataKey] = callerScope
+	}
+	req.Metadata = metadata
+	return req
 }
 
 func codexClientPolicyFromConfig(cfg internalconfig.CodexClientRestrictionConfig) codexclientpolicy.Policy {

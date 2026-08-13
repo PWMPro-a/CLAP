@@ -79,6 +79,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if errPromptCache != nil {
 		return nil, errPromptCache
 	}
+	body, wsHeaders = applyCodexAppServerFingerprint(body, wsHeaders, req.Metadata)
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)

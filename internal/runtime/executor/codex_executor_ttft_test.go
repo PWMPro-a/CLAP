@@ -105,7 +105,8 @@ func (f *codexSSETTFTFixture) measure(ctx context.Context) (codexSSETTFTSample, 
 		Model:   "gpt-5.5",
 		Payload: payload,
 		Metadata: map[string]any{
-			cliproxyexecutor.CallerScopeMetadataKey: "ttft-caller",
+			cliproxyexecutor.CallerScopeMetadataKey:    "ttft-caller",
+			cliproxyexecutor.CodexAppServerMetadataKey: true,
 		},
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatCodex,

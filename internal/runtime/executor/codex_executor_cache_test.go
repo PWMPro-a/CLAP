@@ -511,3 +511,59 @@ func TestCodexExecutorCacheHelper_ClaudeAgentScopeUsesResolvedModelAcrossHTTPAnd
 		t.Fatalf("HTTP/WebSocket prompt keys differ: http=%q websocket=%q", childKey, websocketKey)
 	}
 }
+
+func TestApplyCodexAppServerFingerprintBuildsStableFourSignals(t *testing.T) {
+	metadata := map[string]any{
+		cliproxyexecutor.CodexAppServerMetadataKey: true,
+		cliproxyexecutor.CallerScopeMetadataKey:    "caller-scope-a",
+	}
+	body := []byte(`{"model":"gpt-5.4","prompt_cache_key":"cache-a"}`)
+
+	firstBody, firstHeaders := applyCodexAppServerFingerprint(body, nil, metadata)
+	secondBody, secondHeaders := applyCodexAppServerFingerprint(body, nil, metadata)
+
+	for _, key := range []string{"X-Codex-Window-Id", "Session_id", "Thread-Id"} {
+		if got := firstHeaders.Get(key); got == "" || got != secondHeaders.Get(key) {
+			t.Fatalf("%s is empty or unstable: first=%q second=%q", key, got, secondHeaders.Get(key))
+		}
+	}
+	if got := firstHeaders.Get("Session_id"); got != "cache-a" {
+		t.Fatalf("Session_id = %q, want prompt cache key", got)
+	}
+	for _, path := range []string{"client_metadata.x-codex-installation-id", "client_metadata.x-codex-window-id"} {
+		if got := gjson.GetBytes(firstBody, path).String(); got == "" || got != gjson.GetBytes(secondBody, path).String() {
+			t.Fatalf("%s is empty or unstable: %q", path, got)
+		}
+	}
+}
+
+func TestApplyCodexAppServerFingerprintRequiresInternalProof(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4"}`)
+	headers := http.Header{"X-Codex-Window-Id": {"client-value"}}
+
+	gotBody, gotHeaders := applyCodexAppServerFingerprint(body, headers.Clone(), map[string]any{
+		"x-cpa-codex-app-server": true,
+	})
+
+	if string(gotBody) != string(body) {
+		t.Fatalf("untrusted request body changed: %s", string(gotBody))
+	}
+	if got := gotHeaders.Get("X-Codex-Window-Id"); got != "client-value" {
+		t.Fatalf("untrusted request headers changed: %q", got)
+	}
+	if gotHeaders.Get("Session_id") != "" || gotHeaders.Get("Thread-Id") != "" {
+		t.Fatalf("untrusted request received generated headers: %#v", gotHeaders)
+	}
+}
+
+func BenchmarkApplyCodexAppServerFingerprint(b *testing.B) {
+	body := []byte(`{"model":"gpt-5.4","prompt_cache_key":"cache-a","input":[{"role":"user","content":"hello"}]}`)
+	metadata := map[string]any{
+		cliproxyexecutor.CodexAppServerMetadataKey: true,
+		cliproxyexecutor.CallerScopeMetadataKey:    "caller-scope-a",
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = applyCodexAppServerFingerprint(body, nil, metadata)
+	}
+}

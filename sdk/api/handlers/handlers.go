@@ -193,10 +193,22 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if callerScope := requestCallerScope(ginCtx); callerScope != "" {
 		meta[coreexecutor.CallerScopeMetadataKey] = callerScope
 	}
+	if authenticatedAppServerRequest(ginCtx) {
+		meta[coreexecutor.CodexAppServerMetadataKey] = true
+	}
 	if disallowFreeAuthFromContext(ctx) {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
+}
+
+func authenticatedAppServerRequest(ginCtx *gin.Context) bool {
+	if ginCtx == nil {
+		return false
+	}
+	principal, principalExists := ginCtx.Get("userApiKey")
+	provider, providerExists := ginCtx.Get("accessProvider")
+	return principalExists && providerExists && strings.TrimSpace(fmt.Sprint(principal)) != "" && strings.TrimSpace(fmt.Sprint(provider)) != ""
 }
 
 func requestClientIP(request *http.Request) string {

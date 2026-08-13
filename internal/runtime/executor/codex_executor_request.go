@@ -175,6 +175,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
+	rawJSON, appServerHeaders := applyCodexAppServerFingerprint(rawJSON, nil, req.Metadata)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err
@@ -182,7 +183,64 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if cache.ID != "" {
 		httpReq.Header.Set("Session_id", cache.ID)
 	}
+	mergeMissingHeaders(httpReq.Header, appServerHeaders)
 	return httpReq, rawJSON, identityState, nil
+}
+
+func applyCodexAppServerFingerprint(body []byte, headers http.Header, metadata map[string]any) ([]byte, http.Header) {
+	trusted, _ := metadata[cliproxyexecutor.CodexAppServerMetadataKey].(bool)
+	if !trusted {
+		return body, headers
+	}
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	cacheID := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
+	callerScope := strings.TrimSpace(metadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey))
+	seed := cacheID
+	if seed == "" {
+		seed = callerScope
+	}
+	if seed == "" {
+		seed = "cpa-app-server"
+	}
+	installationSeed := callerScope
+	if installationSeed == "" {
+		installationSeed = seed
+	}
+	installationID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:app-server:installation:"+installationSeed)).String()
+	windowID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:app-server:window:"+seed)).String()
+	threadID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:app-server:thread:"+seed)).String()
+	sessionID := cacheID
+	if sessionID == "" {
+		sessionID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:app-server:session:"+seed)).String()
+	}
+	if !gjson.GetBytes(body, "client_metadata.x-codex-installation-id").Exists() {
+		body, _ = sjson.SetBytes(body, "client_metadata.x-codex-installation-id", installationID)
+	}
+	if !gjson.GetBytes(body, "client_metadata.x-codex-window-id").Exists() {
+		body, _ = sjson.SetBytes(body, "client_metadata.x-codex-window-id", windowID)
+	}
+	setHeaderIfMissing(headers, "X-Codex-Window-Id", windowID)
+	setHeaderIfMissing(headers, "Session_id", sessionID)
+	setHeaderIfMissing(headers, "Thread-Id", threadID)
+	return body, headers
+}
+
+func setHeaderIfMissing(headers http.Header, key, value string) {
+	if headers == nil || strings.TrimSpace(headerValueCaseInsensitive(headers, key)) != "" {
+		return
+	}
+	setHeaderCasePreserved(headers, key, value)
+}
+
+func mergeMissingHeaders(target, source http.Header) {
+	for key, values := range source {
+		if strings.TrimSpace(headerValueCaseInsensitive(target, key)) != "" || len(values) == 0 {
+			continue
+		}
+		setHeaderCasePreserved(target, key, values[0])
+	}
 }
 
 func codexPromptCacheForRequest(ctx context.Context, cfg *config.Config, from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte, headers http.Header) (helps.CodexCache, error) {
