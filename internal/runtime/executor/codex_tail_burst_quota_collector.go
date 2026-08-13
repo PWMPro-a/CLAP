@@ -264,8 +264,13 @@ func parseCodexTailBurstQuotaSnapshot(body []byte, sampledAt time.Time, ttl time
 	if ttl <= 0 {
 		ttl = defaultCodexQuotaCollectorSnapshotTTL
 	}
-	var bestRatio float64
-	bestWindow := ""
+	type quotaCandidate struct {
+		name       string
+		ratio      float64
+		resetAt    time.Time
+		windowKind string
+	}
+	candidates := make([]quotaCandidate, 0, 2)
 	for _, candidate := range []struct {
 		name string
 		path string
@@ -288,22 +293,65 @@ func parseCodexTailBurstQuotaSnapshot(body []byte, sampledAt time.Time, ttl time
 		if ratio < 0 || ratio > 1 {
 			continue
 		}
-		if bestWindow == "" || ratio > bestRatio {
-			bestRatio = ratio
-			bestWindow = candidate.name
-		}
+		resetAt := codexQuotaWindowResetAt(body, candidate.name, sampledAt)
+		candidates = append(candidates, quotaCandidate{
+			name:       candidate.name,
+			ratio:      ratio,
+			resetAt:    resetAt,
+			windowKind: codexQuotaWindowKind(window),
+		})
 	}
-	if bestWindow == "" {
+	if len(candidates) == 0 {
 		return cliproxyauth.CodexQuotaSnapshot{}, false
 	}
+	// The usage endpoint can expose a monthly window at 100% alongside an
+	// independently usable weekly window. Tail draining targets the active
+	// weekly allowance first, then falls back to the most constrained known
+	// window when the response has no weekly classification.
+	preferred := candidates
+	weekly := make([]quotaCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.windowKind == "weekly" {
+			weekly = append(weekly, candidate)
+		}
+	}
+	if len(weekly) > 0 {
+		preferred = weekly
+	}
+	best := preferred[0]
+	for _, candidate := range preferred[1:] {
+		if candidate.ratio > best.ratio || (candidate.ratio == best.ratio && candidate.resetAt.After(best.resetAt)) {
+			best = candidate
+		}
+	}
 	return cliproxyauth.CodexQuotaSnapshot{
-		UsedRatio:      bestRatio,
-		RemainingRatio: 1 - bestRatio,
-		Window:         bestWindow,
+		UsedRatio:      best.ratio,
+		RemainingRatio: 1 - best.ratio,
+		Window:         best.name,
 		SampledAt:      sampledAt,
 		ExpiresAt:      sampledAt.Add(ttl),
-		ResetAt:        codexQuotaWindowResetAt(body, bestWindow, sampledAt),
+		ResetAt:        best.resetAt,
 	}, true
+}
+
+func codexQuotaWindowKind(window gjson.Result) string {
+	seconds := window.Get("limit_window_seconds").Float()
+	if seconds <= 0 {
+		seconds = window.Get("window_seconds").Float()
+	}
+	if seconds <= 0 {
+		seconds = window.Get("window_minutes").Float() * 60
+	}
+	switch {
+	case seconds >= 4.5*60*60 && seconds <= 5.5*60*60:
+		return "five_hour"
+	case seconds >= 6.5*24*60*60 && seconds <= 7.5*24*60*60:
+		return "weekly"
+	case seconds >= 28*24*60*60 && seconds <= 31*24*60*60:
+		return "monthly"
+	default:
+		return "unknown"
+	}
 }
 
 func codexQuotaWindowResetAt(body []byte, windowName string, sampledAt time.Time) time.Time {

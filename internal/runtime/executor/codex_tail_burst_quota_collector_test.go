@@ -30,6 +30,22 @@ func TestParseCodexTailBurstQuotaSnapshotUsesMostConstrainedWindow(t *testing.T)
 	}
 }
 
+func TestParseCodexTailBurstQuotaSnapshotPrefersWeeklyOverMonthly(t *testing.T) {
+	sampledAt := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	snapshot, ok := parseCodexTailBurstQuotaSnapshot([]byte(`{
+  "rate_limit": {
+    "primary_window": {"used_percent": 97, "limit_window_seconds": 604800},
+    "secondary_window": {"used_percent": 100, "limit_window_seconds": 2592000}
+  }
+}`), sampledAt, 90*time.Second)
+	if !ok {
+		t.Fatal("parseCodexTailBurstQuotaSnapshot returned no snapshot")
+	}
+	if snapshot.Window != "primary" || math.Abs(snapshot.UsedRatio-0.97) > 1e-9 {
+		t.Fatalf("snapshot = %#v, want weekly primary at 97%%", snapshot)
+	}
+}
+
 func TestParseCodexTailBurstQuotaSnapshotRejectsMissingUsage(t *testing.T) {
 	if _, ok := parseCodexTailBurstQuotaSnapshot([]byte(`{"rate_limit":{"primary_window":{}}}`), time.Now(), time.Minute); ok {
 		t.Fatal("missing used_percent produced a snapshot")

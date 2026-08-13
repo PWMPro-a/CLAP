@@ -162,6 +162,10 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, now time.Time, tailBurs
 			return true, blockReasonCooldown, frozenUntil
 		}
 	}
+	if tailBurst && state.currentConcurrency >= 1 {
+		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
+		return true, blockReasonOther, time.Time{}
+	}
 	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
@@ -263,6 +267,10 @@ func (a *Auth) acquireRuntimeSlotWithTailBurst(now time.Time, tailBurst bool) (r
 			state.recordSkipLocked(reason, frozenUntil, now)
 			return nil, false, "frozen", frozenUntil
 		}
+	}
+	if tailBurst && state.currentConcurrency >= 1 {
+		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
+		return nil, false, "tail_burst_concurrency_limit", time.Time{}
 	}
 	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)

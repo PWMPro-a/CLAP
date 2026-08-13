@@ -188,8 +188,8 @@ type CodexCacheAffinityConfig struct {
 	QuotaHardStopUsedRatio float64 `yaml:"quota-hard-stop-used-ratio" json:"quota-hard-stop-used-ratio"`
 }
 
-// CodexTailBurstConfig controls the temporary high-concurrency drain mode for
-// Codex credentials that are close to exhausting a tracked usage window.
+// CodexTailBurstConfig controls the bounded drain mode for Codex credentials
+// that are close to exhausting a tracked usage window.
 type CodexTailBurstConfig struct {
 	Enabled          bool                               `yaml:"enabled" json:"enabled"`
 	TriggerUsedRatio float64                            `yaml:"trigger-used-ratio" json:"trigger-used-ratio"`

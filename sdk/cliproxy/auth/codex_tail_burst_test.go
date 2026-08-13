@@ -31,7 +31,7 @@ func updateTailBurstSnapshot(t *testing.T, manager *Manager, authID string) {
 	}
 }
 
-func TestCodexTailBurstBypassesAccountConcurrency(t *testing.T) {
+func TestCodexTailBurstLimitsAccountToOneInFlightRequest(t *testing.T) {
 	executor := &runtimeLimitTestExecutor{
 		blockAuth: "tail-auth",
 		started:   make(chan struct{}),
@@ -63,8 +63,8 @@ func TestCodexTailBurstBypassesAccountConcurrency(t *testing.T) {
 	if errExecute != nil {
 		t.Fatalf("second Execute: %v", errExecute)
 	}
-	if got := string(second.Payload); got != "tail-auth" {
-		t.Fatalf("second payload = %q, want tail-auth", got)
+	if got := string(second.Payload); got != "healthy-auth" {
+		t.Fatalf("second payload = %q, want healthy-auth", got)
 	}
 
 	close(executor.release)
@@ -157,7 +157,7 @@ func (e *codexTailBurstStreamTestExecutor) HttpRequest(context.Context, *Auth, *
 	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "http request not implemented"}
 }
 
-func TestCodexTailBurstBypassesAccountConcurrencyForStreams(t *testing.T) {
+func TestCodexTailBurstLimitsAccountToOneInFlightStream(t *testing.T) {
 	executor := &codexTailBurstStreamTestExecutor{runtimeLimitTestExecutor: runtimeLimitTestExecutor{
 		blockAuth: "tail-auth",
 		started:   make(chan struct{}),
@@ -198,8 +198,8 @@ func TestCodexTailBurstBypassesAccountConcurrencyForStreams(t *testing.T) {
 		}
 		payload = append(payload, chunk.Payload...)
 	}
-	if string(payload) != "tail-auth" {
-		t.Fatalf("second stream payload = %q, want tail-auth", payload)
+	if string(payload) != "healthy-auth" {
+		t.Fatalf("second stream payload = %q, want healthy-auth", payload)
 	}
 
 	close(executor.release)

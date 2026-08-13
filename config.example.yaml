@@ -280,10 +280,12 @@ codex:
     max-session-duration: "5m"
     # New sessions avoid credentials at or above this collected usage ratio.
     quota-preempt-used-ratio: 0.97
-    # Existing warm sessions leave a credential at or above this ratio.
+    # Existing warm sessions leave a credential at or above this ratio. Set
+    # this to 1.0 when bounded tail-burst draining is enabled.
     quota-hard-stop-used-ratio: 0.99
   # Temporarily prioritize a credential after an external quota collector reports
-  # that the current model window is almost exhausted.
+  # that the current model window is almost exhausted. Tail draining is bounded
+  # to one in-flight request per credential.
   tail-burst:
     enabled: false
     trigger-used-ratio: 0.98
