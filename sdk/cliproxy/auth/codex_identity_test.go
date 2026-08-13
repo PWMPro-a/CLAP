@@ -8,6 +8,7 @@ import (
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -127,6 +128,72 @@ func TestDeactivatedWorkspaceDisablesEveryWorkspaceMember(t *testing.T) {
 	other, ok := manager.GetByID("other")
 	if !ok || other == nil || other.Disabled {
 		t.Fatalf("other = %#v, want active", other)
+	}
+}
+
+func TestAccountCooldownPropagatesToCanonicalCodexDuplicate(t *testing.T) {
+	tests := []struct {
+		name      string
+		resultErr *Error
+		quota     bool
+		reason    blockReason
+	}{
+		{name: "unauthorized", resultErr: &Error{Code: "unauthorized", Message: "token rejected", HTTPStatus: http.StatusUnauthorized}, reason: blockReasonOther},
+		{name: "payment required", resultErr: &Error{Code: "payment_required", Message: "payment required", HTTPStatus: http.StatusPaymentRequired}, reason: blockReasonOther},
+		{name: "forbidden", resultErr: &Error{Code: "forbidden", Message: "account forbidden", HTTPStatus: http.StatusForbidden}, reason: blockReasonOther},
+		{name: "quota", resultErr: &Error{Code: "rate_limit", Message: "weekly quota reached", HTTPStatus: http.StatusTooManyRequests}, quota: true, reason: blockReasonCooldown},
+		{name: "invalid grant", resultErr: &Error{Code: "invalid_grant", Message: "refresh failed: invalid_grant", HTTPStatus: http.StatusBadRequest}, reason: blockReasonOther},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			modelRegistry := registry.GetGlobalRegistry()
+			for _, auth := range []*Auth{
+				{ID: "managed-copy", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "member@example.com", "codex_identity_fingerprint": "stable"}},
+				{ID: "manual-copy", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "member@example.com"}},
+				{ID: "other-member", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "other@example.com"}},
+			} {
+				if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+					t.Fatal(errRegister)
+				}
+				modelRegistry.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-test"}})
+				t.Cleanup(func() { modelRegistry.UnregisterClient(auth.ID) })
+			}
+			manager.MarkResult(context.Background(), Result{
+				AuthID: "managed-copy", Provider: "codex", Model: "gpt-test", Error: test.resultErr,
+			})
+
+			for _, id := range []string{"managed-copy", "manual-copy"} {
+				got, ok := manager.GetByID(id)
+				if !ok || got == nil {
+					t.Fatalf("%s missing", id)
+				}
+				state := got.ModelStates["gpt-test"]
+				if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+					t.Fatalf("%s = %#v, state=%#v, want propagated cooldown", id, got, state)
+				}
+				if state.Quota.Exceeded != test.quota {
+					t.Fatalf("%s quota exceeded = %v, want %v", id, state.Quota.Exceeded, test.quota)
+				}
+				if blocked, reason, _ := isAuthBlockedForModel(got, "gpt-test", time.Now()); !blocked || reason != test.reason {
+					t.Fatalf("%s blocked = %v reason = %v, want %v", id, blocked, reason, test.reason)
+				}
+			}
+			wantModelCount := 1
+			if test.quota {
+				// Registry quota state keeps both a quota marker and a suspension,
+				// so GetModelCount conservatively counts each cooling client twice.
+				wantModelCount = 0
+			}
+			if count := modelRegistry.GetModelCount("gpt-test"); count != wantModelCount {
+				t.Fatalf("registry model count = %d, want %d", count, wantModelCount)
+			}
+			other, ok := manager.GetByID("other-member")
+			if !ok || other == nil || other.Unavailable || other.ModelStates["gpt-test"] != nil {
+				t.Fatalf("other-member = %#v, want unaffected", other)
+			}
+		})
 	}
 }
 

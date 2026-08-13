@@ -713,6 +713,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuota := false
 	var authSnapshot *Auth
 	var terminalPeerSnapshots []*Auth
+	var cooldownPeerSnapshots []*Auth
 	cooldownStateChanged := false
 
 	m.mu.Lock()
@@ -885,12 +886,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.maybeFreezeRuntimeResult(result, now, runtimeStickyBypassSessionFromContext(ctx))
 		if terminalCredential {
 			terminalPeerSnapshots = m.propagateTerminalCredentialLocked(auth, result.Error, now)
+		} else if !result.Success && shouldPropagateCanonicalCooldown(result.Error) {
+			cooldownPeerSnapshots = m.propagateCanonicalCooldownLocked(auth, modelKey, now)
 		}
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 			cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+			// The source may already be cooling while a newly loaded duplicate is
+			// still ready. Persist the converged peer state even when the source
+			// itself did not transition during this result.
+			cooldownStateChanged = cooldownStateChanged || len(cooldownPeerSnapshots) > 0
 		}
 	}
 	m.mu.Unlock()
@@ -910,6 +917,25 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		_ = m.persist(ctx, peer)
 		m.invalidateSessionAffinity(peer.ID)
 		m.hook.OnAuthUpdated(ctx, peer.Clone())
+	}
+	for _, peer := range cooldownPeerSnapshots {
+		if peer == nil {
+			continue
+		}
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(peer)
+		}
+		_ = m.persist(ctx, peer)
+		m.invalidateSessionAffinity(peer.ID)
+		m.hook.OnAuthUpdated(ctx, peer.Clone())
+		if modelKey != "" {
+			if setModelQuota {
+				registry.GetGlobalRegistry().SetModelQuotaExceeded(peer.ID, modelKey)
+			}
+			if shouldSuspendModel {
+				registry.GetGlobalRegistry().SuspendClientModel(peer.ID, modelKey, suspendReason)
+			}
+		}
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -966,6 +992,64 @@ func (m *Manager) propagateTerminalCredentialLocked(source *Auth, resultErr *Err
 			candidate.Metadata = make(map[string]any)
 		}
 		candidate.Metadata["disabled"] = true
+		peers = append(peers, candidate.Clone())
+	}
+	return peers
+}
+
+func shouldPropagateCanonicalCooldown(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	switch statusCodeFromResult(resultErr) {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+		return true
+	default:
+		return isInvalidGrantResultError(resultErr)
+	}
+}
+
+// propagateCanonicalCooldownLocked prevents a second file containing the same
+// Codex credential from bypassing an account-wide auth or quota cooldown. The
+// persisted duplicate files remain intact for compatibility, while their
+// runtime availability converges on the result observed by the selected copy.
+func (m *Manager) propagateCanonicalCooldownLocked(source *Auth, modelKey string, now time.Time) []*Auth {
+	if m == nil || source == nil {
+		return nil
+	}
+	identityKey := codexCanonicalIdentityKey(source)
+	if identityKey == "" {
+		return nil
+	}
+	modelKey = canonicalModelKey(modelKey)
+	peers := make([]*Auth, 0)
+	for authID, candidate := range m.auths {
+		if candidate == nil || authID == source.ID || candidate.Disabled || candidate.Status == StatusDisabled ||
+			codexCanonicalIdentityKey(candidate) != identityKey {
+			continue
+		}
+		if modelKey != "" {
+			sourceState := source.ModelStates[modelKey]
+			if sourceState == nil {
+				continue
+			}
+			if candidate.ModelStates == nil {
+				candidate.ModelStates = make(map[string]*ModelState)
+			}
+			candidate.ModelStates[modelKey] = sourceState.Clone()
+			candidate.Status = source.Status
+			candidate.LastError = cloneError(source.LastError)
+			candidate.StatusMessage = source.StatusMessage
+			updateAggregatedAvailability(candidate, now)
+		} else {
+			candidate.Unavailable = source.Unavailable
+			candidate.Status = source.Status
+			candidate.StatusMessage = source.StatusMessage
+			candidate.LastError = cloneError(source.LastError)
+			candidate.NextRetryAfter = source.NextRetryAfter
+			candidate.Quota = source.Quota
+		}
+		candidate.UpdatedAt = now
 		peers = append(peers, candidate.Clone())
 	}
 	return peers
