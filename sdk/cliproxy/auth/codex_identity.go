@@ -20,21 +20,44 @@ func codexCanonicalIdentityKey(auth *Auth) string {
 	if member != "" {
 		return hashedIdentityKey("codex-member", workspace, member)
 	}
+	// Supplier-managed credentials carry a stable per-member fingerprint. Use it
+	// before token material when display/member claims are absent so token
+	// rotation cannot make one member look like a new scheduling identity.
+	if fingerprint := codexIdentityFingerprintValue(auth); fingerprint != "" {
+		return hashedIdentityKey("codex-fingerprint", fingerprint)
+	}
 	if token := firstAuthIdentityString(auth, "refresh_token", "refreshToken", "access_token", "accessToken"); token != "" {
 		return hashedIdentityKey("codex-token", token)
 	}
 	return ""
 }
 
-func codexWorkspaceIdentityKey(auth *Auth) string {
-	if auth == nil || !strings.EqualFold(executorKeyFromAuth(auth), "codex") {
-		return ""
+func codexIdentityFingerprintValue(auth *Auth) string {
+	return strings.ToLower(firstAuthIdentityString(auth,
+		"codex_identity_fingerprint",
+		"codex-identity-fingerprint",
+		"codexIdentityFingerprint",
+	))
+}
+
+// codexSameMemberIdentity deliberately never treats a Team workspace ID as a
+// credential identity. Multiple independent members share that workspace, and
+// a terminal response for one member must not disable every other member.
+// When both records carry stable fingerprints they are authoritative; the
+// legacy workspace+member key keeps older duplicate files grouped.
+func codexSameMemberIdentity(left, right *Auth) bool {
+	if left == nil || right == nil ||
+		!strings.EqualFold(executorKeyFromAuth(left), "codex") ||
+		!strings.EqualFold(executorKeyFromAuth(right), "codex") {
+		return false
 	}
-	workspace := codexWorkspaceIdentityValue(auth)
-	if workspace == "" {
-		return ""
+	leftFingerprint := codexIdentityFingerprintValue(left)
+	rightFingerprint := codexIdentityFingerprintValue(right)
+	if leftFingerprint != "" && rightFingerprint != "" {
+		return leftFingerprint == rightFingerprint
 	}
-	return hashedIdentityKey("codex-workspace", workspace)
+	leftIdentity := codexCanonicalIdentityKey(left)
+	return leftIdentity != "" && leftIdentity == codexCanonicalIdentityKey(right)
 }
 
 func codexWorkspaceIdentityValue(auth *Auth) string {

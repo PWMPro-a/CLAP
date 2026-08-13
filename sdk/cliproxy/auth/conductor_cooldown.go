@@ -961,13 +961,7 @@ func (m *Manager) propagateTerminalCredentialLocked(source *Auth, resultErr *Err
 	if m == nil || source == nil || resultErr == nil {
 		return nil
 	}
-	identityKey := codexCanonicalIdentityKey(source)
-	workspaceKey := ""
-	if strings.Contains(strings.ToLower(resultErr.Message), "deactivated_workspace") ||
-		strings.Contains(strings.ToLower(resultErr.Code), "deactivated_workspace") {
-		workspaceKey = codexWorkspaceIdentityKey(source)
-	}
-	if identityKey == "" && workspaceKey == "" {
+	if codexCanonicalIdentityKey(source) == "" {
 		return nil
 	}
 	peers := make([]*Auth, 0)
@@ -975,9 +969,7 @@ func (m *Manager) propagateTerminalCredentialLocked(source *Auth, resultErr *Err
 		if candidate == nil || authID == source.ID {
 			continue
 		}
-		sameIdentity := identityKey != "" && codexCanonicalIdentityKey(candidate) == identityKey
-		sameWorkspace := workspaceKey != "" && codexWorkspaceIdentityKey(candidate) == workspaceKey
-		if !sameIdentity && !sameWorkspace {
+		if !codexSameMemberIdentity(source, candidate) {
 			continue
 		}
 		candidate.Disabled = true

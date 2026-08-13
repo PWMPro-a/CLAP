@@ -96,12 +96,12 @@ func TestCandidateSnapshotKeepsReadyDuplicateWhenPreferredCopyIsCooling(t *testi
 	}
 }
 
-func TestDeactivatedWorkspaceDisablesEveryWorkspaceMember(t *testing.T) {
+func TestDeactivatedWorkspaceDisablesOnlyMatchingMemberCopies(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	for _, auth := range []*Auth{
-		{ID: "member-a", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "a@example.com"}},
-		{ID: "member-a-copy", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "a@example.com"}},
-		{ID: "member-b", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "b@example.com"}},
+		{ID: "member-a", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "a@example.com", "codex_identity_fingerprint": "fingerprint-a"}},
+		{ID: "member-a-copy", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "a@example.com", "codex_identity_fingerprint": "fingerprint-a"}},
+		{ID: "member-b", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "b@example.com", "codex_identity_fingerprint": "fingerprint-b"}},
 		{ID: "other", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-two", "email": "c@example.com"}},
 	} {
 		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
@@ -119,15 +119,17 @@ func TestDeactivatedWorkspaceDisablesEveryWorkspaceMember(t *testing.T) {
 		},
 	})
 
-	for _, id := range []string{"member-a", "member-a-copy", "member-b"} {
+	for _, id := range []string{"member-a", "member-a-copy"} {
 		got, ok := manager.GetByID(id)
 		if !ok || got == nil || !got.Disabled || got.Status != StatusDisabled {
 			t.Fatalf("%s = %#v, want disabled", id, got)
 		}
 	}
-	other, ok := manager.GetByID("other")
-	if !ok || other == nil || other.Disabled {
-		t.Fatalf("other = %#v, want active", other)
+	for _, id := range []string{"member-b", "other"} {
+		got, ok := manager.GetByID(id)
+		if !ok || got == nil || got.Disabled {
+			t.Fatalf("%s = %#v, want active", id, got)
+		}
 	}
 }
 
@@ -197,14 +199,15 @@ func TestAccountCooldownPropagatesToCanonicalCodexDuplicate(t *testing.T) {
 	}
 }
 
-func TestRefreshDeactivatedWorkspaceDisablesEveryWorkspaceMember(t *testing.T) {
+func TestRefreshDeactivatedWorkspaceDisablesOnlyMatchingMemberCopies(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(deactivatedWorkspaceRefreshExecutor{
 		schedulerTestExecutor: schedulerTestExecutor{provider: "codex"},
 	})
 	for _, auth := range []*Auth{
-		{ID: "member-a", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "a@example.com", "refresh_token": "refresh-a"}},
-		{ID: "member-b", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "b@example.com", "refresh_token": "refresh-b"}},
+		{ID: "member-a", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "a@example.com", "refresh_token": "refresh-a", "codex_identity_fingerprint": "fingerprint-a"}},
+		{ID: "member-a-copy", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "a@example.com", "refresh_token": "refresh-a-copy", "codex_identity_fingerprint": "fingerprint-a"}},
+		{ID: "member-b", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "b@example.com", "refresh_token": "refresh-b", "codex_identity_fingerprint": "fingerprint-b"}},
 		{ID: "other", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"chatgpt_account_id": "workspace-two", "email": "c@example.com", "refresh_token": "refresh-c"}},
 	} {
 		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
@@ -215,14 +218,81 @@ func TestRefreshDeactivatedWorkspaceDisablesEveryWorkspaceMember(t *testing.T) {
 	if _, errRefresh := manager.refreshAuthForRequest(context.Background(), "member-a", ""); errRefresh == nil {
 		t.Fatal("refreshAuthForRequest() error = nil, want deactivated_workspace")
 	}
-	for _, id := range []string{"member-a", "member-b"} {
+	for _, id := range []string{"member-a", "member-a-copy"} {
 		got, ok := manager.GetByID(id)
 		if !ok || got == nil || !got.Disabled || got.Status != StatusDisabled {
 			t.Fatalf("%s = %#v, want disabled", id, got)
 		}
 	}
-	other, ok := manager.GetByID("other")
-	if !ok || other == nil || other.Disabled {
-		t.Fatalf("other = %#v, want active", other)
+	for _, id := range []string{"member-b", "other"} {
+		got, ok := manager.GetByID(id)
+		if !ok || got == nil || got.Disabled {
+			t.Fatalf("%s = %#v, want active", id, got)
+		}
+	}
+}
+
+func TestCanonicalIdentityUsesFingerprintWithoutMemberClaims(t *testing.T) {
+	first := &Auth{Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id":         "workspace-one",
+		"codex_identity_fingerprint": "stable-member",
+		"access_token":               "access-one",
+	}}
+	rotated := &Auth{Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id":         "workspace-one",
+		"codex_identity_fingerprint": "stable-member",
+		"access_token":               "access-two",
+	}}
+	other := &Auth{Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id":         "workspace-one",
+		"codex_identity_fingerprint": "other-member",
+		"access_token":               "access-one",
+	}}
+
+	if got, want := codexCanonicalIdentityKey(rotated), codexCanonicalIdentityKey(first); got == "" || got != want {
+		t.Fatalf("rotated identity = %q, want %q", got, want)
+	}
+	if got := codexCanonicalIdentityKey(other); got == codexCanonicalIdentityKey(first) {
+		t.Fatalf("other fingerprint identity = %q, want distinct", got)
+	}
+}
+
+func TestSameMemberIdentityUsesFingerprintsAuthoritatively(t *testing.T) {
+	managed := &Auth{Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id":         "workspace-one",
+		"email":                      "member@example.com",
+		"codex_identity_fingerprint": "fingerprint-one",
+	}}
+	sameMemberCopy := &Auth{Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id":         "workspace-one",
+		"email":                      "member@example.com",
+		"codex_identity_fingerprint": "fingerprint-one",
+	}}
+	differentFingerprint := &Auth{Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id":         "workspace-one",
+		"email":                      "member@example.com",
+		"codex_identity_fingerprint": "fingerprint-two",
+	}}
+	legacyCopy := &Auth{Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id": "workspace-one",
+		"email":              "member@example.com",
+	}}
+	otherProvider := &Auth{Provider: "claude", Metadata: map[string]any{
+		"chatgpt_account_id":         "workspace-one",
+		"email":                      "member@example.com",
+		"codex_identity_fingerprint": "fingerprint-one",
+	}}
+
+	if !codexSameMemberIdentity(managed, sameMemberCopy) {
+		t.Fatal("matching fingerprints should identify copies of the same member")
+	}
+	if codexSameMemberIdentity(managed, differentFingerprint) {
+		t.Fatal("different fingerprints must remain isolated even when legacy claims match")
+	}
+	if !codexSameMemberIdentity(managed, legacyCopy) {
+		t.Fatal("a legacy copy without a fingerprint should fall back to member claims")
+	}
+	if codexSameMemberIdentity(managed, otherProvider) {
+		t.Fatal("credentials from another provider must remain isolated")
 	}
 }
