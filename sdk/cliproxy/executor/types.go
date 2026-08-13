@@ -40,6 +40,11 @@ const CodexTailBurstMetadataKey = "__cliproxy_codex_tail_burst"
 // compatibility path. HTTP headers never populate this value directly.
 const CodexAppServerMetadataKey = "__cliproxy_codex_app_server"
 
+// CodexAppServerAuthenticatedContextKey marks a Gin request after CPA access
+// authentication has completed successfully. It is intentionally populated by
+// server middleware rather than from any client-controlled HTTP header.
+const CodexAppServerAuthenticatedContextKey = "__cliproxy_codex_app_server_authenticated"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

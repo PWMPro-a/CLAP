@@ -206,9 +206,9 @@ func authenticatedAppServerRequest(ginCtx *gin.Context) bool {
 	if ginCtx == nil {
 		return false
 	}
-	principal, principalExists := ginCtx.Get("userApiKey")
-	provider, providerExists := ginCtx.Get("accessProvider")
-	return principalExists && providerExists && strings.TrimSpace(fmt.Sprint(principal)) != "" && strings.TrimSpace(fmt.Sprint(provider)) != ""
+	authenticated, exists := ginCtx.Get(coreexecutor.CodexAppServerAuthenticatedContextKey)
+	trusted, ok := authenticated.(bool)
+	return exists && ok && trusted
 }
 
 func requestClientIP(request *http.Request) string {

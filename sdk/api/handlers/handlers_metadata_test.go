@@ -55,7 +55,7 @@ func TestRequestExecutionMetadataIncludesHashedCallerScope(t *testing.T) {
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	ginCtx.Set("userApiKey", "downstream-secret")
-	ginCtx.Set("accessProvider", "static-api-key")
+	ginCtx.Set(coreexecutor.CodexAppServerAuthenticatedContextKey, true)
 	ctx := context.WithValue(context.Background(), "gin", ginCtx)
 
 	meta := requestExecutionMetadata(ctx)
@@ -69,6 +69,20 @@ func TestRequestExecutionMetadataIncludesHashedCallerScope(t *testing.T) {
 	}
 	if trusted, _ := meta[coreexecutor.CodexAppServerMetadataKey].(bool); !trusted {
 		t.Fatal("authenticated request is missing internal Codex app-server proof")
+	}
+}
+
+func TestRequestExecutionMetadataRequiresMiddlewareAuthenticationProof(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ginCtx.Set("userApiKey", "downstream-secret")
+	ginCtx.Set("accessProvider", "static-api-key")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	meta := requestExecutionMetadata(ctx)
+	if _, exists := meta[coreexecutor.CodexAppServerMetadataKey]; exists {
+		t.Fatal("legacy authentication fields created an internal Codex app-server proof")
 	}
 }
 
