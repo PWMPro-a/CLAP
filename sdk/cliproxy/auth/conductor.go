@@ -192,5 +192,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)
 	}
 	manager.scheduler = newAuthScheduler(selector)
+	manager.scheduler.setSelectionModelResolver(manager.selectionModelForAuth)
+	manager.scheduler.setQuotaFallback(manager.quotaPreemptFallbackAuth)
 	return manager
 }

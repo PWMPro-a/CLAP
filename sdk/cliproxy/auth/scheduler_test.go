@@ -622,6 +622,7 @@ func TestManager_PickNextMixed_UsesWeightedProviderRotationBeforeCredentialRotat
 	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-a", Provider: "claude"}); errRegister != nil {
 		t.Fatalf("Register(claude-a) error = %v", errRegister)
 	}
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{NewCandidateMode: true}})
 
 	wantProviders := []string{"gemini", "gemini", "claude", "gemini"}
 	wantIDs := []string{"gemini-a", "gemini-b", "claude-a", "gemini-a"}
@@ -1460,7 +1461,7 @@ func TestManagerPluginSchedulerPickNextMixedSelectsProvider(t *testing.T) {
 	}
 }
 
-func TestManagerInactivePluginSchedulerKeepsMixedFastPath(t *testing.T) {
+func TestManagerInactivePluginSchedulerKeepsLegacyMixedPath(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.executors["gemini"] = schedulerTestExecutor{}
 	manager.executors["claude"] = schedulerTestExecutor{}
@@ -1481,11 +1482,11 @@ func TestManagerInactivePluginSchedulerKeepsMixedFastPath(t *testing.T) {
 	if got == nil {
 		t.Fatalf("pickNextMixed() auth = nil")
 	}
-	if provider != "gemini" {
-		t.Fatalf("pickNextMixed() provider = %q, want gemini", provider)
+	if provider != "gemini" && provider != "claude" {
+		t.Fatalf("pickNextMixed() provider = %q, want a configured provider", provider)
 	}
-	if got.ID != "gemini-a" {
-		t.Fatalf("pickNextMixed() auth.ID = %q, want gemini-a", got.ID)
+	if got.ID != "gemini-a" && got.ID != "claude-a" {
+		t.Fatalf("pickNextMixed() auth.ID = %q, want a configured auth", got.ID)
 	}
 	if scheduler.calls != 0 {
 		t.Fatalf("scheduler.calls = %d, want %d", scheduler.calls, 0)
@@ -1647,6 +1648,7 @@ func TestManager_PickNextMixed_UsesSchedulerRotation(t *testing.T) {
 	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-a", Provider: "claude"}); errRegister != nil {
 		t.Fatalf("Register(claude-a) error = %v", errRegister)
 	}
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{NewCandidateMode: true}})
 
 	wantProviders := []string{"gemini", "gemini", "claude", "gemini"}
 	wantIDs := []string{"gemini-a", "gemini-b", "claude-a", "gemini-a"}

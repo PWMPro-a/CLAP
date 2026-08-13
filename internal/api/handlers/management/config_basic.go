@@ -327,6 +327,14 @@ func (h *Handler) PutRoutingHighCacheMode(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.Routing.HighCacheMode = v })
 }
 
+// RoutingNewCandidateMode
+func (h *Handler) GetRoutingNewCandidateMode(c *gin.Context) {
+	c.JSON(200, gin.H{"new-candidate-mode": h.cfg.Routing.NewCandidateMode})
+}
+func (h *Handler) PutRoutingNewCandidateMode(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.Routing.NewCandidateMode = v })
+}
+
 // Proxy URL
 func (h *Handler) GetProxyURL(c *gin.Context) { c.JSON(200, gin.H{"proxy-url": h.cfg.ProxyURL}) }
 func (h *Handler) PutProxyURL(c *gin.Context) {

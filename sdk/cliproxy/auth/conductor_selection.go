@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cacheaffinity"
@@ -39,6 +40,22 @@ func (m *Manager) hasPluginScheduler() bool {
 		return state.HasScheduler()
 	}
 	return true
+}
+
+func (m *Manager) PluginScheduler() PluginScheduler {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	scheduler := m.pluginScheduler
+	m.mu.RUnlock()
+	if scheduler == nil {
+		return nil
+	}
+	if state, ok := scheduler.(pluginSchedulerState); ok && !state.HasScheduler() {
+		return nil
+	}
+	return scheduler
 }
 
 func isBuiltInSelector(selector Selector) bool {
@@ -687,13 +704,13 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 	var errPick error
 	if providerKey == "mixed" {
 		selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
+		if errPick != nil && model != "" && !m.newCandidateMode() && shouldRetrySchedulerPick(errPick) {
 			m.syncScheduler()
 			selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
 		}
 	} else {
 		selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
+		if errPick != nil && model != "" && !m.newCandidateMode() && shouldRetrySchedulerPick(errPick) {
 			m.syncScheduler()
 			selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
 		}
@@ -709,6 +726,9 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 
 func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginScheduler, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, candidates []*Auth) (*Auth, bool, error) {
 	if scheduler == nil || len(candidates) == 0 {
+		return nil, false, nil
+	}
+	if state, ok := scheduler.(pluginSchedulerState); ok && !state.HasScheduler() {
 		return nil, false, nil
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
@@ -1142,11 +1162,12 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 	}
 }
 
-func (m *Manager) useSchedulerFastPath() bool {
-	if m == nil || m.scheduler == nil {
+func (m *Manager) newCandidateMode() bool {
+	if m == nil {
 		return false
 	}
-	return isBuiltInSelector(m.selector)
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return cfg != nil && cfg.Routing.NewCandidateMode
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -1162,6 +1183,96 @@ func shouldRetrySchedulerPick(err error) bool {
 		return false
 	}
 	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
+}
+
+func (m *Manager) indexedCandidates(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) []*Auth {
+	if m == nil || m.scheduler == nil {
+		return nil
+	}
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	indexed := m.scheduler.snapshotCandidates(providers, model)
+	out := make([]*Auth, 0, len(indexed))
+	for _, candidate := range indexed {
+		if candidate == nil || candidate.Disabled || !eligibility.allows(candidate) {
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		if _, used := tried[candidate.ID]; used {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func (m *Manager) pickNextIndexed(ctx context.Context, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
+	selector := m.Selector()
+	pluginScheduler := m.PluginScheduler()
+	if pluginScheduler == nil && isBuiltInSelector(selector) {
+		return m.scheduler.pickSingle(ctx, provider, model, opts, tried)
+	}
+	candidates := m.indexedCandidates(ctx, providers, model, opts, tried)
+	var selectorAuths []*Auth
+	if pluginScheduler != nil || !isBuiltInSelector(selector) {
+		available, availableForSelector, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
+		if errAvailable != nil {
+			return nil, errAvailable
+		}
+		candidates = available
+		selectorAuths = availableForSelector
+	}
+	if pluginScheduler != nil {
+		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, providers, model, opts, tried, candidates)
+		if errPick != nil || handled {
+			return selected, errPick
+		}
+	}
+	if !isBuiltInSelector(selector) {
+		selected, errPick := selector.Pick(ctx, provider, model, opts, selectorAuths)
+		if errPick != nil || selected == nil {
+			return selected, errPick
+		}
+		return selected, nil
+	}
+	return m.scheduler.pickSingle(ctx, provider, model, opts, tried)
+}
+
+func (m *Manager) pickNextMixedIndexed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, string, error) {
+	selector := m.Selector()
+	pluginScheduler := m.PluginScheduler()
+	if pluginScheduler == nil && isBuiltInSelector(selector) {
+		return m.scheduler.pickMixed(ctx, providers, model, opts, tried)
+	}
+	candidates := m.indexedCandidates(ctx, providers, model, opts, tried)
+	var selectorAuths []*Auth
+	if pluginScheduler != nil || !isBuiltInSelector(selector) {
+		available, availableForSelector, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
+		if errAvailable != nil {
+			return nil, "", errAvailable
+		}
+		candidates = available
+		selectorAuths = availableForSelector
+	}
+	if pluginScheduler != nil {
+		selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, candidates)
+		if errPick != nil {
+			return nil, "", errPick
+		}
+		if handled && selected != nil {
+			return selected, executorKeyFromAuth(selected), nil
+		}
+	}
+	if !isBuiltInSelector(selector) {
+		selected, errPick := selector.Pick(ctx, "mixed", model, opts, selectorAuths)
+		if errPick != nil || selected == nil {
+			return selected, "", errPick
+		}
+		return selected, executorKeyFromAuth(selected), nil
+	}
+	return m.scheduler.pickMixed(ctx, providers, model, opts, tried)
 }
 
 func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
@@ -1249,7 +1360,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	authCopy := selected.Clone()
-	if !selected.indexAssigned {
+	if !selected.indexAssigned && !m.newCandidateMode() {
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
@@ -1267,7 +1378,7 @@ func (m *Manager) SelectAuth(ctx context.Context, provider, model string, opts c
 		return nil, &Error{Code: "home_unavailable", Message: "legacy auth selection is unavailable while Home is enabled", HTTPStatus: http.StatusServiceUnavailable}
 	}
 	opts = m.enrichCodexClientRestriction([]string{provider}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
-	selected, _, errPick := m.pickNextLegacy(ctx, provider, model, opts, nil)
+	selected, _, errPick := m.pickNext(ctx, provider, model, opts, nil)
 	if errPick != nil {
 		return nil, errPick
 	}
@@ -1290,7 +1401,7 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 
 	opts = m.enrichCodexClientRestriction([]string{provider}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
 	selectionCtx := withRequiredAuthKind(ctx, requiredKind)
-	selected, _, errPick := m.pickNextLegacy(selectionCtx, provider, model, opts, nil)
+	selected, _, errPick := m.pickNext(selectionCtx, provider, model, opts, nil)
 	if errPick != nil {
 		return nil, errPick
 	}
@@ -1317,7 +1428,7 @@ func (m *Manager) SelectAuthWithCredentialPolicy(ctx context.Context, provider, 
 	}
 	opts = m.enrichCodexClientRestriction([]string{provider}, cliproxyexecutor.Request{Model: model, Payload: opts.OriginalRequest}, opts)
 	selectionCtx := withCredentialPolicy(ctx, policy)
-	selected, _, errPick := m.pickNextLegacy(selectionCtx, provider, model, opts, nil)
+	selected, _, errPick := m.pickNext(selectionCtx, provider, model, opts, nil)
 	if errPick != nil {
 		return nil, errPick
 	}
@@ -1441,48 +1552,16 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return auth, exec, err
 	}
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if !m.newCandidateMode() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
-	}
-	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	if strings.TrimSpace(model) != "" {
-		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
-				continue
-			}
-			if !eligibility.allows(candidate) {
-				continue
-			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
-			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				return m.pickNextLegacy(ctx, provider, model, opts, tried)
-			}
-		}
-		m.mu.RUnlock()
 	}
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
-	selected, errPick := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
-	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-		m.syncScheduler()
-		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
-	}
-	if errPick != nil && strings.EqualFold(strings.TrimSpace(provider), "codex") && shouldRetrySchedulerPick(errPick) {
-		// The incremental scheduler intentionally keeps quota-preempted entries
-		// out of ready buckets. On an all-pool miss, reuse the legacy candidate
-		// pass solely to evaluate the bounded quota-preempt fallback.
-		return m.pickNextLegacy(ctx, provider, model, opts, tried)
-	}
+	selected, errPick := m.pickNextIndexed(ctx, provider, []string{provider}, model, opts, tried)
 	if errPick != nil {
-		m.mu.RLock()
-		restrictionErr := m.codexClientRestrictionError(ctx, map[string]struct{}{provider: {}}, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
-		m.mu.RUnlock()
+		restrictionErr := m.indexedCodexClientRestrictionError(ctx, []string{provider}, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
 		if restrictionErr != nil {
 			return nil, nil, restrictionErr
 		}
@@ -1492,7 +1571,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	authCopy := selected.Clone()
-	if !selected.indexAssigned {
+	if !selected.indexAssigned && !m.newCandidateMode() {
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
@@ -1608,7 +1687,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	authCopy := selected.Clone()
-	if !selected.indexAssigned {
+	if !selected.indexAssigned && !m.newCandidateMode() {
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()
@@ -1629,7 +1708,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if !m.newCandidateMode() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 
@@ -1652,50 +1731,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if len(eligibleProviders) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	if strings.TrimSpace(model) != "" {
-		providerSet := make(map[string]struct{}, len(eligibleProviders))
-		for _, providerKey := range eligibleProviders {
-			providerSet[providerKey] = struct{}{}
-		}
-		m.mu.RLock()
-		for _, candidate := range m.auths {
-			if candidate == nil || candidate.Disabled {
-				continue
-			}
-			if _, ok := providerSet[executorKeyFromAuth(candidate)]; !ok {
-				continue
-			}
-			if !eligibility.allows(candidate) {
-				continue
-			}
-			if _, used := tried[candidate.ID]; used {
-				continue
-			}
-			if m.routeAwareSelectionRequired(candidate, model) {
-				m.mu.RUnlock()
-				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
-			}
-		}
-		m.mu.RUnlock()
-	}
-
-	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
-	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-		m.syncScheduler()
-		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
-	}
-	if errPick != nil && hasCodexProvider(eligibleProviders) && shouldRetrySchedulerPick(errPick) {
-		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
-	}
+	selected, providerKey, errPick := m.pickNextMixedIndexed(ctx, eligibleProviders, model, opts, tried)
 	if errPick != nil {
-		providerSet := make(map[string]struct{}, len(eligibleProviders))
-		for _, eligibleProvider := range eligibleProviders {
-			providerSet[eligibleProvider] = struct{}{}
-		}
-		m.mu.RLock()
-		restrictionErr := m.codexClientRestrictionError(ctx, providerSet, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
-		m.mu.RUnlock()
+		restrictionErr := m.indexedCodexClientRestrictionError(ctx, eligibleProviders, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
 		if restrictionErr != nil {
 			return nil, nil, "", restrictionErr
 		}
@@ -1709,7 +1747,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	authCopy := selected.Clone()
-	if !selected.indexAssigned {
+	if !selected.indexAssigned && !m.newCandidateMode() {
 		m.mu.Lock()
 		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
 			current.EnsureIndex()

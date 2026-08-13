@@ -27,6 +27,7 @@ type configCommit struct {
 
 type routingRuntimeState struct {
 	strategy                string
+	newCandidateMode        bool
 	sessionAffinity         bool
 	sessionAffinityTTL      time.Duration
 	highCacheMode           bool
@@ -52,6 +53,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		state.strategy = "fill-first"
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
+	state.newCandidateMode = cfg.Routing.NewCandidateMode
 	state.highCacheMode = cfg.Routing.HighCacheMode
 	cacheSettings := cacheaffinity.Settings(cfg)
 	state.cacheAffinityEnabled = cacheSettings.Enabled && !cacheSettings.Shadow

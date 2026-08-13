@@ -298,6 +298,10 @@ type RoutingConfig struct {
 	// behavior off, and when enabled it turns on session affinity with a caller-
 	// scoped fallback plus more conservative temporary failover handling.
 	HighCacheMode bool `yaml:"high-cache-mode,omitempty" json:"high-cache-mode,omitempty"`
+
+	// NewCandidateMode routes local selection through the incremental candidate index.
+	// When disabled, selection preserves the legacy request-time auth scan.
+	NewCandidateMode bool `yaml:"new-candidate-mode,omitempty" json:"new-candidate-mode,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

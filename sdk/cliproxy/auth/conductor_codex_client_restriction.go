@@ -218,6 +218,50 @@ func (m *Manager) codexClientRestrictionError(
 	return &Error{Code: "codex_client_restricted", Message: codexClientRestrictionMessage, HTTPStatus: http.StatusForbidden}
 }
 
+func (m *Manager) indexedCodexClientRestrictionError(
+	ctx context.Context,
+	providers []string,
+	model string,
+	opts cliproxyexecutor.Options,
+	tried map[string]struct{},
+	pinnedAuthID string,
+) error {
+	if m == nil || m.scheduler == nil {
+		return nil
+	}
+	if evaluated, _ := opts.Metadata[codexClientRestrictionEvaluatedMetadataKey].(bool); !evaluated {
+		return nil
+	}
+	fullEligibility := authSelectionEligibilityForRequest(ctx, opts)
+	baseEligibility := fullEligibility
+	baseEligibility.codexClientRestrictionEvaluated = false
+	restricted := false
+	for _, candidate := range m.scheduler.snapshotCandidates(providers, model) {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		if _, used := tried[candidate.ID]; used {
+			continue
+		}
+		if !baseEligibility.allows(candidate) {
+			continue
+		}
+		if fullEligibility.allows(candidate) {
+			return nil
+		}
+		if codexClientRestrictionEnabledForAuth(candidate) {
+			restricted = true
+		}
+	}
+	if !restricted {
+		return nil
+	}
+	return &Error{Code: "codex_client_restricted", Message: codexClientRestrictionMessage, HTTPStatus: http.StatusForbidden}
+}
+
 func codexClientRestrictionAllowsAuth(opts cliproxyexecutor.Options, auth *Auth) bool {
 	if auth == nil || !codexClientRestrictionEnabledForAuth(auth) {
 		return true

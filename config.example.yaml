@@ -224,6 +224,9 @@ routing:
   # High cache mode keeps routing stable for cache-heavy Codex/OpenAI workloads.
   # It is off by default and only changes behavior when explicitly enabled.
   high-cache-mode: false
+  # Use the incremental auth candidate index for every local selection path.
+  # When false, every request uses the legacy auth scan without indexed fallback.
+  new-candidate-mode: false
 
 # Codex provider behavior.
 codex:

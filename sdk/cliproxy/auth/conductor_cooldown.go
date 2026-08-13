@@ -131,6 +131,7 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 	oldCooldownStore := m.cooldownStore
 	m.mu.RUnlock()
 	previousCfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	previousNewCandidateMode := previousCfg != nil && previousCfg.Routing.NewCandidateMode
 	if homeSessionAliasTTL(previousCfg) != homeSessionAliasTTL(cfg) {
 		m.homeSessionAliases.clear()
 	}
@@ -148,6 +149,9 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.clearHomeRuntimeAuths()
 	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if !previousNewCandidateMode && cfg.Routing.NewCandidateMode && m.scheduler != nil && m.scheduler.empty() {
+		m.syncScheduler()
+	}
 	return clearedCooldowns
 }
 

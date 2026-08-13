@@ -34,12 +34,14 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu                  sync.Mutex
-	strategy            schedulerStrategy
-	providers           map[string]*providerScheduler
-	authProviders       map[string]string
-	mixedCursors        map[string]int
-	mixedWeightedStates map[string]*smoothWeightedState
+	mu                    sync.Mutex
+	strategy              schedulerStrategy
+	providers             map[string]*providerScheduler
+	authProviders         map[string]string
+	mixedCursors          map[string]int
+	mixedWeightedStates   map[string]*smoothWeightedState
+	selectionModelForAuth func(*Auth, string) string
+	quotaFallback         func([]*Auth, string, time.Time) *Auth
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -57,6 +59,7 @@ type scheduledAuthMeta struct {
 	weight            int64
 	websocketEnabled  bool
 	supportedModelSet map[string]struct{}
+	selectionModelSet map[string]string
 }
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
@@ -182,8 +185,41 @@ func (s *authScheduler) setSelector(selector Selector) {
 	clear(s.mixedWeightedStates)
 }
 
+func (s *authScheduler) setSelectionModelResolver(resolve func(*Auth, string) string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.selectionModelForAuth = resolve
+	s.mu.Unlock()
+}
+
+func (s *authScheduler) setQuotaFallback(resolve func([]*Auth, string, time.Time) *Auth) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.quotaFallback = resolve
+	s.mu.Unlock()
+}
+
+func (s *authScheduler) empty() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.authProviders) == 0
+}
+
 // rebuild recreates the complete scheduler state from an auth snapshot.
 func (s *authScheduler) rebuild(auths []*Auth) {
+	s.rebuildWithSelectionModels(auths, nil)
+}
+
+// rebuildWithSelectionModels rebuilds the index while retaining auth-specific
+// route model keys supplied by Manager. This keeps aliases on the indexed path.
+func (s *authScheduler) rebuildWithSelectionModels(auths []*Auth, selectionModels map[string]map[string]string) {
 	if s == nil {
 		return
 	}
@@ -195,18 +231,83 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	s.mixedWeightedStates = make(map[string]*smoothWeightedState)
 	now := time.Now()
 	for _, auth := range auths {
-		s.upsertAuthLocked(auth, now)
+		var modelSet map[string]string
+		if selectionModels != nil && auth != nil {
+			modelSet = selectionModels[auth.ID]
+		}
+		s.upsertAuthLockedWithSelectionModels(auth, now, modelSet)
 	}
 }
 
 // upsertAuth incrementally synchronizes one auth into the scheduler.
 func (s *authScheduler) upsertAuth(auth *Auth) {
+	s.upsertAuthWithSelectionModels(auth, nil)
+}
+
+func (s *authScheduler) upsertAuthWithSelectionModels(auth *Auth, selectionModels map[string]string) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.upsertAuthLocked(auth, time.Now())
+	s.upsertAuthLockedWithSelectionModels(auth, time.Now(), selectionModels)
+}
+
+// snapshotCandidates returns indexed auth snapshots for the requested route.
+// It is intentionally independent of Manager.auths so request-time selection
+// never falls back to a full map scan in new-candidate mode.
+func (s *authScheduler) snapshotCandidates(providers []string, model string) []*Auth {
+	if s == nil {
+		return nil
+	}
+	normalized := normalizeProviderKeys(providers)
+	modelKey := canonicalModelKey(model)
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := make(map[string]struct{})
+	out := make([]*Auth, 0)
+	for _, providerKey := range normalized {
+		providerState := s.providers[providerKey]
+		if providerState == nil {
+			continue
+		}
+		shard := providerState.ensureModelLocked(modelKey, now)
+		if shard == nil {
+			continue
+		}
+		for authID, entry := range shard.entries {
+			if _, ok := seen[authID]; ok || entry == nil || entry.auth == nil {
+				continue
+			}
+			seen[authID] = struct{}{}
+			out = append(out, entry.auth.Clone())
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (s *authScheduler) snapshotAuth(authID string) *Auth {
+	if s == nil {
+		return nil
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	providerKey := s.authProviders[authID]
+	providerState := s.providers[providerKey]
+	if providerState == nil {
+		return nil
+	}
+	meta := providerState.auths[authID]
+	if meta == nil || meta.auth == nil {
+		return nil
+	}
+	return meta.auth.Clone()
 }
 
 // removeAuth deletes one auth from every scheduler shard that references it.
@@ -255,6 +356,11 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
 	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
+	}
+	if s.quotaFallback != nil && providerKey == "codex" {
+		if fallback := s.quotaFallback(shard.candidateAuthsLocked(predicate), model, time.Now()); fallback != nil {
+			return fallback, nil
+		}
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
 }
@@ -345,6 +451,17 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 	}
 	if !hasCandidate {
+		if s.quotaFallback != nil && containsProvider(normalized, "codex") {
+			candidates := make([]*Auth, 0)
+			for _, shard := range candidateShards {
+				if shard != nil {
+					candidates = append(candidates, shard.candidateAuthsLocked(predicate)...)
+				}
+			}
+			if fallback := s.quotaFallback(candidates, model, now); fallback != nil {
+				return fallback, executorKeyFromAuth(fallback), nil
+			}
+		}
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
 
@@ -540,6 +657,10 @@ func containsProvider(providers []string, provider string) bool {
 
 // upsertAuthLocked updates one auth in-place while the scheduler mutex is held.
 func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
+	s.upsertAuthLockedWithSelectionModels(auth, now, nil)
+}
+
+func (s *authScheduler) upsertAuthLockedWithSelectionModels(auth *Auth, now time.Time, selectionModels map[string]string) {
 	if auth == nil {
 		return
 	}
@@ -554,9 +675,34 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 			previousState.removeAuthLocked(authID)
 		}
 	}
-	meta := buildScheduledAuthMeta(auth)
+	if selectionModels == nil {
+		selectionModels = s.selectionModelsForAuthLocked(auth)
+	}
+	meta := buildScheduledAuthMetaWithSelectionModels(auth, selectionModels)
 	s.authProviders[authID] = providerKey
 	s.ensureProviderLocked(providerKey).upsertAuthLocked(meta, now)
+}
+
+func (s *authScheduler) selectionModelsForAuthLocked(auth *Auth) map[string]string {
+	if auth == nil {
+		return nil
+	}
+	registered := supportedModelSetForAuth(auth.ID)
+	if len(registered) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(registered))
+	for routeModel := range registered {
+		selectionModel := routeModel
+		if s.selectionModelForAuth != nil {
+			selectionModel = canonicalModelKey(s.selectionModelForAuth(auth, routeModel))
+		}
+		if selectionModel == "" {
+			selectionModel = routeModel
+		}
+		out[routeModel] = selectionModel
+	}
+	return out
 }
 
 // removeAuthLocked removes one auth from the scheduler while the scheduler mutex is held.
@@ -591,14 +737,40 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 
 // buildScheduledAuthMeta extracts the scheduling metadata needed for shard bookkeeping.
 func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
+	return buildScheduledAuthMetaWithSelectionModels(auth, nil)
+}
+
+func buildScheduledAuthMetaWithSelectionModels(auth *Auth, selectionModels map[string]string) *scheduledAuthMeta {
 	providerKey := executorKeyFromAuth(auth)
+	selectionModelSet := make(map[string]string)
+	if selectionModels == nil {
+		for modelKey := range supportedModelSetForAuth(auth.ID) {
+			selectionModelSet[modelKey] = modelKey
+		}
+	} else {
+		for routeModel, selectionModel := range selectionModels {
+			routeKey := canonicalModelKey(routeModel)
+			selectionKey := canonicalModelKey(selectionModel)
+			if routeKey != "" && selectionKey != "" {
+				selectionModelSet[routeKey] = selectionKey
+			}
+		}
+	}
+	if len(selectionModelSet) == 0 && auth != nil {
+		selectionModelSet[""] = ""
+	}
+	modelSet := make(map[string]struct{}, len(selectionModelSet))
+	for routeModel := range selectionModelSet {
+		modelSet[routeModel] = struct{}{}
+	}
 	return &scheduledAuthMeta{
 		auth:              auth,
 		providerKey:       providerKey,
 		priority:          authPriority(auth),
 		weight:            authWeight(auth),
 		websocketEnabled:  authWebsocketsEnabled(auth),
-		supportedModelSet: supportedModelSetForAuth(auth.ID),
+		supportedModelSet: modelSet,
+		selectionModelSet: selectionModelSet,
 	}
 }
 
@@ -688,11 +860,24 @@ func (m *scheduledAuthMeta) supportsModel(modelKey string) bool {
 	if modelKey == "" {
 		return true
 	}
-	if len(m.supportedModelSet) == 0 {
+	if len(m.supportedModelSet) == 0 && len(m.selectionModelSet) == 0 {
 		return false
 	}
 	_, ok := m.supportedModelSet[modelKey]
+	if !ok {
+		_, ok = m.selectionModelSet[modelKey]
+	}
 	return ok
+}
+
+func (m *scheduledAuthMeta) selectionModelForRoute(routeModel string) string {
+	routeModel = canonicalModelKey(routeModel)
+	if m != nil && m.selectionModelSet != nil {
+		if selectionModel := strings.TrimSpace(m.selectionModelSet[routeModel]); selectionModel != "" {
+			return selectionModel
+		}
+	}
+	return routeModel
 }
 
 // upsertEntryLocked updates or inserts one auth entry and rebuilds indexes when ordering changes.
@@ -717,7 +902,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	entry.meta = meta
 	entry.auth = meta.auth
 	entry.nextRetryAt = time.Time{}
-	blocked, reason, next := isAuthBlockedForModel(meta.auth, m.modelKey, now)
+	blocked, reason, next := isAuthBlockedForModel(meta.auth, meta.selectionModelForRoute(m.modelKey), now)
 	switch {
 	case !blocked:
 		entry.state = scheduledStateReady
@@ -762,7 +947,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 		if entry.nextRetryAt.IsZero() || entry.nextRetryAt.After(now) {
 			continue
 		}
-		blocked, reason, next := isAuthBlockedForModel(entry.auth, m.modelKey, now)
+		blocked, reason, next := isAuthBlockedForModel(entry.auth, entry.meta.selectionModelForRoute(m.modelKey), now)
 		switch {
 		case !blocked:
 			entry.state = scheduledStateReady
@@ -924,6 +1109,20 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		}
 	}
 	return total, cooldownCount, earliest
+}
+
+func (m *modelScheduler) candidateAuthsLocked(predicate func(*scheduledAuth) bool) []*Auth {
+	if m == nil {
+		return nil
+	}
+	out := make([]*Auth, 0, len(m.entries))
+	for _, entry := range m.entries {
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		out = append(out, entry.auth)
+	}
+	return out
 }
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.

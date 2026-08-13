@@ -229,6 +229,9 @@ func (m *Manager) UpdateCodexQuotaSnapshot(authID, model string, snapshot CodexQ
 	if accepted {
 		cacheSettings := m.cacheAffinitySettings()
 		auth.updateQuotaPreempt(now, snapshot.ResetAt, cacheSettings.active && snapshot.UsedRatio >= cacheSettings.hardStopRatio)
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(auth.Clone())
+		}
 		m.refreshCodexTailBurstCandidates()
 	}
 	return stored, accepted, nil
@@ -247,6 +250,7 @@ func (m *Manager) UpdateCodexQuotaSnapshots(updates []CodexQuotaSnapshotUpdate) 
 	settings := m.codexTailBurstSettings()
 	now := time.Now()
 	acceptedCount := 0
+	updatedAuths := make(map[string]*Auth)
 	for _, update := range updates {
 		authID := strings.TrimSpace(update.AuthID)
 		if authID == "" {
@@ -273,10 +277,16 @@ func (m *Manager) UpdateCodexQuotaSnapshots(updates []CodexQuotaSnapshotUpdate) 
 		if _, accepted := auth.setCodexQuotaSnapshot(strings.TrimSpace(update.Model), snapshot); accepted {
 			cacheSettings := m.cacheAffinitySettings()
 			auth.updateQuotaPreempt(now, snapshot.ResetAt, cacheSettings.active && snapshot.UsedRatio >= cacheSettings.hardStopRatio)
+			updatedAuths[auth.ID] = auth
 			acceptedCount++
 		}
 	}
 	if acceptedCount > 0 {
+		if m.scheduler != nil {
+			for _, auth := range updatedAuths {
+				m.scheduler.upsertAuth(auth.Clone())
+			}
+		}
 		m.refreshCodexTailBurstCandidates()
 	}
 	return acceptedCount, nil
@@ -461,10 +471,8 @@ func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts
 	registryRef := registry.GetGlobalRegistry()
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	executor := m.executors["codex"]
-	if executor == nil {
+	executor, okExecutor := m.Executor("codex")
+	if !okExecutor || executor == nil {
 		return nil, nil, false
 	}
 	for offset := 0; offset < len(candidates); offset++ {
@@ -472,7 +480,17 @@ func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts
 		if _, alreadyTried := tried[authID]; alreadyTried {
 			continue
 		}
-		auth := m.auths[authID]
+		var auth *Auth
+		if m.newCandidateMode() && m.scheduler != nil {
+			auth = m.scheduler.snapshotAuth(authID)
+		} else {
+			m.mu.RLock()
+			auth = m.auths[authID]
+			if auth != nil {
+				auth = auth.Clone()
+			}
+			m.mu.RUnlock()
+		}
 		if auth == nil || auth.Disabled || !eligibility.allows(auth) || !m.authSupportsRouteModel(registryRef, auth, model) || !m.codexTailBurstActive(auth, model, now) {
 			continue
 		}

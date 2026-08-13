@@ -32,3 +32,14 @@ func TestRoutingHighCacheModeRoundTrip(t *testing.T) {
 		t.Fatalf("body = %s, want true", got)
 	}
 }
+
+func TestRoutingNewCandidateModeRoundTrip(t *testing.T) {
+	h := &Handler{cfg: &config.Config{Routing: config.RoutingConfig{NewCandidateMode: true}}}
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/routing/new-candidate-mode", nil)
+	h.GetRoutingNewCandidateMode(ctx)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "true") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}

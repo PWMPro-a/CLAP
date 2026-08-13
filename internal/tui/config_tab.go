@@ -350,9 +350,11 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	if routing, ok := cfg["routing"].(map[string]any); ok {
 		fields = append(fields, configField{"Routing Strategy", "routing/strategy", "string", getString(routing, "strategy"), nil})
 		fields = append(fields, configField{"High Cache Mode", "routing/high-cache-mode", "bool", fmt.Sprintf("%v", getBool(routing, "high-cache-mode")), nil})
+		fields = append(fields, configField{"New Candidate Mode", "routing/new-candidate-mode", "bool", fmt.Sprintf("%v", getBool(routing, "new-candidate-mode")), nil})
 	} else {
 		fields = append(fields, configField{"Routing Strategy", "routing/strategy", "string", "", nil})
 		fields = append(fields, configField{"High Cache Mode", "routing/high-cache-mode", "bool", "false", nil})
+		fields = append(fields, configField{"New Candidate Mode", "routing/new-candidate-mode", "bool", "false", nil})
 	}
 
 	// WebSocket auth

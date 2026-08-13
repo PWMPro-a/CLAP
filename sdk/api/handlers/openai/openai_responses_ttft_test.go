@@ -78,7 +78,7 @@ func TestOpenAIResponsesSSETTFTBudget(t *testing.T) {
 	t.Cleanup(upstream.Close)
 
 	runtimeConfig := &internalconfig.Config{
-		Routing: internalconfig.RoutingConfig{HighCacheMode: true},
+		Routing: internalconfig.RoutingConfig{HighCacheMode: true, NewCandidateMode: true},
 	}
 	executor := providerexecutor.NewCodexExecutor(runtimeConfig)
 	selector := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
@@ -88,6 +88,7 @@ func TestOpenAIResponsesSSETTFTBudget(t *testing.T) {
 	})
 	t.Cleanup(selector.Stop)
 	manager := coreauth.NewManager(nil, selector, nil)
+	manager.SetConfig(runtimeConfig)
 	manager.RegisterExecutor(executor)
 	auth := &coreauth.Auth{
 		ID:       "handler-ttft-auth",
@@ -103,6 +104,7 @@ func TestOpenAIResponsesSSETTFTBudget(t *testing.T) {
 	}
 	const model = "handler-ttft-model"
 	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	manager.RefreshSchedulerEntry(auth.ID)
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 
 	base := handlers.NewBaseAPIHandlers(&runtimeConfig.SDKConfig, manager)

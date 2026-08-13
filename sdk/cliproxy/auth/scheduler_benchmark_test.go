@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -68,6 +69,7 @@ func benchmarkManagerSetup(b *testing.B, total int, mixed bool, withPriority boo
 		reg.RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: model}})
 	}
 	manager.syncScheduler()
+	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{NewCandidateMode: true}})
 	b.Cleanup(func() {
 		for index := 0; index < total; index++ {
 			provider := providers[0]
