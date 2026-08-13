@@ -2,6 +2,7 @@ package synthesizer
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -17,6 +18,60 @@ func TestNewFileSynthesizer(t *testing.T) {
 	synth := NewFileSynthesizer()
 	if synth == nil {
 		t.Fatal("expected non-nil synthesizer")
+	}
+}
+
+func TestFileSynthesizerPinnedTeamPlanSurvivesTransientFreeIDToken(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	claims := base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"free"}}`))
+	idToken := header + "." + claims + ".synthetic"
+	metadata := map[string]any{
+		"type":              "codex",
+		"email":             "team@example.com",
+		"access_token":      "access",
+		"id_token":          idToken,
+		"plan_type":         "team",
+		"chatgpt_plan_type": "free",
+		"import_format":     "sub2api",
+	}
+	data, errMarshal := json.Marshal(metadata)
+	if errMarshal != nil {
+		t.Fatalf("Marshal: %v", errMarshal)
+	}
+	path := filepath.Join(t.TempDir(), "codex-team.json")
+	ctx := &SynthesisContext{Config: &config.Config{}, Now: time.Now(), IDGenerator: NewStableIDGenerator()}
+	auths, errSynthesize := SynthesizeAuthFile(ctx, path, data)
+	if errSynthesize != nil || len(auths) != 1 {
+		t.Fatalf("auths=%d err=%v", len(auths), errSynthesize)
+	}
+	if got := auths[0].Attributes["plan_type"]; got != "team" {
+		t.Fatalf("effective plan_type = %q, want team", got)
+	}
+}
+
+func TestFileSynthesizerExplicitUnpinUsesJWTPlan(t *testing.T) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	claims := base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"free"}}`))
+	metadata := map[string]any{
+		"type":                   "codex",
+		"access_token":           "access",
+		"id_token":               header + "." + claims + ".synthetic",
+		"plan_type":              "team",
+		"chatgpt_plan_type":      "team",
+		"import_format":          "sub2api",
+		"codex_plan_type_pinned": false,
+	}
+	data, _ := json.Marshal(metadata)
+	auths, errSynthesize := SynthesizeAuthFile(
+		&SynthesisContext{Config: &config.Config{}, Now: time.Now(), IDGenerator: NewStableIDGenerator()},
+		filepath.Join(t.TempDir(), "codex-unpinned.json"),
+		data,
+	)
+	if errSynthesize != nil || len(auths) != 1 {
+		t.Fatalf("auths=%d err=%v", len(auths), errSynthesize)
+	}
+	if got := auths[0].Attributes["plan_type"]; got != "free" {
+		t.Fatalf("effective plan_type = %q, want free after explicit unpin", got)
 	}
 }
 

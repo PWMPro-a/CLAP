@@ -231,13 +231,23 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
-		if planType, ok := metadata["plan_type"].(string); ok && strings.TrimSpace(planType) != "" {
-			a.Attributes["plan_type"] = strings.TrimSpace(planType)
+		metadataPlanType := authFileCodexPlanType(metadata)
+		if metadataPlanType != "" {
+			a.Attributes["plan_type"] = strings.ToLower(metadataPlanType)
 		}
-		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
+		planTypePinned, pinDeclared := authFileBoolValue(metadata, "codex_plan_type_pinned", "codexPlanTypePinned")
+		planTypePinned = planTypePinned && metadataPlanType != "" && !strings.EqualFold(metadataPlanType, "free")
+		if !pinDeclared && strings.EqualFold(authFileStringValue(metadata, "import_format"), codex.Sub2ImportFormat) &&
+			metadataPlanType != "" && !strings.EqualFold(metadataPlanType, "free") {
+			// Files created before the explicit pin marker already contain the
+			// normalized supplier workspace plan. Preserve that paid entitlement
+			// across transient Free claims as a backward-compatible migration.
+			planTypePinned = true
+		}
+		if idTokenRaw, ok := metadata["id_token"].(string); !planTypePinned && ok && strings.TrimSpace(idTokenRaw) != "" {
 			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
 				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
-					a.Attributes["plan_type"] = pt
+					a.Attributes["plan_type"] = strings.ToLower(pt)
 				}
 			}
 		}
@@ -250,6 +260,43 @@ func authFileStringValue(metadata map[string]any, keys ...string) string {
 		if value, ok := metadata[key].(string); ok {
 			return strings.TrimSpace(value)
 		}
+	}
+	return ""
+}
+
+func authFileBoolValue(metadata map[string]any, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		raw, exists := metadata[key]
+		if !exists || raw == nil {
+			continue
+		}
+		switch value := raw.(type) {
+		case bool:
+			return value, true
+		case string:
+			parsed, errParse := strconv.ParseBool(strings.TrimSpace(value))
+			if errParse == nil {
+				return parsed, true
+			}
+		}
+	}
+	return false, false
+}
+
+func authFileCodexPlanType(metadata map[string]any) string {
+	candidates := make([]string, 0, 4)
+	for _, key := range []string{"chatgpt_plan_type", "chatgptPlanType", "plan_type", "planType"} {
+		if candidate := strings.ToLower(authFileStringValue(metadata, key)); candidate != "" {
+			candidates = append(candidates, candidate)
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate != "free" {
+			return candidate
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0]
 	}
 	return ""
 }

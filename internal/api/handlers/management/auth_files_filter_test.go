@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -73,6 +74,66 @@ func TestListAuthFilesFiltersByNameAndAuthIndex(t *testing.T) {
 	}
 	if got := payload.Files[0]["auth_index"]; got != "idx-b" {
 		t.Fatalf("auth_index = %#v, want idx-b", got)
+	}
+}
+
+func TestBuildAuthFileEntryExposesEffectivePlanType(t *testing.T) {
+	authDir := t.TempDir()
+	fileName := "codex-team.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	entry := h.buildAuthFileEntry(&coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "team",
+		},
+	})
+	if got := entry["plan_type"]; got != "team" {
+		t.Fatalf("plan_type = %#v, want team", got)
+	}
+}
+
+func TestBuildAuthFileEntryReportsPinnedTeamSeparatelyFromTransientJWTPlan(t *testing.T) {
+	authDir := t.TempDir()
+	fileName := "codex-team-transient-free.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	claims := base64.RawURLEncoding.EncodeToString([]byte(`{"https://api.openai.com/auth":{"chatgpt_plan_type":"free"}}`))
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
+	entry := h.buildAuthFileEntry(&coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "team",
+		},
+		Metadata: map[string]any{
+			"id_token":               header + "." + claims + ".synthetic",
+			"chatgpt_plan_type":      "team",
+			"codex_plan_type_pinned": true,
+		},
+	})
+	if got := entry["plan_type"]; got != "team" {
+		t.Fatalf("effective plan_type = %#v, want team", got)
+	}
+	idToken, ok := entry["id_token"].(gin.H)
+	if !ok || idToken["plan_type"] != "free" {
+		t.Fatalf("id_token plan = %#v, want transient free claim", entry["id_token"])
+	}
+	if entry["codex_plan_type_pinned"] != true {
+		t.Fatalf("codex_plan_type_pinned = %#v, want true", entry["codex_plan_type_pinned"])
 	}
 }
 

@@ -408,6 +408,19 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if planType := strings.TrimSpace(authAttribute(auth, "plan_type")); planType != "" {
+			entry["plan_type"] = strings.ToLower(planType)
+		}
+		if auth.Metadata != nil {
+			if planType, ok := auth.Metadata["chatgpt_plan_type"].(string); ok && strings.TrimSpace(planType) != "" {
+				entry["chatgpt_plan_type"] = strings.ToLower(strings.TrimSpace(planType))
+			}
+			if pinned, ok := authFileMetadataBool(auth.Metadata, "codex_plan_type_pinned", "codexPlanTypePinned"); ok {
+				entry["codex_plan_type_pinned"] = pinned
+			}
+		}
+	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {

@@ -95,6 +95,21 @@ func TestParseSub2BundleWithoutRootMarker(t *testing.T) {
 	}
 }
 
+func TestParseSub2BundlePinsAuthoritativeTeamOverGenericFree(t *testing.T) {
+	payload := []byte(`{"type":"sub2api-data","accounts":[{"type":"oauth","platform":"openai","credentials":{"access_token":"access","refresh_token":"refresh","email":"team@example.com","plan_type":"free","chatgpt_plan_type":"team"}}]}`)
+	files, handled, err := ParseSub2Bundle(payload)
+	if err != nil || !handled || len(files) != 1 {
+		t.Fatalf("files=%d handled=%v err=%v", len(files), handled, err)
+	}
+	metadata := files[0].Metadata
+	if metadata["plan_type"] != "team" || metadata["chatgpt_plan_type"] != "team" {
+		t.Fatalf("normalized plan metadata = %#v", metadata)
+	}
+	if metadata["codex_plan_type_pinned"] != true {
+		t.Fatalf("codex_plan_type_pinned = %#v, want true", metadata["codex_plan_type_pinned"])
+	}
+}
+
 func TestParseSub2BundleRejectsMixedProviders(t *testing.T) {
 	payload := []byte(`{"type":"sub2api-data","accounts":[{"type":"oauth","platform":"openai","credentials":{"access_token":"access"}},{"type":"oauth","platform":"anthropic","credentials":{"access_token":"other"}}]}`)
 	files, handled, err := ParseSub2Bundle(payload)

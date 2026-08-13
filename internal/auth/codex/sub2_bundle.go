@@ -136,10 +136,7 @@ func normalizeSub2Account(account sub2BundleAccount) (map[string]any, string, er
 		firstString(metadata, "email"),
 		firstString(account.Extra, "email"),
 	)
-	planType := firstNonEmpty(
-		firstString(metadata, "plan_type", "chatgpt_plan_type"),
-		firstString(account.Extra, "plan_type"),
-	)
+	planType := resolveSub2PlanType(metadata, account.Extra)
 	if idToken := firstString(metadata, "id_token"); idToken != "" {
 		if claims, err := ParseJWTToken(idToken); err == nil && claims != nil {
 			if accountID == "" {
@@ -161,6 +158,10 @@ func normalizeSub2Account(account sub2BundleAccount) (map[string]any, string, er
 	}
 	if planType != "" {
 		metadata["plan_type"] = planType
+		metadata["chatgpt_plan_type"] = planType
+		if planType != "free" {
+			metadata["codex_plan_type_pinned"] = true
+		}
 	}
 	if name := strings.TrimSpace(account.Name); name != "" {
 		metadata["name"] = name
@@ -217,6 +218,26 @@ func normalizeSub2Account(account sub2BundleAccount) (map[string]any, string, er
 		return nil, "", errors.New("stable account identity is missing")
 	}
 	return metadata, identity, nil
+}
+
+func resolveSub2PlanType(values ...map[string]any) string {
+	candidates := make([]string, 0, len(values)*4)
+	for _, value := range values {
+		for _, key := range []string{"chatgpt_plan_type", "chatgptPlanType", "plan_type", "planType"} {
+			if candidate := strings.ToLower(strings.TrimSpace(firstString(value, key))); candidate != "" {
+				candidates = append(candidates, candidate)
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate != "free" {
+			return candidate
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0]
+	}
+	return ""
 }
 
 func firstBool(values map[string]any, keys ...string) (bool, bool) {

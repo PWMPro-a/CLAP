@@ -191,6 +191,32 @@ func TestRegisterModelsForAuthCodexAPIKeyDefaultRequiresConfigMatch(t *testing.T
 	}
 }
 
+func TestRegisterModelsForPinnedTeamAuthKeepsSolModel(t *testing.T) {
+	authID := "codex-pinned-team-sol"
+	modelRegistry := internalregistry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(authID)
+	t.Cleanup(func() { modelRegistry.UnregisterClient(authID) })
+
+	service := &Service{cfg: &config.Config{}}
+	auth := &coreauth.Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "team",
+		},
+		Metadata: map[string]any{
+			"plan_type":              "team",
+			"codex_plan_type_pinned": true,
+		},
+	}
+	service.registerModelsForAuth(context.Background(), auth)
+	models := codexModelIDSet(modelRegistry.GetModelsForClient(authID))
+	if _, ok := models["gpt-5.6-sol"]; !ok {
+		t.Fatalf("pinned Team models are missing gpt-5.6-sol: %#v", models)
+	}
+}
+
 func TestRegisterConfigAPIKeyAuthsCodexModelModes(t *testing.T) {
 	defaultIDs := codexModelIDSet(internalregistry.GetCodexProModels())
 	tests := []struct {
