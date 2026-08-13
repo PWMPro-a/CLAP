@@ -362,6 +362,9 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 	}
 
 	if len(availableByPriority) == 0 {
+		if fallback := m.quotaPreemptFallbackAuth(auths, routeModel, now); fallback != nil {
+			return []*Auth{fallback}, nil
+		}
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
@@ -377,6 +380,56 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 	}
 
 	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
+}
+
+// quotaPreemptFallbackAuth activates only when every otherwise eligible
+// credential is blocked by the collector's quota-preempt freeze and no other
+// auth/model/runtime exclusion is present. It picks the lowest fresh usage
+// snapshot with capacity and marks a request-local clone for a one-slot bypass.
+func (m *Manager) quotaPreemptFallbackAuth(auths []*Auth, routeModel string, now time.Time) *Auth {
+	if m == nil || len(auths) == 0 {
+		return nil
+	}
+	settings := m.cacheAffinitySettings()
+	if !settings.active || settings.hardStopRatio <= 0 {
+		return nil
+	}
+
+	var best *Auth
+	bestRatio := 2.0
+	for _, candidate := range auths {
+		if candidate == nil || candidate.Disabled || candidate.Status == StatusDisabled {
+			return nil
+		}
+		if availability, ok := candidate.Runtime.(runtimeSelectionAvailability); ok && availability != nil && !availability.RuntimeSelectionAvailable() {
+			return nil
+		}
+		quotaOnly, hasCapacity := runtimeQuotaPreemptFallbackState(candidate, now)
+		if !quotaOnly {
+			return nil
+		}
+		checkModel := m.selectionModelForAuth(candidate, routeModel)
+		if blocked, _, _ := authModelAvailabilityBlock(candidate, checkModel, now); blocked {
+			return nil
+		}
+		snapshot, ok := candidate.codexQuotaSnapshot(checkModel, now)
+		if !ok || snapshot.UsedRatio < settings.hardStopRatio {
+			return nil
+		}
+		if !hasCapacity {
+			continue
+		}
+		if best == nil || snapshot.UsedRatio < bestRatio || (snapshot.UsedRatio == bestRatio && candidate.ID < best.ID) {
+			best = candidate
+			bestRatio = snapshot.UsedRatio
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	fallback := best.Clone()
+	fallback.quotaPreemptFallback = true
+	return fallback
 }
 
 // availableAuthsForSelector reports the candidates handed to priority-scoped consumers such as
@@ -409,10 +462,10 @@ func authSubsetByID(auths, subset []*Auth) []*Auth {
 	if len(auths) == 0 || len(subset) == 0 {
 		return nil
 	}
-	wanted := make(map[string]struct{}, len(subset))
+	wanted := make(map[string]*Auth, len(subset))
 	for _, auth := range subset {
 		if auth != nil {
-			wanted[auth.ID] = struct{}{}
+			wanted[auth.ID] = auth
 		}
 	}
 	out := make([]*Auth, 0, len(wanted))
@@ -420,7 +473,10 @@ func authSubsetByID(auths, subset []*Auth) []*Auth {
 		if auth == nil {
 			continue
 		}
-		if _, ok := wanted[auth.ID]; ok {
+		if selected, ok := wanted[auth.ID]; ok {
+			if selected.quotaPreemptFallback {
+				auth.quotaPreemptFallback = true
+			}
 			out = append(out, auth)
 		}
 	}
@@ -1417,6 +1473,12 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		m.syncScheduler()
 		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	}
+	if errPick != nil && strings.EqualFold(strings.TrimSpace(provider), "codex") && shouldRetrySchedulerPick(errPick) {
+		// The incremental scheduler intentionally keeps quota-preempted entries
+		// out of ready buckets. On an all-pool miss, reuse the legacy candidate
+		// pass solely to evaluate the bounded quota-preempt fallback.
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
 	if errPick != nil {
 		m.mu.RLock()
 		restrictionErr := m.codexClientRestrictionError(ctx, map[string]struct{}{provider: {}}, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
@@ -1622,6 +1684,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 		m.syncScheduler()
 		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
+	}
+	if errPick != nil && hasCodexProvider(eligibleProviders) && shouldRetrySchedulerPick(errPick) {
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	if errPick != nil {
 		providerSet := make(map[string]struct{}, len(eligibleProviders))

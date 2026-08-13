@@ -553,6 +553,13 @@ func isAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.Time,
 	if blocked, reason, next := runtimeAuthBlockedForModelWithTailBurst(auth, now, tailBurst); blocked {
 		return true, reason, next
 	}
+	return authModelAvailabilityBlock(auth, model, now)
+}
+
+func authModelAvailabilityBlock(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	if auth == nil {
+		return true, blockReasonOther, time.Time{}
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			modelKey := canonicalModelKey(model)
@@ -841,6 +848,10 @@ func (s *SessionAffinitySelector) cacheAffinityNewSessionAuths(auths []*Auth, mo
 		if auth == nil {
 			continue
 		}
+		if auth.quotaPreemptFallback {
+			filtered = append(filtered, auth)
+			continue
+		}
 		snapshot, ok := auth.codexQuotaSnapshot(model, now)
 		if ok && snapshot.UsedRatio >= s.quotaPreemptUsedRatio {
 			continue
@@ -851,7 +862,7 @@ func (s *SessionAffinitySelector) cacheAffinityNewSessionAuths(auths []*Auth, mo
 }
 
 func (s *SessionAffinitySelector) cacheAffinityHardStopped(auth *Auth, model string, now time.Time) bool {
-	if s == nil || !s.cacheAffinityEnabled || auth == nil {
+	if s == nil || !s.cacheAffinityEnabled || auth == nil || auth.quotaPreemptFallback {
 		return false
 	}
 	snapshot, ok := auth.codexQuotaSnapshot(model, now)

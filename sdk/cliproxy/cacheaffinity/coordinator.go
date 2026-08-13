@@ -52,6 +52,7 @@ type Stats struct {
 	PrefixSkipped         uint64  `json:"prefix_skipped"`
 	UsageLimitSignals     uint64  `json:"usage_limit_signals"`
 	UsageLimitFreezes     uint64  `json:"usage_limit_freezes"`
+	QuotaFallbacks        uint64  `json:"quota_fallbacks"`
 	UsageLimitDeduped     uint64  `json:"usage_limit_deduped"`
 	RouteRebinds          uint64  `json:"route_rebinds"`
 	RouteHits             uint64  `json:"route_hits"`
@@ -76,6 +77,7 @@ type counters struct {
 	prefixSkipped         atomic.Uint64
 	usageLimitSignals     atomic.Uint64
 	usageLimitFreezes     atomic.Uint64
+	quotaFallbacks        atomic.Uint64
 	usageLimitDeduped     atomic.Uint64
 	routeRebinds          atomic.Uint64
 	routeHits             atomic.Uint64
@@ -245,6 +247,7 @@ func Snapshot() Stats {
 		PrefixSkipped:         global.counters.prefixSkipped.Load(),
 		UsageLimitSignals:     global.counters.usageLimitSignals.Load(),
 		UsageLimitFreezes:     global.counters.usageLimitFreezes.Load(),
+		QuotaFallbacks:        global.counters.quotaFallbacks.Load(),
 		UsageLimitDeduped:     global.counters.usageLimitDeduped.Load(),
 		RouteRebinds:          global.counters.routeRebinds.Load(),
 		RouteHits:             global.counters.routeHits.Load(),
@@ -268,6 +271,12 @@ func RecordUsageLimitFreeze(extended bool) {
 		return
 	}
 	global.counters.usageLimitDeduped.Add(1)
+}
+
+// RecordQuotaFallback records one request admitted through the bounded
+// all-pool quota-preempt fallback.
+func RecordQuotaFallback() {
+	global.counters.quotaFallbacks.Add(1)
 }
 
 // RecordRouteRebind records a permanent session move after its bound auth became unavailable.

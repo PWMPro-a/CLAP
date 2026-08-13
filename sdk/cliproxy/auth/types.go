@@ -101,6 +101,10 @@ type Auth struct {
 	recentRequests recentRequestRing  `json:"-"`
 	indexAssigned  bool               `json:"-"`
 	runtimeLimits  *authRuntimeLimits `json:"-"`
+
+	// quotaPreemptFallback is set only on a request-local clone selected by the
+	// all-pool quota fallback. It never mutates or persists the registered auth.
+	quotaPreemptFallback bool `json:"-"`
 }
 
 // RuntimeAuthView is a minimal read-only projection for callers that only need

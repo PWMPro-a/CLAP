@@ -9,6 +9,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cacheaffinity"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -27,15 +28,16 @@ type authRuntimeLimits struct {
 	rateWindowStart time.Time
 	rateWindowCount int
 
-	frozenUntil             time.Time
-	usageLimitFreezeUntil   time.Time
-	quotaPreemptFreezeUntil time.Time
-	rateLimitedUntil        time.Time
-	stickyBypassNext        bool
-	stickyBypassSessions    map[string]time.Time
-	lastSkipReason          string
-	lastSkipRecordedAt      time.Time
-	lastSkipRecoveryTarget  time.Time
+	frozenUntil                  time.Time
+	usageLimitFreezeUntil        time.Time
+	quotaPreemptFreezeUntil      time.Time
+	rateLimitedUntil             time.Time
+	stickyBypassNext             bool
+	stickyBypassSessions         map[string]time.Time
+	lastSkipReason               string
+	lastSkipRecordedAt           time.Time
+	lastSkipRecoveryTarget       time.Time
+	quotaPreemptFallbackInFlight int
 
 	// codexQuotaSnapshots is replaced atomically by the asynchronous quota
 	// collector. Request-time reads remain lock-free.
@@ -152,8 +154,13 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, now time.Time, tailBurs
 
 	state.compactRuntimeWindowLocked(now, cfg)
 	if frozenUntil, reason := state.activeFreezeLocked(now); frozenUntil.After(now) {
-		state.recordSkipLocked(reason, frozenUntil, now)
-		return true, blockReasonCooldown, frozenUntil
+		if auth.quotaPreemptFallback && state.onlyQuotaPreemptFreezeLocked(now) && state.quotaPreemptFallbackInFlight == 0 {
+			// Continue through concurrency and rate checks. The request-local
+			// fallback flag only bypasses the collector's quota-preempt freeze.
+		} else {
+			state.recordSkipLocked(reason, frozenUntil, now)
+			return true, blockReasonCooldown, frozenUntil
+		}
 	}
 	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
@@ -248,9 +255,14 @@ func (a *Auth) acquireRuntimeSlotWithTailBurst(now time.Time, tailBurst bool) (r
 	defer state.mu.Unlock()
 
 	state.compactRuntimeWindowLocked(now, cfg)
+	quotaPreemptFallback := false
 	if frozenUntil, reason := state.activeFreezeLocked(now); frozenUntil.After(now) {
-		state.recordSkipLocked(reason, frozenUntil, now)
-		return nil, false, "frozen", frozenUntil
+		if a.quotaPreemptFallback && state.onlyQuotaPreemptFreezeLocked(now) && state.quotaPreemptFallbackInFlight == 0 {
+			quotaPreemptFallback = true
+		} else {
+			state.recordSkipLocked(reason, frozenUntil, now)
+			return nil, false, "frozen", frozenUntil
+		}
 	}
 	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
@@ -267,6 +279,10 @@ func (a *Auth) acquireRuntimeSlotWithTailBurst(now time.Time, tailBurst bool) (r
 	}
 
 	state.currentConcurrency++
+	if quotaPreemptFallback {
+		state.quotaPreemptFallbackInFlight++
+		cacheaffinity.RecordQuotaFallback()
+	}
 	if state.rateWindowStart.IsZero() || now.Sub(state.rateWindowStart) >= time.Duration(cfg.rateLimitWindowSeconds)*time.Second {
 		state.rateWindowStart = now
 		state.rateWindowCount = 0
@@ -282,6 +298,9 @@ func (a *Auth) acquireRuntimeSlotWithTailBurst(now time.Time, tailBurst bool) (r
 			state.mu.Lock()
 			if state.currentConcurrency > 0 {
 				state.currentConcurrency--
+			}
+			if quotaPreemptFallback && state.quotaPreemptFallbackInFlight > 0 {
+				state.quotaPreemptFallbackInFlight--
 			}
 			state.mu.Unlock()
 		})
@@ -348,6 +367,47 @@ func (state *authRuntimeLimits) activeFreezeLocked(now time.Time) (time.Time, st
 		return time.Time{}, ""
 	}
 	return until, reason
+}
+
+// onlyQuotaPreemptFreezeLocked reports whether the collector's preventive
+// hard-stop is the sole active runtime freeze. Generic error freezes and real
+// upstream usage-limit freezes deliberately remain absolute.
+func (state *authRuntimeLimits) onlyQuotaPreemptFreezeLocked(now time.Time) bool {
+	if state == nil || !state.quotaPreemptFreezeUntil.After(now) {
+		return false
+	}
+	return !state.frozenUntil.After(now) && !state.usageLimitFreezeUntil.After(now)
+}
+
+// runtimeQuotaPreemptFallbackState separates pool-level eligibility from
+// request-time capacity. Callers may ignore a busy fallback credential and use
+// the next-lowest valid quota snapshot, while acquisition still enforces a
+// single fallback request per credential plus its normal concurrency/rate caps.
+func runtimeQuotaPreemptFallbackState(auth *Auth, now time.Time) (quotaOnly, hasCapacity bool) {
+	if auth == nil {
+		return false, false
+	}
+	state := auth.ensureRuntimeLimits()
+	if state == nil {
+		return false, false
+	}
+	cfg := auth.runtimeLimitConfig()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.compactRuntimeWindowLocked(now, cfg)
+	if !state.onlyQuotaPreemptFreezeLocked(now) {
+		return false, false
+	}
+	if state.quotaPreemptFallbackInFlight > 0 {
+		return true, false
+	}
+	if cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
+		return true, false
+	}
+	if cfg.rateLimitMaxRequests > 0 && state.rateWindowCount >= cfg.rateLimitMaxRequests {
+		return true, false
+	}
+	return true, true
 }
 
 func runtimeAuthHasPersistentQuotaFreeze(auth *Auth, now time.Time) bool {
