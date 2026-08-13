@@ -227,8 +227,11 @@ routing:
 
 # Codex provider behavior.
 codex:
-  # When true, and routing.strategy is fill-first or routing.session-affinity is true,
-  # remap Codex prompt_cache_key and installation identity per selected auth.
+  # When true, and routing.strategy is fill-first, routing.session-affinity is true,
+  # or routing.high-cache-mode is true, remap Codex prompt/session identity per
+  # selected auth and pin one stable installation fingerprint per account.
+  # File auths may persist `codex_identity_fingerprint` to retain that device
+  # identity across token rotation, file renames, or account metadata changes.
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false

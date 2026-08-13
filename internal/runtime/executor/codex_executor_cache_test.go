@@ -304,7 +304,7 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
 	}
-	expectedInstallationID := codexIdentityConfuseUUID("auth-1", "installation", "install-1")
+	expectedInstallationID := codexAccountInstallationID(auth)
 	if gotID := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); gotID != expectedInstallationID {
 		t.Fatalf("installation id = %q, want %q", gotID, expectedInstallationID)
 	}
@@ -404,6 +404,72 @@ func TestCodexIdentityConfuseKeepsClientBodySeparateFromUpstreamBody(t *testing.
 	}
 	if gotKey := gjson.GetBytes(clientBody, "prompt_cache_key").String(); gotKey != "cache-1" {
 		t.Fatalf("client prompt_cache_key = %q, want cache-1", gotKey)
+	}
+}
+
+func TestCodexIdentityConfuseUsesStablePerAccountInstallationFingerprint(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{HighCacheMode: true},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{
+		ID: "first-file-name.json",
+		Metadata: map[string]any{
+			"email":              "Member@Example.COM",
+			"chatgpt_account_id": "shared-team-workspace",
+		},
+	}
+	first, firstState := applyCodexIdentityConfuseBody(cfg, auth,
+		[]byte(`{"client_metadata":{"x-codex-installation-id":"caller-install-a"}}`),
+		[]byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"session-a"}`),
+	)
+	second, secondState := applyCodexIdentityConfuseBody(cfg, auth,
+		[]byte(`{"client_metadata":{"x-codex-installation-id":"caller-install-b"}}`),
+		[]byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"session-b"}`),
+	)
+
+	firstInstallation := gjson.GetBytes(first, "client_metadata.x-codex-installation-id").String()
+	secondInstallation := gjson.GetBytes(second, "client_metadata.x-codex-installation-id").String()
+	if firstInstallation == "" || firstInstallation != secondInstallation {
+		t.Fatalf("per-account installation fingerprint is empty or unstable: first=%q second=%q", firstInstallation, secondInstallation)
+	}
+	if firstInstallation != firstState.installationID || secondInstallation != secondState.installationID {
+		t.Fatalf("body/state installation mismatch: first=%q/%q second=%q/%q", firstInstallation, firstState.installationID, secondInstallation, secondState.installationID)
+	}
+	if firstState.promptCacheKey == secondState.promptCacheKey {
+		t.Fatalf("per-session cache identities collapsed: %q", firstState.promptCacheKey)
+	}
+}
+
+func TestCodexAccountInstallationFingerprintSurvivesRenameAndSeparatesTeamMembers(t *testing.T) {
+	first := &cliproxyauth.Auth{ID: "old-name.json", Metadata: map[string]any{
+		"email": "first@example.com", "chatgpt_account_id": "shared-team-workspace",
+	}}
+	renamed := &cliproxyauth.Auth{ID: "new-name.json", Metadata: map[string]any{
+		"email": "FIRST@example.com", "chatgpt_account_id": "shared-team-workspace",
+	}}
+	secondMember := &cliproxyauth.Auth{ID: "second.json", Metadata: map[string]any{
+		"email": "second@example.com", "chatgpt_account_id": "shared-team-workspace",
+	}}
+
+	firstID := codexAccountInstallationID(first)
+	if firstID == "" || firstID != codexAccountInstallationID(renamed) {
+		t.Fatalf("account fingerprint did not survive rename/case change: first=%q renamed=%q", firstID, codexAccountInstallationID(renamed))
+	}
+	if firstID == codexAccountInstallationID(secondMember) {
+		t.Fatalf("different members in one Team workspace share installation fingerprint %q", firstID)
+	}
+}
+
+func TestCodexAccountInstallationFingerprintPrefersPersistedSeed(t *testing.T) {
+	first := &cliproxyauth.Auth{ID: "first.json", Metadata: map[string]any{
+		"email": "old@example.com", "codex_identity_fingerprint": "persisted-account-fingerprint",
+	}}
+	rotated := &cliproxyauth.Auth{ID: "rotated.json", Metadata: map[string]any{
+		"email": "new@example.com", "codex_identity_fingerprint": "persisted-account-fingerprint",
+	}}
+	if got, want := codexAccountInstallationID(first), codexAccountInstallationID(rotated); got == "" || got != want {
+		t.Fatalf("persisted fingerprint was not authoritative: first=%q rotated=%q", got, want)
 	}
 }
 

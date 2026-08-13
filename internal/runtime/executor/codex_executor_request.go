@@ -145,6 +145,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 type codexIdentityConfuseState struct {
 	enabled                bool
 	authID                 string
+	installationID         string
 	originalPromptCacheKey string
 	promptCacheKey         string
 	turnIDs                []codexIdentityReplacement
@@ -308,7 +309,11 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 		return rawJSON, codexIdentityConfuseState{}
 	}
 
-	state := codexIdentityConfuseState{enabled: true, authID: strings.TrimSpace(auth.ID)}
+	state := codexIdentityConfuseState{
+		enabled:        true,
+		authID:         strings.TrimSpace(auth.ID),
+		installationID: codexAccountInstallationID(auth),
+	}
 	clientPromptCacheKey := strings.TrimSpace(gjson.GetBytes(userPayload, "prompt_cache_key").String())
 	promptCacheKey := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String())
 	if promptCacheKey != "" {
@@ -316,8 +321,13 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", state.promptCacheKey)
 	}
-	if installationID := strings.TrimSpace(gjson.GetBytes(userPayload, "client_metadata.x-codex-installation-id").String()); installationID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", installationID))
+	// Installation identity is an account-level device fingerprint. It must not
+	// inherit the downstream installation ID: one account may be reached by many
+	// clients, and allowing that input into the derivation makes the same OAuth
+	// credential look like a different installation on every caller. The stable
+	// account seed also survives auth-file renames when account metadata exists.
+	if state.installationID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", state.installationID)
 	}
 	if turnMetadata := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state))
@@ -434,6 +444,64 @@ func codexIdentityConfuseEnabled(cfg *config.Config) bool {
 func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 	name := strings.Join([]string{"cli-proxy-api", "codex", "identity-confuse", kind, strings.TrimSpace(authID), strings.TrimSpace(value)}, ":")
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+}
+
+func codexAccountInstallationID(auth *cliproxyauth.Auth) string {
+	seed := codexAccountFingerprintSeed(auth)
+	if seed == "" {
+		return ""
+	}
+	name := strings.Join([]string{"cli-proxy-api", "codex", "account-fingerprint", "installation", seed}, ":")
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+}
+
+func codexAccountFingerprintSeed(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	// A persisted explicit seed has highest precedence. Supply/import tooling can
+	// retain this value while rotating tokens or changing display metadata.
+	if explicit := firstCodexAuthMetadataString(auth,
+		"codex_identity_fingerprint",
+		"codex-identity-fingerprint",
+		"codexIdentityFingerprint",
+	); explicit != "" {
+		return "explicit:" + explicit
+	}
+
+	// Team workspace/account IDs are shared by many members, so email remains a
+	// required part of the normal seed. Lower-casing makes casing-only supplier
+	// updates preserve the same upstream installation identity.
+	email := strings.ToLower(firstCodexAuthMetadataString(auth, "email", "outlook_email"))
+	accountID := firstCodexAuthMetadataString(auth, "chatgpt_account_id", "account_id", "workspace_id", "organization_id")
+	if email != "" {
+		return strings.Join([]string{"account", email, accountID}, ":")
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return "auth-id:" + id
+	}
+	return ""
+}
+
+func firstCodexAuthMetadataString(auth *cliproxyauth.Auth, keys ...string) string {
+	if auth == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if auth.Metadata != nil {
+			if value, ok := auth.Metadata[key].(string); ok {
+				if value = strings.TrimSpace(value); value != "" {
+					return value
+				}
+			}
+		}
+		if auth.Attributes != nil {
+			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
