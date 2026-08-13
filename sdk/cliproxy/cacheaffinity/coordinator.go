@@ -21,9 +21,11 @@ import (
 )
 
 const (
-	defaultMaxEntries     = 65536
-	shardCount            = 64
-	prefixInspectInterval = 5 * time.Second
+	defaultMaxEntries         = 65536
+	defaultMaxSessionRequests = 50
+	defaultMaxSessionDuration = 5 * time.Minute
+	shardCount                = 64
+	prefixInspectInterval     = 5 * time.Second
 )
 
 // Decision separates local routing, upstream prompt caching, and websocket reuse.
@@ -174,13 +176,15 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, cfg *in
 
 // RuntimeSettings contains normalized hot-path settings.
 type RuntimeSettings struct {
-	Enabled                bool    `json:"enabled"`
-	Shadow                 bool    `json:"shadow"`
-	MaxEntries             int     `json:"max_entries"`
-	MaxRetryCredentials    int     `json:"max_retry_credentials"`
-	WebsocketPoolSlots     int     `json:"websocket_pool_slots"`
-	QuotaPreemptUsedRatio  float64 `json:"quota_preempt_used_ratio"`
-	QuotaHardStopUsedRatio float64 `json:"quota_hard_stop_used_ratio"`
+	Enabled                bool          `json:"enabled"`
+	Shadow                 bool          `json:"shadow"`
+	MaxEntries             int           `json:"max_entries"`
+	MaxRetryCredentials    int           `json:"max_retry_credentials"`
+	WebsocketPoolSlots     int           `json:"websocket_pool_slots"`
+	MaxSessionRequests     int           `json:"max_session_requests"`
+	MaxSessionDuration     time.Duration `json:"max_session_duration"`
+	QuotaPreemptUsedRatio  float64       `json:"quota_preempt_used_ratio"`
+	QuotaHardStopUsedRatio float64       `json:"quota_hard_stop_used_ratio"`
 }
 
 // Settings normalizes optional configuration without mutating the config tree.
@@ -195,6 +199,7 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 		MaxEntries:             raw.MaxEntries,
 		MaxRetryCredentials:    raw.MaxRetryCredentials,
 		WebsocketPoolSlots:     raw.WebsocketPoolSlots,
+		MaxSessionRequests:     raw.MaxSessionRequests,
 		QuotaPreemptUsedRatio:  raw.QuotaPreemptUsedRatio,
 		QuotaHardStopUsedRatio: raw.QuotaHardStopUsedRatio,
 	}
@@ -208,6 +213,15 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 		settings.WebsocketPoolSlots = 8
 	} else if settings.WebsocketPoolSlots > 30 {
 		settings.WebsocketPoolSlots = 30
+	}
+	if settings.MaxSessionRequests <= 0 {
+		settings.MaxSessionRequests = defaultMaxSessionRequests
+	}
+	settings.MaxSessionDuration = defaultMaxSessionDuration
+	if rawDuration := strings.TrimSpace(raw.MaxSessionDuration); rawDuration != "" {
+		if parsed, errParse := time.ParseDuration(rawDuration); errParse == nil && parsed > 0 {
+			settings.MaxSessionDuration = parsed
+		}
 	}
 	if settings.QuotaPreemptUsedRatio <= 0 || settings.QuotaPreemptUsedRatio >= 1 {
 		settings.QuotaPreemptUsedRatio = 0.97

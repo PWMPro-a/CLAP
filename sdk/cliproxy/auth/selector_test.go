@@ -2123,6 +2123,37 @@ func TestSessionCache_GetAndRefresh(t *testing.T) {
 	}
 }
 
+func TestSessionCache_BoundedHitsRebalances(t *testing.T) {
+	t.Parallel()
+
+	cache := NewSessionCacheWithBounds(time.Hour, 16, 2, time.Hour)
+	defer cache.Stop()
+	cache.Set("session1", "auth1")
+
+	// Set accounts for the request that established the binding, leaving one
+	// cached request before the two-request bound is reached.
+	for attempt := 0; attempt < 1; attempt++ {
+		if got, ok := cache.GetAndRefresh("session1"); !ok || got != "auth1" {
+			t.Fatalf("GetAndRefresh() #%d = %q, %v", attempt, got, ok)
+		}
+	}
+	if got, ok := cache.GetAndRefresh("session1"); ok || got != "" {
+		t.Fatalf("GetAndRefresh() after hit bound = %q, %v, want empty false", got, ok)
+	}
+}
+
+func TestSessionCache_BoundedAgeRebalances(t *testing.T) {
+	t.Parallel()
+
+	cache := NewSessionCacheWithBounds(time.Hour, 16, 100, 20*time.Millisecond)
+	defer cache.Stop()
+	cache.Set("session1", "auth1")
+	time.Sleep(30 * time.Millisecond)
+	if got, ok := cache.GetAndRefresh("session1"); ok || got != "" {
+		t.Fatalf("GetAndRefresh() after age bound = %q, %v, want empty false", got, ok)
+	}
+}
+
 func TestSessionAffinitySelector_RoundRobinDistribution(t *testing.T) {
 	t.Parallel()
 

@@ -13,6 +13,8 @@ type sessionEntry struct {
 	authID    string
 	expiresAt time.Time
 	aliases   []string
+	boundAt   time.Time
+	hits      int
 }
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
@@ -21,6 +23,8 @@ type SessionCache struct {
 	entries    map[string]sessionEntry
 	ttl        time.Duration
 	maxEntries int
+	maxHits    int
+	maxAge     time.Duration
 	stopCh     chan struct{}
 }
 
@@ -32,6 +36,12 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 
 // NewSessionCacheWithLimit creates a cache with a bounded number of aliases.
 func NewSessionCacheWithLimit(ttl time.Duration, maxEntries int) *SessionCache {
+	return NewSessionCacheWithBounds(ttl, maxEntries, 0, 0)
+}
+
+// NewSessionCacheWithBounds creates a cache whose hot bindings also expire
+// after a bounded request count or wall-clock duration.
+func NewSessionCacheWithBounds(ttl time.Duration, maxEntries, maxHits int, maxAge time.Duration) *SessionCache {
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
@@ -39,6 +49,8 @@ func NewSessionCacheWithLimit(ttl time.Duration, maxEntries int) *SessionCache {
 		entries:    make(map[string]sessionEntry),
 		ttl:        ttl,
 		maxEntries: maxEntries,
+		maxHits:    maxHits,
+		maxAge:     maxAge,
 		stopCh:     make(chan struct{}),
 	}
 	go c.cleanupLoop()
@@ -93,7 +105,13 @@ func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
 		c.removeAliasGroupLocked(entry)
 		return "", false
 	}
+	if (c.maxHits > 0 && entry.hits >= c.maxHits) ||
+		(c.maxAge > 0 && !entry.boundAt.IsZero() && now.Sub(entry.boundAt) >= c.maxAge) {
+		c.removeAliasGroupLocked(entry)
+		return "", false
+	}
 
+	entry.hits++
 	aliases := compactSessionAliases(mergeSessionAliases([]string{sessionID}, entry.aliases...))
 	c.replaceAliasGroupsLocked(entry.authID, now.Add(c.ttl), aliases, entry)
 	return entry.authID, true
@@ -157,10 +175,32 @@ func (c *SessionCache) enforceLimitLocked() {
 }
 
 func (c *SessionCache) replaceAliasGroupsLocked(authID string, expiresAt time.Time, aliases []string, previousGroups ...sessionEntry) {
+	now := time.Now()
+	boundAt := now
+	// SetAliases is called after the request that creates a new binding, so a
+	// fresh binding starts with one consumed request. Rebinding the same auth
+	// preserves its counter without incrementing it again.
+	hits := 1
+	preserved := false
+	for _, previous := range previousGroups {
+		if previous.authID != authID {
+			continue
+		}
+		preserved = true
+		if !previous.boundAt.IsZero() && (boundAt.Equal(now) || previous.boundAt.Before(boundAt)) {
+			boundAt = previous.boundAt
+		}
+		if previous.hits > hits {
+			hits = previous.hits
+		}
+	}
+	if preserved && hits < 1 {
+		hits = 1
+	}
 	for _, previous := range previousGroups {
 		c.removeAliasGroupLocked(previous)
 	}
-	entry := sessionEntry{authID: authID, expiresAt: expiresAt, aliases: aliases}
+	entry := sessionEntry{authID: authID, expiresAt: expiresAt, aliases: aliases, boundAt: boundAt, hits: hits}
 	for _, alias := range aliases {
 		c.entries[alias] = entry
 	}

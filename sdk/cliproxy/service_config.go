@@ -33,6 +33,8 @@ type routingRuntimeState struct {
 	highCacheMode           bool
 	cacheAffinityEnabled    bool
 	cacheAffinityMaxEntries int
+	maxSessionRequests      int
+	maxSessionDuration      time.Duration
 	quotaPreemptUsedRatio   float64
 	quotaHardStopUsedRatio  float64
 }
@@ -58,6 +60,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	cacheSettings := cacheaffinity.Settings(cfg)
 	state.cacheAffinityEnabled = cacheSettings.Enabled && !cacheSettings.Shadow
 	state.cacheAffinityMaxEntries = cacheSettings.MaxEntries
+	state.maxSessionRequests = cacheSettings.MaxSessionRequests
+	state.maxSessionDuration = cacheSettings.MaxSessionDuration
 	state.quotaPreemptUsedRatio = cacheSettings.QuotaPreemptUsedRatio
 	state.quotaHardStopUsedRatio = cacheSettings.QuotaHardStopUsedRatio
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -85,6 +89,8 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 			HighCacheMode:          state.highCacheMode,
 			CacheAffinityEnabled:   state.cacheAffinityEnabled,
 			MaxEntries:             state.cacheAffinityMaxEntries,
+			MaxSessionRequests:     state.maxSessionRequests,
+			MaxSessionDuration:     state.maxSessionDuration,
 			QuotaPreemptUsedRatio:  state.quotaPreemptUsedRatio,
 			QuotaHardStopUsedRatio: state.quotaHardStopUsedRatio,
 		})

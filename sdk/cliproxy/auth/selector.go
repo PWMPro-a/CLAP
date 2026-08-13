@@ -643,6 +643,8 @@ type SessionAffinityConfig struct {
 	HighCacheMode          bool
 	CacheAffinityEnabled   bool
 	MaxEntries             int
+	MaxSessionRequests     int
+	MaxSessionDuration     time.Duration
 	QuotaPreemptUsedRatio  float64
 	QuotaHardStopUsedRatio float64
 }
@@ -671,8 +673,8 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	}
 	return &SessionAffinitySelector{
 		fallback:               cfg.Fallback,
-		cache:                  NewSessionCacheWithLimit(cfg.TTL, cfg.MaxEntries),
-		failoverCache:          NewSessionCacheWithLimit(cfg.TTL, cfg.MaxEntries),
+		cache:                  NewSessionCacheWithBounds(cfg.TTL, cfg.MaxEntries, cfg.MaxSessionRequests, cfg.MaxSessionDuration),
+		failoverCache:          NewSessionCacheWithBounds(cfg.TTL, cfg.MaxEntries, cfg.MaxSessionRequests, cfg.MaxSessionDuration),
 		highCacheMode:          cfg.HighCacheMode,
 		cacheAffinityEnabled:   cfg.CacheAffinityEnabled,
 		quotaPreemptUsedRatio:  cfg.QuotaPreemptUsedRatio,
@@ -811,7 +813,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	if fallbackKey != "" {
-		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
+		if cachedAuthID, ok := s.cache.GetAndRefresh(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					bind(auth.ID)

@@ -58,6 +58,8 @@ type scheduledAuthMeta struct {
 	priority          int
 	weight            int64
 	websocketEnabled  bool
+	canonicalIdentity string
+	canonicalScore    int
 	supportedModelSet map[string]struct{}
 	selectionModelSet map[string]string
 }
@@ -266,6 +268,7 @@ func (s *authScheduler) snapshotCandidates(providers []string, model string) []*
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	seen := make(map[string]struct{})
+	canonical := make(map[string]*Auth)
 	out := make([]*Auth, 0)
 	for _, providerKey := range normalized {
 		providerState := s.providers[providerKey]
@@ -281,8 +284,17 @@ func (s *authScheduler) snapshotCandidates(providers []string, model string) []*
 				continue
 			}
 			seen[authID] = struct{}{}
-			out = append(out, entry.auth.Clone())
+			candidate := entry.auth.Clone()
+			identityKey := codexCanonicalIdentityKey(candidate)
+			if identityKey == "" {
+				out = append(out, candidate)
+				continue
+			}
+			canonical[identityKey] = preferredCanonicalAuth(canonical[identityKey], candidate)
 		}
+	}
+	for _, candidate := range canonical {
+		out = append(out, candidate)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -769,6 +781,8 @@ func buildScheduledAuthMetaWithSelectionModels(auth *Auth, selectionModels map[s
 		priority:          authPriority(auth),
 		weight:            authWeight(auth),
 		websocketEnabled:  authWebsocketsEnabled(auth),
+		canonicalIdentity: codexCanonicalIdentityKey(auth),
+		canonicalScore:    canonicalAuthPreferenceScore(auth),
 		supportedModelSet: modelSet,
 		selectionModelSet: selectionModelSet,
 	}
@@ -894,9 +908,13 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	previousNextRetryAt := entry.nextRetryAt
 	previousPriority := 0
 	previousWebsocketEnabled := false
+	previousCanonicalIdentity := ""
+	previousCanonicalScore := 0
 	if entry.meta != nil {
 		previousPriority = entry.meta.priority
 		previousWebsocketEnabled = entry.meta.websocketEnabled
+		previousCanonicalIdentity = entry.meta.canonicalIdentity
+		previousCanonicalScore = entry.meta.canonicalScore
 	}
 
 	entry.meta = meta
@@ -916,7 +934,9 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		entry.nextRetryAt = next
 	}
 
-	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousWebsocketEnabled == meta.websocketEnabled {
+	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority &&
+		previousWebsocketEnabled == meta.websocketEnabled && previousCanonicalIdentity == meta.canonicalIdentity &&
+		previousCanonicalScore == meta.canonicalScore {
 		return
 	}
 	m.rebuildIndexesLocked()
@@ -1092,10 +1112,7 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 	total := 0
 	cooldownCount := 0
 	earliest := time.Time{}
-	for _, entry := range m.entries {
-		if predicate != nil && !predicate(entry) {
-			continue
-		}
+	for _, entry := range m.uniqueCandidateEntriesLocked(predicate) {
 		total++
 		if entry == nil || entry.auth == nil {
 			continue
@@ -1116,11 +1133,32 @@ func (m *modelScheduler) candidateAuthsLocked(predicate func(*scheduledAuth) boo
 		return nil
 	}
 	out := make([]*Auth, 0, len(m.entries))
+	for _, entry := range m.uniqueCandidateEntriesLocked(predicate) {
+		out = append(out, entry.auth)
+	}
+	return out
+}
+
+func (m *modelScheduler) uniqueCandidateEntriesLocked(predicate func(*scheduledAuth) bool) []*scheduledAuth {
+	if m == nil {
+		return nil
+	}
+	out := make([]*scheduledAuth, 0, len(m.entries))
+	canonical := make(map[string]*scheduledAuth)
 	for _, entry := range m.entries {
 		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
 			continue
 		}
-		out = append(out, entry.auth)
+		identityKey := codexCanonicalIdentityKey(entry.auth)
+		if identityKey == "" {
+			out = append(out, entry)
+			continue
+		}
+		current := canonical[identityKey]
+		canonical[identityKey] = preferScheduledCanonicalEntry(current, entry)
+	}
+	for _, entry := range canonical {
+		out = append(out, entry)
 	}
 	return out
 }
@@ -1142,7 +1180,7 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 	m.priorityOrder = m.priorityOrder[:0]
 	m.blocked = m.blocked[:0]
 	priorityBuckets := make(map[int][]*scheduledAuth)
-	for _, entry := range m.entries {
+	for _, entry := range m.uniqueCandidateEntriesLocked(nil) {
 		if entry == nil || entry.auth == nil {
 			continue
 		}

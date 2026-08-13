@@ -712,6 +712,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
+	var terminalPeerSnapshots []*Auth
 	cooldownStateChanged := false
 
 	m.mu.Lock()
@@ -882,6 +883,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 
 		auth.maybeFreezeRuntimeResult(result, now, runtimeStickyBypassSessionFromContext(ctx))
+		if terminalCredential {
+			terminalPeerSnapshots = m.propagateTerminalCredentialLocked(auth, result.Error, now)
+		}
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
@@ -892,6 +896,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
+	}
+	if authSnapshot != nil && isTerminalCredentialResultError(result.Error) {
+		m.invalidateSessionAffinity(authSnapshot.ID)
+	}
+	for _, peer := range terminalPeerSnapshots {
+		if peer == nil {
+			continue
+		}
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(peer)
+		}
+		_ = m.persist(ctx, peer)
+		m.invalidateSessionAffinity(peer.ID)
+		m.hook.OnAuthUpdated(ctx, peer.Clone())
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -911,6 +929,46 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+func (m *Manager) propagateTerminalCredentialLocked(source *Auth, resultErr *Error, now time.Time) []*Auth {
+	if m == nil || source == nil || resultErr == nil {
+		return nil
+	}
+	identityKey := codexCanonicalIdentityKey(source)
+	workspaceKey := ""
+	if strings.Contains(strings.ToLower(resultErr.Message), "deactivated_workspace") ||
+		strings.Contains(strings.ToLower(resultErr.Code), "deactivated_workspace") {
+		workspaceKey = codexWorkspaceIdentityKey(source)
+	}
+	if identityKey == "" && workspaceKey == "" {
+		return nil
+	}
+	peers := make([]*Auth, 0)
+	for authID, candidate := range m.auths {
+		if candidate == nil || authID == source.ID {
+			continue
+		}
+		sameIdentity := identityKey != "" && codexCanonicalIdentityKey(candidate) == identityKey
+		sameWorkspace := workspaceKey != "" && codexWorkspaceIdentityKey(candidate) == workspaceKey
+		if !sameIdentity && !sameWorkspace {
+			continue
+		}
+		candidate.Disabled = true
+		candidate.Unavailable = true
+		candidate.Status = StatusDisabled
+		candidate.StatusMessage = "credential invalidated"
+		candidate.LastError = cloneError(resultErr)
+		candidate.NextRefreshAfter = time.Time{}
+		candidate.NextRetryAfter = time.Time{}
+		candidate.UpdatedAt = now
+		if candidate.Metadata == nil {
+			candidate.Metadata = make(map[string]any)
+		}
+		candidate.Metadata["disabled"] = true
+		peers = append(peers, candidate.Clone())
+	}
+	return peers
 }
 
 func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool) {

@@ -582,6 +582,7 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		terminal := isTerminalCredentialFailure(err)
 		shouldReschedule := false
 		var persistAuth *Auth
+		var terminalPeerSnapshots []*Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.LastError = refreshErrorFromError(err)
@@ -597,6 +598,7 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 				}
 				current.Metadata["disabled"] = true
 				persistAuth = current.Clone()
+				terminalPeerSnapshots = m.propagateTerminalCredentialLocked(current, current.LastError, now)
 			} else if unauthorized {
 				current.NextRefreshAfter = time.Time{}
 				current.Unavailable = true
@@ -616,6 +618,20 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 			if errPersist := m.persist(context.WithoutCancel(ctx), persistAuth); errPersist != nil {
 				log.Warnf("persist terminal credential failure for %s (%s): %v", auth.Provider, auth.ID, errPersist)
 			}
+			m.invalidateSessionAffinity(persistAuth.ID)
+		}
+		for _, peer := range terminalPeerSnapshots {
+			if peer == nil {
+				continue
+			}
+			if m.scheduler != nil {
+				m.scheduler.upsertAuth(peer)
+			}
+			if errPersist := m.persist(context.WithoutCancel(ctx), peer); errPersist != nil {
+				log.Warnf("persist propagated terminal credential failure for %s (%s): %v", peer.Provider, peer.ID, errPersist)
+			}
+			m.invalidateSessionAffinity(peer.ID)
+			m.hook.OnAuthUpdated(ctx, peer.Clone())
 		}
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)

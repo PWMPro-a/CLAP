@@ -182,6 +182,8 @@ type CodexCacheAffinityConfig struct {
 	MaxEntries             int     `yaml:"max-entries" json:"max-entries"`
 	MaxRetryCredentials    int     `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	WebsocketPoolSlots     int     `yaml:"websocket-pool-slots" json:"websocket-pool-slots"`
+	MaxSessionRequests     int     `yaml:"max-session-requests" json:"max-session-requests"`
+	MaxSessionDuration     string  `yaml:"max-session-duration" json:"max-session-duration"`
 	QuotaPreemptUsedRatio  float64 `yaml:"quota-preempt-used-ratio" json:"quota-preempt-used-ratio"`
 	QuotaHardStopUsedRatio float64 `yaml:"quota-hard-stop-used-ratio" json:"quota-hard-stop-used-ratio"`
 }
