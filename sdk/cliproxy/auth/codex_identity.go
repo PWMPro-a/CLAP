@@ -27,6 +27,9 @@ func codexCanonicalIdentityKey(auth *Auth) string {
 }
 
 func codexWorkspaceIdentityKey(auth *Auth) string {
+	if auth == nil || !strings.EqualFold(executorKeyFromAuth(auth), "codex") {
+		return ""
+	}
 	workspace := codexWorkspaceIdentityValue(auth)
 	if workspace == "" {
 		return ""

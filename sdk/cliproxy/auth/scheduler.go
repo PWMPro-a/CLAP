@@ -268,7 +268,7 @@ func (s *authScheduler) snapshotCandidates(providers []string, model string) []*
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	seen := make(map[string]struct{})
-	canonical := make(map[string]*Auth)
+	canonical := make(map[string]*scheduledAuth)
 	out := make([]*Auth, 0)
 	for _, providerKey := range normalized {
 		providerState := s.providers[providerKey]
@@ -284,17 +284,16 @@ func (s *authScheduler) snapshotCandidates(providers []string, model string) []*
 				continue
 			}
 			seen[authID] = struct{}{}
-			candidate := entry.auth.Clone()
-			identityKey := codexCanonicalIdentityKey(candidate)
+			identityKey := codexCanonicalIdentityKey(entry.auth)
 			if identityKey == "" {
-				out = append(out, candidate)
+				out = append(out, entry.auth.Clone())
 				continue
 			}
-			canonical[identityKey] = preferredCanonicalAuth(canonical[identityKey], candidate)
+			canonical[identityKey] = preferScheduledCanonicalEntry(canonical[identityKey], entry)
 		}
 	}
-	for _, candidate := range canonical {
-		out = append(out, candidate)
+	for _, entry := range canonical {
+		out = append(out, entry.auth.Clone())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -73,6 +74,24 @@ func TestNewCandidateModeKeepsReadyDuplicateWhenPreferredCopyIsDisabled(t *testi
 	}
 	if got == nil || got.ID != "ready-copy" {
 		t.Fatalf("pick = %#v, want ready-copy", got)
+	}
+}
+
+func TestCandidateSnapshotKeepsReadyDuplicateWhenPreferredCopyIsCooling(t *testing.T) {
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	scheduler.upsertAuth(&Auth{
+		ID: "ready-copy", Provider: "codex", Status: StatusActive,
+		Metadata: map[string]any{"chatgpt_account_id": "workspace-one", "email": "member@example.com"},
+	})
+	scheduler.upsertAuth(&Auth{
+		ID: "preferred-cooling", Provider: "codex", Status: StatusError, Unavailable: true,
+		NextRetryAfter: time.Now().Add(time.Hour),
+		Metadata:       map[string]any{"chatgpt_account_id": "workspace-one", "email": "member@example.com", "codex_identity_fingerprint": "stable"},
+	})
+
+	candidates := scheduler.snapshotCandidates([]string{"codex"}, "")
+	if len(candidates) != 1 || candidates[0] == nil || candidates[0].ID != "ready-copy" {
+		t.Fatalf("snapshotCandidates() = %#v, want only ready-copy", candidates)
 	}
 }
 
