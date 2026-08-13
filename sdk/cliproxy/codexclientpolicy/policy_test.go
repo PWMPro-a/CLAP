@@ -15,17 +15,18 @@ func TestEvaluateIdentityVersionAndFingerprint(t *testing.T) {
 	tests := []struct {
 		name    string
 		headers http.Header
+		body    []byte
 		want    bool
 		reason  string
 	}{
-		{name: "official", headers: http.Header{"User-Agent": {"codex_cli_rs/0.142.0 (linux)"}, "X-Codex-Window-Id": {"window"}}, want: true, reason: ReasonOfficialUserAgent},
+		{name: "official", headers: completeOfficialFingerprintHeaders(), body: completeOfficialFingerprintBody(), want: true, reason: ReasonOfficialUserAgent},
 		{name: "missing fingerprint", headers: http.Header{"User-Agent": {"codex_cli_rs/0.142.0 (linux)"}}, reason: ReasonFingerprintMissing},
 		{name: "too old", headers: http.Header{"User-Agent": {"codex_cli_rs/0.141.0 (linux)"}, "X-Codex-Window-Id": {"window"}}, reason: ReasonVersionTooLow},
 		{name: "unknown client", headers: http.Header{"User-Agent": {"curl/8.0"}, "X-Codex-Window-Id": {"window"}}, reason: ReasonIdentityMissing},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := Evaluate(Request{Headers: test.headers}, policy)
+			got := Evaluate(Request{Headers: test.headers, Body: test.body}, policy)
 			if got.Allowed != test.want || got.Reason != test.reason {
 				t.Fatalf("Evaluate() = %+v, want allowed=%v reason=%q", got, test.want, test.reason)
 			}
@@ -33,15 +34,56 @@ func TestEvaluateIdentityVersionAndFingerprint(t *testing.T) {
 	}
 }
 
-func TestDefaultEngineFingerprintSignalsMatchSub2Defaults(t *testing.T) {
+func completeOfficialFingerprintHeaders() http.Header {
+	return http.Header{
+		"User-Agent":        {"codex_cli_rs/0.142.0 (linux)"},
+		"X-Codex-Window-Id": {"window"},
+		"Session-Id":        {"session"},
+		"Thread-Id":         {"thread"},
+	}
+}
+
+func completeOfficialFingerprintBody() []byte {
+	return []byte(`{"client_metadata":{"x-codex-installation-id":"installation"}}`)
+}
+
+func TestDefaultEngineFingerprintSignalsMatchStrictQuotaProtectionProfile(t *testing.T) {
 	if len(DefaultEngineFingerprintSignals) != 4 {
 		t.Fatalf("default signal count = %d, want 4", len(DefaultEngineFingerprintSignals))
 	}
 	for index, signal := range DefaultEngineFingerprintSignals {
-		wantRequired := index == 0
-		if signal.Required != wantRequired {
-			t.Fatalf("default signal %d required = %v, want %v", index, signal.Required, wantRequired)
+		if !signal.Required {
+			t.Fatalf("default signal %d required = false, want true", index)
 		}
+	}
+}
+
+func TestDefaultEngineFingerprintSignalsRequireCompleteOfficialFingerprint(t *testing.T) {
+	headers := completeOfficialFingerprintHeaders()
+	body := completeOfficialFingerprintBody()
+	if result := Evaluate(Request{Headers: headers, Body: body}, Policy{EngineFingerprintSignals: DefaultEngineFingerprintSignals}); !result.Allowed {
+		t.Fatalf("complete official fingerprint rejected: %+v", result)
+	}
+
+	for _, missing := range []string{"x-codex", "session", "thread", "body"} {
+		t.Run("missing_"+missing, func(t *testing.T) {
+			candidateHeaders := headers.Clone()
+			candidateBody := append([]byte(nil), body...)
+			switch missing {
+			case "x-codex":
+				candidateHeaders.Del("X-Codex-Window-Id")
+			case "session":
+				candidateHeaders.Del("Session-Id")
+			case "thread":
+				candidateHeaders.Del("Thread-Id")
+			case "body":
+				candidateBody = nil
+			}
+			result := Evaluate(Request{Headers: candidateHeaders, Body: candidateBody}, Policy{EngineFingerprintSignals: DefaultEngineFingerprintSignals})
+			if result.Allowed || result.Reason != ReasonFingerprintMissing {
+				t.Fatalf("Evaluate() = %+v, want missing fingerprint rejection", result)
+			}
+		})
 	}
 }
 
@@ -89,7 +131,9 @@ func TestEvaluateWhitelistAndAppServer(t *testing.T) {
 	}
 
 	appServer := Policy{AllowAppServerClients: true, EngineFingerprintSignals: DefaultEngineFingerprintSignals}
-	result = Evaluate(Request{Headers: http.Header{"User-Agent": {"third-party/1.0"}, "X-Codex-Window-Id": {"window"}}}, appServer)
+	appServerHeaders := completeOfficialFingerprintHeaders()
+	appServerHeaders.Set("User-Agent", "third-party/1.0")
+	result = Evaluate(Request{Headers: appServerHeaders, Body: completeOfficialFingerprintBody()}, appServer)
 	if !result.Allowed || result.Reason != ReasonAppServer {
 		t.Fatalf("app-server result = %+v", result)
 	}
@@ -137,11 +181,7 @@ func BenchmarkEvaluate(b *testing.B) {
 		MaxCodexVersion:          "0.200.0",
 		EngineFingerprintSignals: DefaultEngineFingerprintSignals,
 	}
-	headers := http.Header{
-		"User-Agent":        {"codex_cli_rs/0.142.0 (linux)"},
-		"X-Codex-Window-Id": {"window"},
-	}
-	request := Request{Headers: headers}
+	request := Request{Headers: completeOfficialFingerprintHeaders(), Body: completeOfficialFingerprintBody()}
 	b.ReportAllocs()
 	for b.Loop() {
 		result := Evaluate(request, policy)

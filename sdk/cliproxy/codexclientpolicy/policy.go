@@ -66,9 +66,9 @@ type Result struct {
 
 var DefaultEngineFingerprintSignals = []EngineFingerprintSignal{
 	{Type: SignalHeaderPrefix, Match: []string{"x-codex-"}, Required: true},
-	{Type: SignalHeaderExact, Match: []string{"session-id", "session_id"}},
-	{Type: SignalHeaderExact, Match: []string{"thread-id", "thread_id"}},
-	{Type: SignalBodyPath, Match: []string{"client_metadata.x-codex-window-id", "client_metadata.x-codex-installation-id"}},
+	{Type: SignalHeaderExact, Match: []string{"session-id", "session_id"}, Required: true},
+	{Type: SignalHeaderExact, Match: []string{"thread-id", "thread_id"}, Required: true},
+	{Type: SignalBodyPath, Match: []string{"client_metadata.x-codex-window-id", "client_metadata.x-codex-installation-id"}, Required: true},
 }
 
 var officialUserAgentPrefixes = []string{

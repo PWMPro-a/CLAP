@@ -249,15 +249,15 @@ codex:
         required: true
       - type: header_exact
         match: ["session-id", "session_id"]
-        required: false
+        required: true
       - type: header_exact
         match: ["thread-id", "thread_id"]
-        required: false
+        required: true
       - type: body_path
         match:
           - "client_metadata.x-codex-window-id"
           - "client_metadata.x-codex-installation-id"
-        required: false
+        required: true
   # Independent cache-affinity coordinator. Shadow mode computes stable route,
   # upstream cache, websocket pool, and prefix fingerprints without changing routing.
   cache-affinity:
