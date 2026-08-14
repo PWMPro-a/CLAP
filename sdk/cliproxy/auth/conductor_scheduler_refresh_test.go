@@ -229,6 +229,36 @@ func TestManager_DeactivatedWorkspaceExecutionFailureDisablesAuth(t *testing.T) 
 	}
 }
 
+func TestTerminalCredentialFailureMarkers(t *testing.T) {
+	for _, message := range []string{
+		"Encountered invalidated oauth token for user",
+		`upstream response: {"error":{"code":"token_revoked"}}`,
+	} {
+		t.Run(message, func(t *testing.T) {
+			resultErr := resultErrorFromError(errors.New(message))
+			if resultErr == nil || resultErr.Code != terminalCredentialErrorCode || resultErr.Retryable {
+				t.Fatalf("result error = %#v, want terminal credential error", resultErr)
+			}
+
+			manager := NewManager(nil, nil, nil)
+			auth := &Auth{ID: "terminal-marker", Provider: "codex"}
+			if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+			manager.MarkResult(context.Background(), Result{
+				AuthID:   auth.ID,
+				Provider: auth.Provider,
+				Model:    "gpt-5.6-sol",
+				Error:    resultErr,
+			})
+			updated, ok := manager.GetByID(auth.ID)
+			if !ok || updated == nil || !updated.Disabled || updated.Status != StatusDisabled {
+				t.Fatalf("terminal marker auth = %#v, want disabled", updated)
+			}
+		})
+	}
+}
+
 func TestManager_RefreshSchedulerEntry_RebuildsSupportedModelSetAfterModelRegistration(t *testing.T) {
 	ctx := context.Background()
 

@@ -692,6 +692,8 @@ func isTerminalCredentialFailure(err error) bool {
 		"refresh_token_reused",
 		"refresh_token_invalidated",
 		"token_invalidated",
+		"invalidated oauth token",
+		"token_revoked",
 		"account_deactivated",
 		"deactivated_workspace",
 		"personal access token owner is inactive",

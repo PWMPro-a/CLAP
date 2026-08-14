@@ -516,23 +516,111 @@ func TestManager_TransientCodexAccountContextFallsBackWithoutPoisoningAuth(t *te
 		t.Fatalf("register good auth: %v", errRegister)
 	}
 
-	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute: %v", errExecute)
+	request := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		resp, errExecute := m.Execute(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{})
+		if errExecute != nil {
+			t.Fatalf("execute %d: %v", i, errExecute)
+		}
+		if string(resp.Payload) != goodAuth.ID {
+			t.Fatalf("execute %d payload = %q, want %q", i, string(resp.Payload), goodAuth.ID)
+		}
 	}
-	if string(resp.Payload) != goodAuth.ID {
-		t.Fatalf("payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
 	}
 
 	updatedBad, ok := m.GetByID(badAuth.ID)
 	if !ok || updatedBad == nil {
 		t.Fatal("transient auth missing")
 	}
-	if updatedBad.Unavailable || updatedBad.Status == StatusError || updatedBad.LastError != nil || updatedBad.StatusMessage != "" {
-		t.Fatalf("transient context failure poisoned auth: %#v", updatedBad)
+	if updatedBad.Disabled || updatedBad.Status == StatusDisabled {
+		t.Fatalf("transient context failure disabled auth: %#v", updatedBad)
 	}
-	if state := updatedBad.ModelStates[model]; state != nil && state.Unavailable {
-		t.Fatalf("transient context failure poisoned model state: %#v", state)
+	state := updatedBad.ModelStates[model]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("transient context failure model state = %#v, want active cooldown", state)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(updatedBad, "gpt-5.5", time.Now()); blocked {
+		t.Fatalf("transient context failure blocked unrelated model: %#v", updatedBad)
+	}
+	remaining := time.Until(state.NextRetryAfter)
+	if remaining < 29*time.Minute || remaining > 31*time.Minute {
+		t.Fatalf("transient context cooldown = %v, want about 30m", remaining)
+	}
+}
+
+func TestManagerExecuteStream_TransientCodexAccountContextFallsBackAndSuspendsModel(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "codex",
+		streamFirstErrors: map[string]error{
+			"aa-context-race": transientCredentialContextTestError{},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-5.6-sol"
+	badAuth := &Auth{ID: "aa-context-race", Provider: "codex"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "codex"}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{Stream: true})
+		if errExecute != nil {
+			t.Fatalf("execute stream %d: %v", i, errExecute)
+		}
+		var payload []byte
+		for chunk := range streamResult.Chunks {
+			if chunk.Err != nil {
+				t.Fatalf("execute stream %d chunk error: %v", i, chunk.Err)
+			}
+			payload = append(payload, chunk.Payload...)
+		}
+		if string(payload) != goodAuth.ID {
+			t.Fatalf("execute stream %d payload = %q, want %q", i, string(payload), goodAuth.ID)
+		}
+	}
+
+	got := executor.StreamCalls()
+	want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil || updatedBad.Disabled || updatedBad.Status == StatusDisabled {
+		t.Fatalf("transient auth = %#v, want registered and enabled", updatedBad)
+	}
+	state := updatedBad.ModelStates[model]
+	if state == nil || !state.Unavailable || state.NextRetryAfter.IsZero() {
+		t.Fatalf("transient stream model state = %#v, want active cooldown", state)
 	}
 }
 

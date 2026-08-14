@@ -783,7 +783,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
-					if isModelSupportResultError(result.Error) {
+					if isTransientCredentialContextResultError(result.Error) {
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "transient_credential_context"
+						shouldSuspendModel = true
+					} else if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
@@ -1423,8 +1428,7 @@ func resultErrorFromError(err error) *Error {
 // Connection lifecycle is intentionally separate from request_scoped so transport
 // drops do not also stop credential rotation via isRequestInvalidError.
 func shouldSkipCredentialCooldown(err *Error) bool {
-	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) ||
-		isTransientCredentialContextResultError(err)
+	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err)
 }
 
 func isTransientCredentialContextError(err error) bool {
