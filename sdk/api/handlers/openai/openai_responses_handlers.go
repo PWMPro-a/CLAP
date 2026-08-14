@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/optimize-multi-agent-v2"
@@ -518,15 +519,82 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("X-Accel-Buffering", "no")
 	}
 	framer := &responsesSSEFramer{}
+
+	type streamExecutionResult struct {
+		data            <-chan []byte
+		upstreamHeaders http.Header
+		errs            <-chan *interfaces.ErrorMessage
+	}
+	execute := func() streamExecutionResult {
+		data, upstreamHeaders, errs := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+		return streamExecutionResult{data: data, upstreamHeaders: upstreamHeaders, errs: errs}
+	}
+
+	var execution streamExecutionResult
+	streamStarted := false
+	bootstrapDelay := handlers.StreamingBootstrapKeepAliveDelay(h.Cfg)
+	if bootstrapDelay <= 0 {
+		execution = execute()
+	} else {
+		resultChan := make(chan streamExecutionResult, 1)
+		go func() {
+			resultChan <- execute()
+		}()
+
+		bootstrapTimer := time.NewTimer(bootstrapDelay)
+		defer bootstrapTimer.Stop()
+		var keepAlive *time.Ticker
+		var keepAliveC <-chan time.Time
+		stopKeepAlive := func() {
+			if keepAlive != nil {
+				keepAlive.Stop()
+				keepAlive = nil
+				keepAliveC = nil
+			}
+		}
+		defer stopKeepAlive()
+
+		for {
+			select {
+			case <-c.Request.Context().Done():
+				cliCancel(c.Request.Context().Err())
+				return
+			case execution = <-resultChan:
+				stopKeepAlive()
+				goto streamExecutionReady
+			case <-bootstrapTimer.C:
+				setSSEHeaders()
+				_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+				flusher.Flush()
+				streamStarted = true
+				if interval := handlers.StreamingKeepAliveInterval(h.Cfg); interval > 0 {
+					keepAlive = time.NewTicker(interval)
+					keepAliveC = keepAlive.C
+				}
+			case <-keepAliveC:
+				_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+				flusher.Flush()
+			}
+		}
+	}
+
+streamExecutionReady:
+	dataChan := execution.data
+	upstreamHeaders := execution.upstreamHeaders
+	errChan := execution.errs
+	if streamStarted {
+		h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
+		return
+	}
 
 	// Peek at the first chunk
 	for {

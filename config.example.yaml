@@ -354,8 +354,9 @@ ws-auth: true
 nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
-#   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
-#   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   bootstrap-keepalive-millis: 150 # Default: 0 (disabled). Emit the first SSE comment while upstream bootstrap is still pending.
+#   keepalive-seconds: 10           # Default: 0 (disabled). Continue SSE comments while the stream is idle.
+#   bootstrap-retries: 1            # Default: 0 (disabled). Retries before first byte is sent.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.

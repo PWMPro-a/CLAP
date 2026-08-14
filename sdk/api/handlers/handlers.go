@@ -121,6 +121,20 @@ func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// StreamingBootstrapKeepAliveDelay returns how long a streaming handler may wait
+// for the upstream bootstrap result before committing an SSE comment heartbeat.
+// Returning 0 disables the bootstrap heartbeat.
+func StreamingBootstrapKeepAliveDelay(cfg *config.SDKConfig) time.Duration {
+	millis := 0
+	if cfg != nil {
+		millis = cfg.Streaming.BootstrapKeepAliveMillis
+	}
+	if millis <= 0 {
+		return 0
+	}
+	return time.Duration(millis) * time.Millisecond
+}
+
 // NonStreamingKeepAliveInterval returns the keep-alive interval for non-streaming responses.
 // Returning 0 disables keep-alives (default when unset).
 func NonStreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {

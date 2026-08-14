@@ -77,44 +77,11 @@ func TestOpenAIResponsesSSETTFTBudget(t *testing.T) {
 	}))
 	t.Cleanup(upstream.Close)
 
-	runtimeConfig := &internalconfig.Config{
-		Routing: internalconfig.RoutingConfig{HighCacheMode: true, NewCandidateMode: true},
-	}
-	executor := providerexecutor.NewCodexExecutor(runtimeConfig)
-	selector := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-		Fallback:      &coreauth.RoundRobinSelector{},
-		TTL:           time.Minute,
-		HighCacheMode: true,
-	})
-	t.Cleanup(selector.Stop)
-	manager := coreauth.NewManager(nil, selector, nil)
-	manager.SetConfig(runtimeConfig)
-	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{
-		ID:       "handler-ttft-auth",
-		Provider: executor.Identifier(),
-		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"base_url": upstream.URL,
-			"api_key":  "ttft-test-key",
-		},
-	}
-	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
-	}
-	const model = "handler-ttft-model"
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
-	manager.RefreshSchedulerEntry(auth.ID)
-	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
-
-	base := handlers.NewBaseAPIHandlers(&runtimeConfig.SDKConfig, manager)
-	handler := NewOpenAIResponsesAPIHandler(base)
-	engine := gin.New()
-	engine.POST("/v1/responses", handler.Responses)
+	engine := newResponsesTTFTTestEngine(t, upstream.URL, internalconfig.StreamingConfig{})
 
 	measure := func() (time.Duration, error) {
 		recorder := newFirstWriteRecorder()
-		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"`+model+`","stream":true,"input":"hello"}`))
+		request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"handler-ttft-model","stream":true,"input":"hello"}`))
 		request.Header.Set("Content-Type", "application/json")
 		started := time.Now()
 		done := make(chan struct{})
@@ -174,6 +141,126 @@ func TestOpenAIResponsesSSETTFTBudget(t *testing.T) {
 		}
 	}
 	assertResponsesSSETTFTBudget(t, "concurrent-16", concurrent, 230*time.Millisecond, 50*time.Millisecond)
+}
+
+func TestOpenAIResponsesSSEBootstrapKeepAlive(t *testing.T) {
+	const (
+		bootstrapDelay = 100 * time.Millisecond
+		upstreamDelay  = 2200 * time.Millisecond
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		timer := time.NewTimer(upstreamDelay)
+		defer timer.Stop()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+		}
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_bootstrap\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+		flusher.Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	engine := newResponsesTTFTTestEngine(t, upstream.URL, internalconfig.StreamingConfig{
+		BootstrapKeepAliveMillis: int(bootstrapDelay / time.Millisecond),
+		KeepAliveSeconds:         1,
+	})
+	recorder := newFirstWriteRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"handler-ttft-model","stream":true,"input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	started := time.Now()
+	done := make(chan struct{})
+	go func() {
+		engine.ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	var firstWrite time.Time
+	select {
+	case firstWrite = <-recorder.firstWrite:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bootstrap SSE heartbeat")
+	}
+	if elapsed := firstWrite.Sub(started); elapsed < 70*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Fatalf("bootstrap first write = %s, want near %s", elapsed, bootstrapDelay)
+	}
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for stream completion")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if count := strings.Count(body, ": keep-alive\n\n"); count < 3 {
+		t.Fatalf("keep-alive count = %d, want initial plus periodic heartbeats: %q", count, body)
+	}
+	if !strings.Contains(body, `"id":"resp_bootstrap"`) {
+		t.Fatalf("missing upstream completion after heartbeats: %q", body)
+	}
+}
+
+func TestOpenAIResponsesSSEBootstrapKeepsImmediateHTTPError(t *testing.T) {
+	engine := newResponsesTTFTTestEngine(t, "http://127.0.0.1:1", internalconfig.StreamingConfig{
+		BootstrapKeepAliveMillis: 150,
+		KeepAliveSeconds:         1,
+	})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"missing-model","stream":true,"input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(recorder, request)
+
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("immediate selection error was committed as SSE 200: %q", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), ": keep-alive") {
+		t.Fatalf("immediate error unexpectedly emitted bootstrap heartbeat: %q", recorder.Body.String())
+	}
+}
+
+func newResponsesTTFTTestEngine(t *testing.T, upstreamURL string, streaming internalconfig.StreamingConfig) *gin.Engine {
+	t.Helper()
+	runtimeConfig := &internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{Streaming: streaming},
+		Routing:   internalconfig.RoutingConfig{HighCacheMode: true, NewCandidateMode: true},
+	}
+	executor := providerexecutor.NewCodexExecutor(runtimeConfig)
+	selector := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+		Fallback:      &coreauth.RoundRobinSelector{},
+		TTL:           time.Minute,
+		HighCacheMode: true,
+	})
+	t.Cleanup(selector.Stop)
+	manager := coreauth.NewManager(nil, selector, nil)
+	manager.SetConfig(runtimeConfig)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{
+		ID:       "handler-ttft-auth",
+		Provider: executor.Identifier(),
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"base_url": upstreamURL,
+			"api_key":  "ttft-test-key",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	const model = "handler-ttft-model"
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	manager.RefreshSchedulerEntry(auth.ID)
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	base := handlers.NewBaseAPIHandlers(&runtimeConfig.SDKConfig, manager)
+	handler := NewOpenAIResponsesAPIHandler(base)
+	engine := gin.New()
+	engine.POST("/v1/responses", handler.Responses)
+	return engine
 }
 
 func assertResponsesSSETTFTBudget(t *testing.T, name string, samples []time.Duration, ttftBudget, overheadBudget time.Duration) {
