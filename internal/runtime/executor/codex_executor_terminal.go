@@ -617,10 +617,20 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
+	err.transientCredentialContext = isCodexTransientAccountContextError(statusCode, body)
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func isCodexTransientAccountContextError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(string(body)))
+	return strings.Contains(lower, "model is not supported when using codex with a chatgpt account") ||
+		strings.Contains(lower, "model is unsupported when using codex with a chatgpt account")
 }
 
 func classifyCodexStatusError(statusCode int, body []byte) []byte {

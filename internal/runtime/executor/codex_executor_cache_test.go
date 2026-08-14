@@ -386,6 +386,31 @@ func TestApplyCodexHeadersUsesAccountHeaderForOAuth(t *testing.T) {
 	}
 }
 
+func TestApplyCodexHeadersFallsBackToWorkspaceAccountAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{name: "chatgpt account", key: "chatgpt_account_id"},
+		{name: "workspace", key: "workspace_id"},
+		{name: "organization", key: "organization_id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			httpReq := httptest.NewRequest("POST", "https://example.com/responses", nil)
+			auth := &cliproxyauth.Auth{
+				Provider: "codex",
+				Metadata: map[string]any{tc.key: "team-workspace"},
+			}
+
+			applyCodexHeaders(httpReq, auth, "oauth-token", true, nil)
+
+			if got := httpReq.Header.Get("Chatgpt-Account-Id"); got != "team-workspace" {
+				t.Fatalf("Chatgpt-Account-Id = %q, want team-workspace", got)
+			}
+		})
+	}
+}
+
 func TestCodexIdentityConfuseKeepsClientBodySeparateFromUpstreamBody(t *testing.T) {
 	cfg := &config.Config{
 		Routing: config.RoutingConfig{Strategy: "fill-first"},

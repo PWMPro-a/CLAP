@@ -231,8 +231,8 @@ func fetchCodexTailBurstQuotaSnapshot(
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", codexUserAgent)
 	req.Header.Set("Originator", codexOriginator)
-	if accountID, _ := auth.Metadata["account_id"].(string); strings.TrimSpace(accountID) != "" {
-		req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(accountID))
+	if accountID := codexAuthAccountID(auth); accountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", accountID)
 	}
 
 	resp, err := client.Do(req)

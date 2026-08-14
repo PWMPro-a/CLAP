@@ -576,10 +576,8 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		r.Header.Set("Originator", codexOriginator)
 	}
 	if !isAPIKey {
-		if auth != nil && auth.Metadata != nil {
-			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
-			}
+		if accountID := codexAuthAccountID(auth); accountID != "" {
+			r.Header.Set("Chatgpt-Account-Id", accountID)
 		}
 	}
 	var attrs map[string]string
@@ -588,6 +586,16 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	applyCodexCloakingHeaders(r.Header, cfg)
+}
+
+func codexAuthAccountID(auth *cliproxyauth.Auth) string {
+	return firstCodexAuthMetadataString(
+		auth,
+		"account_id",
+		"chatgpt_account_id",
+		"workspace_id",
+		"organization_id",
+	)
 }
 
 func setCodexAuthorizationHeader(headers http.Header, authorization string) {

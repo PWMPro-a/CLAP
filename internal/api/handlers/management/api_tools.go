@@ -142,6 +142,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	if reqHeaders == nil {
 		reqHeaders = map[string]string{}
 	}
+	injectCodexAPICallAccountHeader(auth, parsedURL, reqHeaders)
 
 	agentTaskID, agentIdentity, errPrepareHeaders := h.prepareAPICallTokenHeaders(
 		c.Request.Context(),
@@ -223,6 +224,58 @@ func (h *Handler) APICall(c *gin.Context) {
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+func injectCodexAPICallAccountHeader(auth *coreauth.Auth, target *url.URL, headers map[string]string) {
+	if auth == nil || target == nil || headers == nil ||
+		!strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") ||
+		!isChatGPTAPICallHost(target.Hostname()) || hasNonEmptyHeader(headers, "Chatgpt-Account-Id") {
+		return
+	}
+	accountID := firstAuthMetadataString(auth,
+		"account_id",
+		"chatgpt_account_id",
+		"workspace_id",
+		"organization_id",
+	)
+	if accountID != "" {
+		headers["Chatgpt-Account-Id"] = accountID
+	}
+}
+
+func isChatGPTAPICallHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "chatgpt.com" || strings.HasSuffix(host, ".chatgpt.com")
+}
+
+func hasNonEmptyHeader(headers map[string]string, name string) bool {
+	for key, value := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func firstAuthMetadataString(auth *coreauth.Auth, keys ...string) string {
+	if auth == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if auth.Metadata != nil {
+			if value, ok := auth.Metadata[key].(string); ok {
+				if value = strings.TrimSpace(value); value != "" {
+					return value
+				}
+			}
+		}
+		if auth.Attributes != nil {
+			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func (h *Handler) prepareAPICallTokenHeaders(

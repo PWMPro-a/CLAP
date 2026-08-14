@@ -479,6 +479,63 @@ func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {
 	}
 }
 
+type transientCredentialContextTestError struct{}
+
+func (transientCredentialContextTestError) Error() string {
+	return "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
+}
+
+func (transientCredentialContextTestError) StatusCode() int { return http.StatusBadRequest }
+
+func (transientCredentialContextTestError) IsTransientCredentialContext() bool { return true }
+
+func TestManager_TransientCodexAccountContextFallsBackWithoutPoisoningAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"aa-context-race": transientCredentialContextTestError{},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-5.6-sol"
+	badAuth := &Auth{ID: "aa-context-race", Provider: "codex"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "codex"}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute: %v", errExecute)
+	}
+	if string(resp.Payload) != goodAuth.ID {
+		t.Fatalf("payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatal("transient auth missing")
+	}
+	if updatedBad.Unavailable || updatedBad.Status == StatusError || updatedBad.LastError != nil || updatedBad.StatusMessage != "" {
+		t.Fatalf("transient context failure poisoned auth: %#v", updatedBad)
+	}
+	if state := updatedBad.ModelStates[model]; state != nil && state.Unavailable {
+		t.Fatalf("transient context failure poisoned model state: %#v", state)
+	}
+}
+
 func TestManagerExecute_AntigravityInvalidGrantFallsBackAndSuspendsAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	invalidGrantErr := &Error{

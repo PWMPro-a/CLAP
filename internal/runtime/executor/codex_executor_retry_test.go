@@ -74,6 +74,19 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	}
 }
 
+func TestNewCodexStatusErrMarksChatGPTAccountContextFailureTransient(t *testing.T) {
+	body := []byte(`{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}`)
+
+	err := newCodexStatusErr(http.StatusBadRequest, body)
+
+	if got := err.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
+	}
+	if !err.IsTransientCredentialContext() {
+		t.Fatal("expected transient credential context marker")
+	}
+}
+
 func TestNewCodexStatusErrTreatsUsageLimitAsRetryableRateLimit(t *testing.T) {
 	body := []byte(`{"error":{"type":"usage_limit_reached","message":"You've hit your usage limit.","resets_in_seconds":120}}`)
 

@@ -1,8 +1,9 @@
 package auth
 
 const (
-	requestScopedErrorCode      = "request_scoped"
-	terminalCredentialErrorCode = "credential_invalidated"
+	requestScopedErrorCode              = "request_scoped"
+	terminalCredentialErrorCode         = "credential_invalidated"
+	transientCredentialContextErrorCode = "transient_credential_context"
 )
 
 // connectionLifecycleErrorCode marks transport/session lifecycle failures that

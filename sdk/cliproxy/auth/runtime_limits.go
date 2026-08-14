@@ -551,6 +551,9 @@ func shouldFreezeRuntimeAuthResult(err *Error) bool {
 	if err == nil {
 		return false
 	}
+	if isTransientCredentialContextResultError(err) {
+		return false
+	}
 	if isCloudflareChallengeResultError(err) || isModelSupportResultError(err) {
 		return true
 	}

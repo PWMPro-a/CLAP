@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -139,6 +140,44 @@ func TestAPICallNormalOAuthKeepsBearerTokenReplacement(t *testing.T) {
 	}
 	if upstreamAuthorization != "Bearer oauth-token" {
 		t.Fatalf("Authorization = %q, want ordinary bearer token", upstreamAuthorization)
+	}
+}
+
+func TestInjectCodexAPICallAccountHeaderUsesSelectedCredentialContext(t *testing.T) {
+	target, errParse := url.Parse("https://chatgpt.com/backend-api/wham/usage")
+	if errParse != nil {
+		t.Fatalf("url.Parse: %v", errParse)
+	}
+	auth := &coreauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"chatgpt_account_id": "team-workspace"},
+	}
+	headers := map[string]string{"Authorization": "Bearer token"}
+
+	injectCodexAPICallAccountHeader(auth, target, headers)
+
+	if got := headers["Chatgpt-Account-Id"]; got != "team-workspace" {
+		t.Fatalf("Chatgpt-Account-Id = %q, want team-workspace", got)
+	}
+}
+
+func TestInjectCodexAPICallAccountHeaderPreservesExplicitContextAndExternalHosts(t *testing.T) {
+	auth := &coreauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"account_id": "selected-workspace"},
+	}
+	chatGPTTarget, _ := url.Parse("https://chatgpt.com/backend-api/wham/usage")
+	explicitHeaders := map[string]string{"CHATGPT-ACCOUNT-ID": "explicit-workspace"}
+	injectCodexAPICallAccountHeader(auth, chatGPTTarget, explicitHeaders)
+	if got := explicitHeaders["CHATGPT-ACCOUNT-ID"]; got != "explicit-workspace" {
+		t.Fatalf("explicit Chatgpt-Account-Id = %q, want explicit-workspace", got)
+	}
+
+	externalTarget, _ := url.Parse("https://example.com/inspect")
+	externalHeaders := map[string]string{}
+	injectCodexAPICallAccountHeader(auth, externalTarget, externalHeaders)
+	if got := externalHeaders["Chatgpt-Account-Id"]; got != "" {
+		t.Fatalf("external Chatgpt-Account-Id = %q, want empty", got)
 	}
 }
 

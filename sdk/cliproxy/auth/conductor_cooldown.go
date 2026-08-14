@@ -1402,6 +1402,9 @@ func resultErrorFromError(err error) *Error {
 	case isTerminalCredentialFailure(err):
 		resultErr.Code = terminalCredentialErrorCode
 		resultErr.Retryable = false
+	case isTransientCredentialContextError(err):
+		resultErr.Code = transientCredentialContextErrorCode
+		resultErr.Retryable = true
 	case isRequestScopedError(err) || isRequestInvalidError(err):
 		// Prefer true request-scoped faults (including Claude OAuth cancellation)
 		// over the broader connection-lifecycle classification.
@@ -1420,7 +1423,24 @@ func resultErrorFromError(err error) *Error {
 // Connection lifecycle is intentionally separate from request_scoped so transport
 // drops do not also stop credential rotation via isRequestInvalidError.
 func shouldSkipCredentialCooldown(err *Error) bool {
-	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err)
+	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) ||
+		isTransientCredentialContextResultError(err)
+}
+
+func isTransientCredentialContextError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type transientCredentialContextError interface {
+		error
+		IsTransientCredentialContext() bool
+	}
+	marker, ok := errors.AsType[transientCredentialContextError](err)
+	return ok && marker != nil && marker.IsTransientCredentialContext()
+}
+
+func isTransientCredentialContextResultError(err *Error) bool {
+	return err != nil && strings.EqualFold(strings.TrimSpace(err.Code), transientCredentialContextErrorCode)
 }
 
 // isConnectionLifecycleError reports transport/session lifecycle failures that must
