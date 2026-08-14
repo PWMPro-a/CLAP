@@ -104,6 +104,12 @@ func (a *Auth) runtimeLimitConfig() runtimeLimitConfig {
 	return cfg
 }
 
+func (a *Auth) runtimeLimitConfigForModel(model string, now time.Time) runtimeLimitConfig {
+	cfg := a.runtimeLimitConfig()
+	cfg.maxConcurrency = expiryDrainConcurrencyLimit(a, model, now, cfg.maxConcurrency)
+	return cfg
+}
+
 type runtimeLimitConfig struct {
 	maxConcurrency              int
 	rateLimitMaxRequests        int
@@ -137,10 +143,10 @@ func (a *Auth) RuntimeLimitSnapshot(now time.Time) RuntimeLimitSnapshot {
 }
 
 func runtimeAuthBlockedForModel(auth *Auth, now time.Time) (bool, blockReason, time.Time) {
-	return runtimeAuthBlockedForModelWithTailBurst(auth, now, false)
+	return runtimeAuthBlockedForModelWithTailBurst(auth, "", now, false)
 }
 
-func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, now time.Time, tailBurst bool) (bool, blockReason, time.Time) {
+func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.Time, tailBurst bool) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -148,7 +154,7 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, now time.Time, tailBurs
 	if state == nil {
 		return false, blockReasonNone, time.Time{}
 	}
-	cfg := auth.runtimeLimitConfig()
+	cfg := auth.runtimeLimitConfigForModel(model, now)
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
@@ -162,7 +168,14 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, now time.Time, tailBurs
 			return true, blockReasonCooldown, frozenUntil
 		}
 	}
-	if tailBurst && state.currentConcurrency >= 1 {
+	tailBurstLimit := 1
+	if cfg.maxConcurrency > tailBurstLimit {
+		tailBurstLimit = cfg.maxConcurrency
+	}
+	if drainLimit := expiryDrainConcurrencyLimit(auth, model, now, 1); drainLimit > tailBurstLimit {
+		tailBurstLimit = drainLimit
+	}
+	if tailBurst && state.currentConcurrency >= tailBurstLimit {
 		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
 	}
@@ -243,14 +256,18 @@ func (a *Auth) markStickyBypassForSession(sessionKey string, now time.Time) {
 }
 
 func (a *Auth) acquireRuntimeSlot(now time.Time) (release func(), ok bool, reason string, retryAt time.Time) {
-	return a.acquireRuntimeSlotWithTailBurst(now, false)
+	return a.acquireRuntimeSlotForModel(now, "", false)
 }
 
 func (a *Auth) acquireRuntimeSlotWithTailBurst(now time.Time, tailBurst bool) (release func(), ok bool, reason string, retryAt time.Time) {
+	return a.acquireRuntimeSlotForModel(now, "", tailBurst)
+}
+
+func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst bool) (release func(), ok bool, reason string, retryAt time.Time) {
 	if a == nil {
 		return nil, false, "missing_auth", time.Time{}
 	}
-	cfg := a.runtimeLimitConfig()
+	cfg := a.runtimeLimitConfigForModel(model, now)
 	state := a.ensureRuntimeLimits()
 	if state == nil {
 		return nil, true, "", time.Time{}
@@ -268,7 +285,14 @@ func (a *Auth) acquireRuntimeSlotWithTailBurst(now time.Time, tailBurst bool) (r
 			return nil, false, "frozen", frozenUntil
 		}
 	}
-	if tailBurst && state.currentConcurrency >= 1 {
+	tailBurstLimit := 1
+	if cfg.maxConcurrency > tailBurstLimit {
+		tailBurstLimit = cfg.maxConcurrency
+	}
+	if drainLimit := expiryDrainConcurrencyLimit(a, model, now, 1); drainLimit > tailBurstLimit {
+		tailBurstLimit = drainLimit
+	}
+	if tailBurst && state.currentConcurrency >= tailBurstLimit {
 		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
 		return nil, false, "tail_burst_concurrency_limit", time.Time{}
 	}

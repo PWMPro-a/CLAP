@@ -40,6 +40,8 @@ type authScheduler struct {
 	authProviders         map[string]string
 	mixedCursors          map[string]int
 	mixedWeightedStates   map[string]*smoothWeightedState
+	mixedExpiryCursors    map[string]int
+	mixedExpiryWeighted   map[string]*smoothWeightedState
 	selectionModelForAuth func(*Auth, string) string
 	quotaFallback         func([]*Auth, string, time.Time) *Auth
 }
@@ -77,6 +79,7 @@ type modelScheduler struct {
 type scheduledAuth struct {
 	meta        *scheduledAuthMeta
 	auth        *Auth
+	expiresAt   time.Time
 	state       scheduledState
 	nextRetryAt time.Time
 }
@@ -89,17 +92,22 @@ type readyBucket struct {
 
 // readyView holds the selection order for flat round-robin traversal.
 type readyView struct {
-	flat          []*scheduledAuth
-	cursor        int
-	weightedState smoothWeightedState
+	flat                []*scheduledAuth
+	cursor              int
+	weightedState       smoothWeightedState
+	expiryFlat          []*scheduledAuth
+	expiryCursor        int
+	expiryWeightedState smoothWeightedState
 }
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
 type cooldownQueue []*scheduledAuth
 
 type readyViewCursorState struct {
-	cursor        int
-	weightedState smoothWeightedState
+	cursor              int
+	weightedState       smoothWeightedState
+	expiryCursor        int
+	expiryWeightedState smoothWeightedState
 }
 
 type readyBucketCursorState struct {
@@ -108,20 +116,27 @@ type readyBucketCursorState struct {
 }
 
 func snapshotReadyViewCursors(view readyView) readyViewCursorState {
-	state := readyViewCursorState{cursor: view.cursor}
-	if len(view.weightedState.current) > 0 {
-		state.weightedState.current = make(map[string]int64, len(view.weightedState.current))
-		for authID, current := range view.weightedState.current {
-			state.weightedState.current[authID] = current
-		}
-	}
-	if len(view.weightedState.weights) > 0 {
-		state.weightedState.weights = make(map[string]int64, len(view.weightedState.weights))
-		for authID, weight := range view.weightedState.weights {
-			state.weightedState.weights[authID] = weight
-		}
-	}
+	state := readyViewCursorState{cursor: view.cursor, expiryCursor: view.expiryCursor}
+	state.weightedState = cloneSmoothWeightedState(view.weightedState)
+	state.expiryWeightedState = cloneSmoothWeightedState(view.expiryWeightedState)
 	return state
+}
+
+func cloneSmoothWeightedState(source smoothWeightedState) smoothWeightedState {
+	clone := smoothWeightedState{}
+	if len(source.current) > 0 {
+		clone.current = make(map[string]int64, len(source.current))
+		for authID, current := range source.current {
+			clone.current[authID] = current
+		}
+	}
+	if len(source.weights) > 0 {
+		clone.weights = make(map[string]int64, len(source.weights))
+		for authID, weight := range source.weights {
+			clone.weights[authID] = weight
+		}
+	}
+	return clone
 }
 
 func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
@@ -131,12 +146,14 @@ func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
 	if len(view.flat) > 0 {
 		view.cursor = normalizeCursor(state.cursor, len(view.flat))
 	}
+	view.expiryCursor = normalizeCursor(state.expiryCursor, len(view.expiryFlat))
 	weights := scheduledWeightVector(view.flat)
-	if len(state.weightedState.current) == 0 || !weightVectorsEqual(state.weightedState.weights, weights) {
-		return
+	if len(state.weightedState.current) > 0 && weightVectorsEqual(state.weightedState.weights, weights) {
+		view.weightedState = state.weightedState
+	} else {
+		view.weightedState = smoothWeightedState{}
 	}
-	view.weightedState.current = state.weightedState.current
-	view.weightedState.weights = weights
+	view.expiryWeightedState = state.expiryWeightedState
 }
 
 func normalizeCursor(cursor, size int) int {
@@ -158,6 +175,8 @@ func newAuthScheduler(selector Selector) *authScheduler {
 		authProviders:       make(map[string]string),
 		mixedCursors:        make(map[string]int),
 		mixedWeightedStates: make(map[string]*smoothWeightedState),
+		mixedExpiryCursors:  make(map[string]int),
+		mixedExpiryWeighted: make(map[string]*smoothWeightedState),
 	}
 }
 
@@ -185,6 +204,8 @@ func (s *authScheduler) setSelector(selector Selector) {
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
 	clear(s.mixedWeightedStates)
+	clear(s.mixedExpiryCursors)
+	clear(s.mixedExpiryWeighted)
 }
 
 func (s *authScheduler) setSelectionModelResolver(resolve func(*Auth, string) string) {
@@ -476,6 +497,51 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
 
+	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
+	expiringEntries := make([]*scheduledAuth, 0)
+	for _, shard := range candidateShards {
+		if shard == nil {
+			continue
+		}
+		bucket := shard.readyByPriority[bestPriority]
+		if bucket == nil {
+			continue
+		}
+		expiringEntries = append(expiringEntries, expiringScheduledEntries(bucket.all.flat, predicate, now)...)
+	}
+	if len(expiringEntries) > 0 {
+		sort.SliceStable(expiringEntries, func(i, j int) bool {
+			if !expiringEntries[i].expiresAt.Equal(expiringEntries[j].expiresAt) {
+				return expiringEntries[i].expiresAt.Before(expiringEntries[j].expiresAt)
+			}
+			return expiringEntries[i].auth.ID < expiringEntries[j].auth.ID
+		})
+		switch strategy {
+		case schedulerStrategyFillFirst:
+			picked := expiringEntries[0]
+			return picked.auth, picked.meta.providerKey, nil
+		case schedulerStrategyWeightedRoundRobin:
+			if s.mixedExpiryWeighted == nil {
+				s.mixedExpiryWeighted = make(map[string]*smoothWeightedState)
+			}
+			state := s.mixedExpiryWeighted[cursorKey]
+			if state == nil {
+				state = &smoothWeightedState{}
+				s.mixedExpiryWeighted[cursorKey] = state
+			}
+			state.prepare(scheduledWeightVectorMatching(expiringEntries, predicate))
+			picked := pickSmoothWeightedScheduled(expiringEntries, state.current, predicate)
+			if picked != nil && picked.meta != nil {
+				return picked.auth, picked.meta.providerKey, nil
+			}
+		default:
+			start := s.mixedExpiryCursors[cursorKey] % len(expiringEntries)
+			picked := expiringEntries[start]
+			s.mixedExpiryCursors[cursorKey] = start + 1
+			return picked.auth, picked.meta.providerKey, nil
+		}
+	}
+
 	if strategy == schedulerStrategyFillFirst {
 		for providerIndex, providerKey := range normalized {
 			shard := candidateShards[providerIndex]
@@ -490,7 +556,6 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
 
-	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
 	if strategy == schedulerStrategyWeightedRoundRobin {
 		entries := make([]*scheduledAuth, 0)
 		for _, shard := range candidateShards {
@@ -909,15 +974,21 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	previousWebsocketEnabled := false
 	previousCanonicalIdentity := ""
 	previousCanonicalScore := 0
+	previousExpiresAt := time.Time{}
 	if entry.meta != nil {
 		previousPriority = entry.meta.priority
 		previousWebsocketEnabled = entry.meta.websocketEnabled
 		previousCanonicalIdentity = entry.meta.canonicalIdentity
 		previousCanonicalScore = entry.meta.canonicalScore
+		previousExpiresAt = entry.expiresAt
 	}
 
 	entry.meta = meta
 	entry.auth = meta.auth
+	entry.expiresAt = time.Time{}
+	if expiresAt, ok := meta.auth.ExpirationTime(); ok {
+		entry.expiresAt = expiresAt
+	}
 	entry.nextRetryAt = time.Time{}
 	blocked, reason, next := isAuthBlockedForModel(meta.auth, meta.selectionModelForRoute(m.modelKey), now)
 	switch {
@@ -935,7 +1006,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 
 	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority &&
 		previousWebsocketEnabled == meta.websocketEnabled && previousCanonicalIdentity == meta.canonicalIdentity &&
-		previousCanonicalScore == meta.canonicalScore {
+		previousCanonicalScore == meta.canonicalScore && previousExpiresAt.Equal(entry.expiresAt) {
 		return
 	}
 	m.rebuildIndexesLocked()
@@ -1045,6 +1116,9 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	view := &bucket.all
 	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
 		view = &bucket.ws
+	}
+	if picked := view.pickExpiring(predicate, strategy, time.Now()); picked != nil {
+		return picked.auth
 	}
 	var picked *scheduledAuth
 	switch strategy {
@@ -1241,7 +1315,21 @@ func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
 
 // buildReadyView creates a flat view for rotation.
 func buildReadyView(entries []*scheduledAuth) readyView {
-	return readyView{flat: append([]*scheduledAuth(nil), entries...)}
+	view := readyView{flat: append([]*scheduledAuth(nil), entries...)}
+	for _, entry := range view.flat {
+		if entry != nil && !entry.expiresAt.IsZero() {
+			view.expiryFlat = append(view.expiryFlat, entry)
+		}
+	}
+	sort.SliceStable(view.expiryFlat, func(i, j int) bool {
+		left := view.expiryFlat[i]
+		right := view.expiryFlat[j]
+		if !left.expiresAt.Equal(right.expiresAt) {
+			return left.expiresAt.Before(right.expiresAt)
+		}
+		return left.auth.ID < right.auth.ID
+	})
+	return view
 }
 
 // pickFirst returns the first ready entry that satisfies predicate without advancing cursors.
@@ -1282,6 +1370,41 @@ func (v *readyView) pickWeighted(predicate func(*scheduledAuth) bool) *scheduled
 	}
 	v.weightedState.prepare(scheduledWeightVectorMatching(v.flat, predicate))
 	return pickSmoothWeightedScheduled(v.flat, v.weightedState.current, predicate)
+}
+
+func (v *readyView) pickExpiring(predicate func(*scheduledAuth) bool, strategy schedulerStrategy, now time.Time) *scheduledAuth {
+	if v == nil || len(v.expiryFlat) == 0 {
+		return nil
+	}
+	isExpiring := func(entry *scheduledAuth) bool {
+		if entry == nil || entry.expiresAt.IsZero() || !entry.expiresAt.After(now) || entry.expiresAt.After(now.Add(authExpiryPriorityWindow)) {
+			return false
+		}
+		return predicate == nil || predicate(entry)
+	}
+	switch strategy {
+	case schedulerStrategyFillFirst:
+		for _, entry := range v.expiryFlat {
+			if isExpiring(entry) {
+				return entry
+			}
+		}
+		return nil
+	case schedulerStrategyWeightedRoundRobin:
+		v.expiryWeightedState.prepare(scheduledWeightVectorMatching(v.expiryFlat, isExpiring))
+		return pickSmoothWeightedScheduled(v.expiryFlat, v.expiryWeightedState.current, isExpiring)
+	default:
+		start := v.expiryCursor % len(v.expiryFlat)
+		for offset := 0; offset < len(v.expiryFlat); offset++ {
+			index := (start + offset) % len(v.expiryFlat)
+			if !isExpiring(v.expiryFlat[index]) {
+				continue
+			}
+			v.expiryCursor = index + 1
+			return v.expiryFlat[index]
+		}
+	}
+	return nil
 }
 
 func scheduledWeightVector(entries []*scheduledAuth) map[string]int64 {

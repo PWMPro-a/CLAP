@@ -375,6 +375,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, opts, available)
+	available = expiryPriorityAuths(available, now)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -415,11 +416,13 @@ func positiveWeightAuths(auths []*Auth) []*Auth {
 
 // Pick selects the next available auth using smooth weighted round-robin.
 func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now())
+	now := time.Now()
+	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, now)
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, opts, available)
+	available = expiryPriorityAuths(available, now)
 	stateModel := weightedSelectorStateModel(ctx, model)
 	key := provider + ":" + canonicalModelKey(stateModel)
 
@@ -529,6 +532,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, opts, available)
+	available = expiryPriorityAuths(available, now)
 	return available[0], nil
 }
 
@@ -550,7 +554,7 @@ func isAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.Time,
 	if availability, ok := auth.Runtime.(runtimeSelectionAvailability); ok && availability != nil && !availability.RuntimeSelectionAvailable() {
 		return true, blockReasonOther, time.Time{}
 	}
-	if blocked, reason, next := runtimeAuthBlockedForModelWithTailBurst(auth, now, tailBurst); blocked {
+	if blocked, reason, next := runtimeAuthBlockedForModelWithTailBurst(auth, model, now, tailBurst); blocked {
 		return true, reason, next
 	}
 	return authModelAvailabilityBlock(auth, model, now)
@@ -707,6 +711,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
+		fallbackAuths = expiryPriorityAuths(fallbackAuths, now)
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	}
@@ -719,6 +724,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	fallbackAvailable := s.cacheAffinityNewSessionAuths(available, model, now)
 	fallbackAuths := highestPriorityAuths(fallbackAvailable)
+	fallbackAuths = expiryPriorityAuths(fallbackAuths, now)
 
 	cacheKey := sessionAffinityCacheKey(provider, primaryID, model)
 	fallbackKey := ""

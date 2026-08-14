@@ -350,7 +350,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
-		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlotWithTailBurst(time.Now(), tailBurst)
+		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlotForModel(time.Now(), routeModel, tailBurst)
 		if !acquired {
 			continue
 		}
@@ -501,7 +501,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
-		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlot(time.Now())
+		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlotForModel(time.Now(), routeModel, false)
 		if !acquired {
 			continue
 		}
@@ -722,7 +722,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		var releaseRuntime func()
 		if selection == nil {
 			var acquired bool
-			releaseRuntime, acquired, _, _ = auth.acquireRuntimeSlotWithTailBurst(time.Now(), tailBurst)
+			releaseRuntime, acquired, _, _ = auth.acquireRuntimeSlotForModel(time.Now(), routeModel, tailBurst)
 			if !acquired {
 				continue
 			}
