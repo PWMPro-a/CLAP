@@ -77,11 +77,12 @@ type modelScheduler struct {
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
 type scheduledAuth struct {
-	meta        *scheduledAuthMeta
-	auth        *Auth
-	expiresAt   time.Time
-	state       scheduledState
-	nextRetryAt time.Time
+	meta                 *scheduledAuthMeta
+	auth                 *Auth
+	expiresAt            time.Time
+	supplyLeaseExpiresAt time.Time
+	state                scheduledState
+	nextRetryAt          time.Time
 }
 
 // readyBucket keeps the ready views for one priority level.
@@ -381,16 +382,17 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	shard := providerState.ensureModelLocked(modelKey, time.Now())
+	now := time.Now()
+	shard := providerState.ensureModelLocked(modelKey, now)
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
+	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin, now)
 	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
 	}
 	if s.quotaFallback != nil && providerKey == "codex" {
-		if fallback := s.quotaFallback(shard.candidateAuthsLocked(predicate), model, time.Now()); fallback != nil {
+		if fallback := s.quotaFallback(shard.candidateAuthsLocked(predicate), model, now); fallback != nil {
 			return fallback, nil
 		}
 	}
@@ -442,6 +444,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		strategy = s.strategy
 	}
 	if pinnedAuthID != "" {
+		now := time.Now()
 		providerKey := s.authProviders[pinnedAuthID]
 		if providerKey == "" || !containsProvider(normalized, providerKey) {
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -450,19 +453,19 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if providerState == nil {
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		shard := providerState.ensureModelLocked(modelKey, time.Now())
-		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin)
+		shard := providerState.ensureModelLocked(modelKey, now)
+		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin, now)
 		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
-	predicate := scheduledAuthPredicate(eligibility, tried, "", strategy == schedulerStrategyWeightedRoundRobin)
+	now := time.Now()
+	predicate := scheduledAuthPredicate(eligibility, tried, "", strategy == schedulerStrategyWeightedRoundRobin, now)
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
-	now := time.Now()
 	for providerIndex, providerKey := range normalized {
 		providerState := s.providers[providerKey]
 		if providerState == nil {
@@ -510,12 +513,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		expiringEntries = append(expiringEntries, expiringScheduledEntries(bucket.all.flat, predicate, now)...)
 	}
 	if len(expiringEntries) > 0 {
-		sort.SliceStable(expiringEntries, func(i, j int) bool {
-			if !expiringEntries[i].expiresAt.Equal(expiringEntries[j].expiresAt) {
-				return expiringEntries[i].expiresAt.Before(expiringEntries[j].expiresAt)
-			}
-			return expiringEntries[i].auth.ID < expiringEntries[j].auth.ID
-		})
+		expiringEntries = narrowScheduledExpiryLane(expiringEntries)
 		switch strategy {
 		case schedulerStrategyFillFirst:
 			picked := expiringEntries[0]
@@ -683,9 +681,12 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 }
 
 // scheduledAuthPredicate filters request-ineligible auths before scheduler state advances.
-func scheduledAuthPredicate(eligibility authSelectionEligibility, tried map[string]struct{}, pinnedAuthID string, requirePositiveWeight bool) func(*scheduledAuth) bool {
+func scheduledAuthPredicate(eligibility authSelectionEligibility, tried map[string]struct{}, pinnedAuthID string, requirePositiveWeight bool, now time.Time) func(*scheduledAuth) bool {
 	return func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil || !eligibility.allows(entry.auth) {
+			return false
+		}
+		if !entry.supplyLeaseExpiresAt.IsZero() && !entry.supplyLeaseExpiresAt.After(now) {
 			return false
 		}
 		if requirePositiveWeight && (entry.meta == nil || entry.meta.weight <= 0) {
@@ -975,18 +976,24 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	previousCanonicalIdentity := ""
 	previousCanonicalScore := 0
 	previousExpiresAt := time.Time{}
+	previousSupplyLeaseExpiresAt := time.Time{}
 	if entry.meta != nil {
 		previousPriority = entry.meta.priority
 		previousWebsocketEnabled = entry.meta.websocketEnabled
 		previousCanonicalIdentity = entry.meta.canonicalIdentity
 		previousCanonicalScore = entry.meta.canonicalScore
 		previousExpiresAt = entry.expiresAt
+		previousSupplyLeaseExpiresAt = entry.supplyLeaseExpiresAt
 	}
 
 	entry.meta = meta
 	entry.auth = meta.auth
 	entry.expiresAt = time.Time{}
-	if expiresAt, ok := meta.auth.ExpirationTime(); ok {
+	entry.supplyLeaseExpiresAt = time.Time{}
+	if expiresAt, ok := authSupplyLeaseExpirationTime(meta.auth); ok {
+		entry.supplyLeaseExpiresAt = expiresAt
+		entry.expiresAt = expiresAt
+	} else if expiresAt, ok := meta.auth.ExpirationTime(); ok {
 		entry.expiresAt = expiresAt
 	}
 	entry.nextRetryAt = time.Time{}
@@ -1006,7 +1013,8 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 
 	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority &&
 		previousWebsocketEnabled == meta.websocketEnabled && previousCanonicalIdentity == meta.canonicalIdentity &&
-		previousCanonicalScore == meta.canonicalScore && previousExpiresAt.Equal(entry.expiresAt) {
+		previousCanonicalScore == meta.canonicalScore && previousExpiresAt.Equal(entry.expiresAt) &&
+		previousSupplyLeaseExpiresAt.Equal(entry.supplyLeaseExpiresAt) {
 		return
 	}
 	m.rebuildIndexesLocked()
@@ -1376,11 +1384,24 @@ func (v *readyView) pickExpiring(predicate func(*scheduledAuth) bool, strategy s
 	if v == nil || len(v.expiryFlat) == 0 {
 		return nil
 	}
-	isExpiring := func(entry *scheduledAuth) bool {
+	isEligible := func(entry *scheduledAuth) bool {
 		if entry == nil || entry.expiresAt.IsZero() || !entry.expiresAt.After(now) || entry.expiresAt.After(now.Add(authExpiryPriorityWindow)) {
 			return false
 		}
 		return predicate == nil || predicate(entry)
+	}
+	var laneCutoff time.Time
+	for _, entry := range v.expiryFlat {
+		if isEligible(entry) {
+			laneCutoff = entry.expiresAt.Add(authExpiryCohortWindow)
+			break
+		}
+	}
+	if laneCutoff.IsZero() {
+		return nil
+	}
+	isExpiring := func(entry *scheduledAuth) bool {
+		return isEligible(entry) && !entry.expiresAt.After(laneCutoff)
 	}
 	switch strategy {
 	case schedulerStrategyFillFirst:

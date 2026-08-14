@@ -10,6 +10,11 @@ const (
 	// distant expiry keep normal balancing semantics; only the near-expiry
 	// group becomes a drain lane.
 	authExpiryPriorityWindow = 24 * time.Hour
+	// authExpiryCohortWindow keeps one supplier batch moving together while
+	// preventing a large short-lived pool from degenerating into round-robin
+	// across every account. The next batch enters the lane after the oldest
+	// minute-wide cohort is exhausted, blocked, or expired.
+	authExpiryCohortWindow = time.Minute
 	// authExpiryDrainWindow is the final window in which an account may use a
 	// bounded concurrency boost to consume remaining quota before expiry.
 	authExpiryDrainWindow = 5 * time.Minute
@@ -18,11 +23,52 @@ const (
 	authExpiryDrainMaxConcurrency = 8
 )
 
+var authSupplyLeaseExpiryKeys = [...]string{
+	"supply_lease_expires_at_ms",
+	"supplyLeaseExpiresAtMs",
+	"supply_lease_expires_at",
+	"supplyLeaseExpiresAt",
+}
+
+// authSupplyLeaseExpirationTime returns the supplier's serving deadline. It is
+// intentionally separate from Auth.ExpirationTime: the latter is the OAuth
+// token expiry and drives token refresh, while this deadline drives routing.
+func authSupplyLeaseExpirationTime(auth *Auth) (time.Time, bool) {
+	if auth == nil || auth.Metadata == nil {
+		return time.Time{}, false
+	}
+	for _, key := range authSupplyLeaseExpiryKeys {
+		value, exists := auth.Metadata[key]
+		if !exists {
+			continue
+		}
+		if expiresAt, ok := parseTimeValue(value); ok && !expiresAt.IsZero() {
+			return expiresAt, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func authSchedulingExpirationTime(auth *Auth) (time.Time, bool) {
+	if expiresAt, ok := authSupplyLeaseExpirationTime(auth); ok {
+		return expiresAt, true
+	}
+	if auth == nil {
+		return time.Time{}, false
+	}
+	return auth.ExpirationTime()
+}
+
+func authSupplyLeaseExpired(auth *Auth, now time.Time) bool {
+	expiresAt, ok := authSupplyLeaseExpirationTime(auth)
+	return ok && !expiresAt.After(now)
+}
+
 func authExpiryRemaining(auth *Auth, now time.Time) (time.Duration, bool) {
 	if auth == nil {
 		return 0, false
 	}
-	expiresAt, ok := auth.ExpirationTime()
+	expiresAt, ok := authSchedulingExpirationTime(auth)
 	if !ok || expiresAt.IsZero() {
 		return 0, false
 	}
@@ -38,13 +84,11 @@ func authExpiryDrainActive(auth *Auth, model string, now time.Time) bool {
 	if !ok || remaining > authExpiryDrainWindow {
 		return false
 	}
-	// A provider-level quota failure is stronger evidence than the expiry
-	// signal. Once the quota snapshot itself is exhausted, extra concurrency
-	// only creates failed requests and does not drain useful capacity.
+	// A provider-level quota failure is the authoritative exhaustion signal.
+	// Usage percentages are rounded and may report 100% while a small amount of
+	// capacity remains, so the final lane continues until the upstream rejects a
+	// request rather than stopping on a sampled ratio.
 	if authQuotaExceeded(auth, model) {
-		return false
-	}
-	if snapshot, ok := auth.codexQuotaSnapshot(model, now); ok && snapshot.UsedRatio >= 1 {
 		return false
 	}
 	return true
@@ -64,18 +108,7 @@ func expiryPriorityAuths(auths []*Auth, now time.Time) []*Auth {
 			priority = append(priority, auth)
 		}
 	}
-	if len(priority) == 0 || len(priority) == len(auths) {
-		if len(priority) == len(auths) {
-			sort.SliceStable(priority, func(i, j int) bool {
-				left, _ := authExpiryRemaining(priority[i], now)
-				right, _ := authExpiryRemaining(priority[j], now)
-				if left != right {
-					return left < right
-				}
-				return priority[i].ID < priority[j].ID
-			})
-			return priority
-		}
+	if len(priority) == 0 {
 		return auths
 	}
 	sort.SliceStable(priority, func(i, j int) bool {
@@ -86,7 +119,17 @@ func expiryPriorityAuths(auths []*Auth, now time.Time) []*Auth {
 		}
 		return priority[i].ID < priority[j].ID
 	})
-	return priority
+	earliest, _ := authSchedulingExpirationTime(priority[0])
+	cutoff := earliest.Add(authExpiryCohortWindow)
+	end := 1
+	for end < len(priority) {
+		expiresAt, _ := authSchedulingExpirationTime(priority[end])
+		if expiresAt.After(cutoff) {
+			break
+		}
+		end++
+	}
+	return priority[:end]
 }
 
 func expiryDrainConcurrencyLimit(auth *Auth, model string, now time.Time, configured int) int {
@@ -121,5 +164,23 @@ func expiringScheduledEntries(entries []*scheduledAuth, predicate func(*schedule
 		}
 		out = append(out, entry)
 	}
-	return out
+	return narrowScheduledExpiryLane(out)
+}
+
+func narrowScheduledExpiryLane(entries []*scheduledAuth) []*scheduledAuth {
+	if len(entries) <= 1 {
+		return entries
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if !entries[i].expiresAt.Equal(entries[j].expiresAt) {
+			return entries[i].expiresAt.Before(entries[j].expiresAt)
+		}
+		return entries[i].auth.ID < entries[j].auth.ID
+	})
+	cutoff := entries[0].expiresAt.Add(authExpiryCohortWindow)
+	end := 1
+	for end < len(entries) && !entries[end].expiresAt.After(cutoff) {
+		end++
+	}
+	return entries[:end]
 }

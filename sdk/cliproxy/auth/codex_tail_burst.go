@@ -328,12 +328,18 @@ func (m *Manager) codexTailBurstActive(auth *Auth, model string, now time.Time) 
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex") {
 		return false
 	}
+	if authQuotaExceeded(auth, model) {
+		return false
+	}
 	settings := m.codexTailBurstSettings()
 	if !settings.enabled || !codexTailBurstEnabledForAuth(auth) {
 		return false
 	}
 	snapshot, ok := auth.codexQuotaSnapshot(model, now)
-	return ok && snapshot.UsedRatio >= settings.triggerRatio && snapshot.UsedRatio < 1
+	// The usage endpoint reports rounded percentages. Keep a sampled 100% in
+	// the bounded tail lane until the upstream returns an actual quota error;
+	// otherwise the last sub-percent capacity is stranded on every account.
+	return ok && snapshot.UsedRatio >= settings.triggerRatio
 }
 
 func (m *Manager) refreshCodexTailBurstCandidates() {
@@ -350,7 +356,7 @@ func (m *Manager) refreshCodexTailBurstCandidates() {
 				continue
 			}
 			for model, snapshot := range auth.codexQuotaSnapshots(now) {
-				if snapshot.UsedRatio < settings.triggerRatio || snapshot.UsedRatio >= 1 {
+				if snapshot.UsedRatio < settings.triggerRatio || authQuotaExceeded(auth, model) {
 					continue
 				}
 				key := normalizeCodexTailBurstModel(model)

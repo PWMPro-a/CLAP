@@ -228,6 +228,36 @@ func TestCodexTailBurstSnapshotExpires(t *testing.T) {
 	}
 }
 
+func TestCodexTailBurstKeepsRoundedHundredPercentUntilProviderRejects(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(newTailBurstConfig())
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "rounded-tail", Provider: "codex", Status: StatusActive}); errRegister != nil {
+		t.Fatalf("Register: %v", errRegister)
+	}
+	if _, accepted, errUpdate := manager.UpdateCodexQuotaSnapshot("rounded-tail", "", CodexQuotaSnapshot{UsedRatio: 1}); errUpdate != nil || !accepted {
+		t.Fatalf("UpdateCodexQuotaSnapshot accepted=%t err=%v", accepted, errUpdate)
+	}
+
+	manager.mu.RLock()
+	auth := manager.auths["rounded-tail"]
+	manager.mu.RUnlock()
+	if !manager.codexTailBurstActive(auth, "", time.Now()) {
+		t.Fatal("rounded 100% snapshot left the tail lane before an upstream quota error")
+	}
+	if ids := codexTailBurstCandidateIDs(manager, "*"); len(ids) != 1 || ids[0] != auth.ID {
+		t.Fatalf("rounded tail candidates = %v, want [%s]", ids, auth.ID)
+	}
+
+	auth.Quota = QuotaState{Exceeded: true}
+	manager.refreshCodexTailBurstCandidates()
+	if manager.codexTailBurstActive(auth, "", time.Now()) {
+		t.Fatal("authoritative provider quota failure remained active in the tail lane")
+	}
+	if ids := codexTailBurstCandidateIDs(manager, "*"); len(ids) != 0 {
+		t.Fatalf("provider-exhausted tail candidates = %v, want none", ids)
+	}
+}
+
 func TestCodexTailBurstRejectsStaleQuotaSnapshots(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetConfig(newTailBurstConfig())
