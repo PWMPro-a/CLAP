@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -232,6 +233,44 @@ func TestPatchAuthFileStatusVerifiesAuthIndex(t *testing.T) {
 	}
 	if !authB.Disabled || authB.Status != coreauth.StatusDisabled {
 		t.Fatalf("auth-b was not disabled: %+v", authB)
+	}
+}
+
+func TestPatchAuthFileStatusEnableClearsRuntimeInvalidationState(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	registerAuthForLookupTest(t, manager, &coreauth.Auth{
+		ID:             "auth-invalidated",
+		Index:          "idx-invalidated",
+		FileName:       "invalidated-codex.json",
+		Provider:       "codex",
+		Disabled:       true,
+		Unavailable:    true,
+		Status:         coreauth.StatusDisabled,
+		StatusMessage:  "credential invalidated",
+		NextRetryAfter: time.Now().Add(time.Hour),
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status", strings.NewReader(`{"name":"auth-invalidated","auth_index":"idx-invalidated","disabled":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	h.PatchAuthFileStatus(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	updated, ok := manager.GetByID("auth-invalidated")
+	if !ok {
+		t.Fatal("expected invalidated auth record to exist")
+	}
+	if updated.Disabled || updated.Unavailable || updated.Status != coreauth.StatusActive ||
+		updated.StatusMessage != "" || !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("enabled auth retained runtime invalidation state: %+v", updated)
 	}
 }
 

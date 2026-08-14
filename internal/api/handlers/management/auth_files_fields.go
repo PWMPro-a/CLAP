@@ -190,8 +190,11 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "disabled via management API"
 	} else {
+		auth.Unavailable = false
 		auth.Status = coreauth.StatusActive
 		auth.StatusMessage = ""
+		auth.LastError = nil
+		auth.NextRetryAfter = time.Time{}
 	}
 	auth.UpdatedAt = time.Now()
 	if auth.Metadata == nil {
