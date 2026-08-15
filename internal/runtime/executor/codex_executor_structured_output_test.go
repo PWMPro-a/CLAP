@@ -64,6 +64,45 @@ func TestNormalizeCodexStructuredOutputCompatibility(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexOrphanToolCalls(t *testing.T) {
+	t.Run("synthesizes missing function output in place", func(t *testing.T) {
+		body := []byte(`{"input":[{"type":"message","role":"user","content":"start"},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},{"type":"message","role":"user","content":"continue"}]}`)
+		got := normalizeCodexOrphanToolCalls(body)
+		input := gjson.GetBytes(got, "input").Array()
+		if len(input) != 4 || input[2].Get("type").String() != "function_call_output" ||
+			input[2].Get("call_id").String() != "call_1" ||
+			input[2].Get("output").String() != codexMissingToolOutput ||
+			input[3].Get("role").String() != "user" {
+			t.Fatalf("orphan function call was not repaired in place: %s", got)
+		}
+	})
+
+	t.Run("synthesizes matching custom tool output", func(t *testing.T) {
+		body := []byte(`{"input":[{"type":"custom_tool_call","call_id":"call_custom","name":"search","input":"query"}]}`)
+		got := normalizeCodexOrphanToolCalls(body)
+		output := gjson.GetBytes(got, "input.1")
+		if output.Get("type").String() != "custom_tool_call_output" ||
+			output.Get("call_id").String() != "call_custom" {
+			t.Fatalf("orphan custom tool call was not repaired: %s", got)
+		}
+	})
+
+	t.Run("keeps valid pair byte for byte", func(t *testing.T) {
+		body := []byte(`{"input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+		got := normalizeCodexOrphanToolCalls(body)
+		if !bytes.Equal(got, body) {
+			t.Fatalf("valid tool transcript changed:\noriginal: %s\nupdated:  %s", body, got)
+		}
+	})
+
+	t.Run("keeps non array input unchanged", func(t *testing.T) {
+		body := []byte(`{"input":"hello"}`)
+		if got := normalizeCodexOrphanToolCalls(body); !bytes.Equal(got, body) {
+			t.Fatalf("string input changed: %s", got)
+		}
+	})
+}
+
 func TestCodexStructuredOutputCompatibilityTransportBoundaries(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.5","input":"Return one object.","text":{"format":{"type":"json_object"}}}`)
 	req := cliproxyexecutor.Request{Model: "gpt-5.5", Payload: body}

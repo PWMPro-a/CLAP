@@ -30,7 +30,7 @@ func applyCodexPromptCacheHeadersWithConfig(ctx context.Context, cfg *config.Con
 	if len(rawJSON) == 0 {
 		return rawJSON, headers, nil
 	}
-	rawJSON = normalizeCodexStructuredOutputCompatibility(rawJSON)
+	rawJSON = normalizeCodexUpstreamCompatibility(rawJSON)
 
 	var requestHeaders http.Header
 	if len(headerSets) > 0 {

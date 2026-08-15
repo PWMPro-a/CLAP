@@ -31,6 +31,7 @@ const (
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 	codexJSONOutputInstruction = "Return the response as JSON."
 	codexJSONOutputMessage     = `{"type":"message","role":"developer","content":[{"type":"input_text","text":"Return the response as JSON."}]}`
+	codexMissingToolOutput     = "Tool execution result unavailable. Continue using the available context."
 )
 
 var dataTag = []byte("data:")
@@ -163,7 +164,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if len(headerSets) > 0 {
 		headers = headerSets[0]
 	}
-	rawJSON = normalizeCodexStructuredOutputCompatibility(rawJSON)
+	rawJSON = normalizeCodexUpstreamCompatibility(rawJSON)
 	cache, errCache := codexPromptCacheForRequest(ctx, e.cfg, from, req, rawJSON, headers)
 	if errCache != nil {
 		return nil, nil, codexIdentityConfuseState{}, errCache
@@ -190,6 +191,76 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 	mergeMissingHeaders(httpReq.Header, appServerHeaders)
 	return httpReq, rawJSON, identityState, nil
+}
+
+func normalizeCodexUpstreamCompatibility(body []byte) []byte {
+	body = normalizeCodexOrphanToolCalls(body)
+	return normalizeCodexStructuredOutputCompatibility(body)
+}
+
+// A truncated or retried client transcript can retain a tool call after losing
+// its result. Codex rejects the whole request in that state. Supply a stable
+// result immediately after the orphan while leaving every valid transcript
+// byte-for-byte unchanged.
+func normalizeCodexOrphanToolCalls(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body
+	}
+	items := input.Array()
+	outputs := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType != "function_call_output" && itemType != "custom_tool_call_output" {
+			continue
+		}
+		if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+			outputs[itemType+"\x00"+callID] = struct{}{}
+		}
+	}
+
+	normalized := make([][]byte, 0, len(items))
+	synthesized := make(map[string]struct{})
+	changed := false
+	for _, item := range items {
+		normalized = append(normalized, []byte(item.Raw))
+		callType := strings.TrimSpace(item.Get("type").String())
+		outputType := ""
+		switch callType {
+		case "function_call":
+			outputType = "function_call_output"
+		case "custom_tool_call":
+			outputType = "custom_tool_call_output"
+		default:
+			continue
+		}
+		callID := strings.TrimSpace(item.Get("call_id").String())
+		if callID == "" {
+			continue
+		}
+		key := outputType + "\x00" + callID
+		if _, ok := outputs[key]; ok {
+			continue
+		}
+		if _, ok := synthesized[key]; ok {
+			continue
+		}
+		output := []byte(`{"type":"function_call_output"}`)
+		output, _ = sjson.SetBytes(output, "type", outputType)
+		output, _ = sjson.SetBytes(output, "call_id", callID)
+		output, _ = sjson.SetBytes(output, "output", codexMissingToolOutput)
+		normalized = append(normalized, output)
+		synthesized[key] = struct{}{}
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	updated, errSet := sjson.SetRawBytes(body, "input", helps.JoinRawJSONArray(normalized))
+	if errSet != nil {
+		return body
+	}
+	return updated
 }
 
 // The Responses API requires an explicit JSON reference when json_object output
