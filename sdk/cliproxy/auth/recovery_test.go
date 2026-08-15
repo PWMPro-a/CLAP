@@ -100,7 +100,7 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 		Provider: "codex",
 		Model:    "gpt-5.3-codex",
 		Error: &Error{
-			Code:       "rate_limit_exceeded",
+			Code:       "retry_after",
 			Message:    "Rate limit exceeded",
 			HTTPStatus: http.StatusTooManyRequests,
 		},
@@ -148,21 +148,44 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 func TestRateLimitRecoveryClassificationExcludesQuotaAndWebsocketLimits(t *testing.T) {
 	auth := &Auth{Provider: "codex", Metadata: map[string]any{"type": "codex"}}
 	for _, testCase := range []struct {
-		name    string
-		message string
-		want    bool
+		name       string
+		code       string
+		message    string
+		httpStatus int
+		want       bool
 	}{
-		{name: "rate limit", message: "rate_limit_exceeded: Rate limit exceeded", want: true},
-		{name: "quota", message: "usage_limit_reached", want: false},
-		{name: "websocket", message: "websocket_connection_limit_reached", want: false},
-		{name: "generic 429", message: "too many requests", want: false},
+		{name: "retry after code", code: "retry_after", message: "Rate limit exceeded", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "rate limit code", code: "rate_limit", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "rate limited code", code: "rate_limited", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "too many requests code", code: "too_many_requests", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "legacy rate limit", message: "rate_limit_exceeded: Rate limit exceeded", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "quota", code: "retry_after", message: "usage_limit_reached", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "websocket", code: "retry_after", message: "websocket_connection_limit_reached", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "generic 429", message: "too many requests", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "marker without 429", code: "retry_after", message: "Rate limit exceeded", httpStatus: http.StatusBadRequest, want: false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			got := shouldQueueRateLimitRecovery(auth, Result{Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: testCase.message}})
+			got := shouldQueueRateLimitRecovery(auth, Result{Error: &Error{
+				Code:       testCase.code,
+				HTTPStatus: testCase.httpStatus,
+				Message:    testCase.message,
+			}})
 			if got != testCase.want {
 				t.Fatalf("shouldQueueRateLimitRecovery() = %v, want %v", got, testCase.want)
 			}
 		})
+	}
+
+	agent := &Auth{Provider: "codex", Metadata: map[string]any{
+		"type":             "codex",
+		"agent_runtime_id": "agent-1",
+	}}
+	if shouldQueueRateLimitRecovery(agent, Result{Error: &Error{
+		Code:       "retry_after",
+		Message:    "Rate limit exceeded",
+		HTTPStatus: http.StatusTooManyRequests,
+	}}) {
+		t.Fatal("agent identity entered OAuth rate-limit recovery")
 	}
 }
 

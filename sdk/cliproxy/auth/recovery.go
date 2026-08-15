@@ -557,7 +557,19 @@ func shouldQueueRateLimitRecovery(auth *Auth, result Result) bool {
 	if strings.Contains(raw, "usage_limit_reached") || strings.Contains(raw, "websocket_connection_limit_reached") || strings.Contains(raw, "too many websocket") {
 		return false
 	}
-	return strings.Contains(raw, "rate_limit_exceeded") || strings.Contains(raw, "rate limit exceeded")
+	for _, marker := range []string{
+		"retry_after",
+		"rate_limit",
+		"rate_limit_exceeded",
+		"rate_limited",
+		"too_many_requests",
+		"rate limit exceeded",
+	} {
+		if strings.Contains(raw, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func markRateLimitRecoveryQueuedLocked(auth *Auth, now time.Time) string {
