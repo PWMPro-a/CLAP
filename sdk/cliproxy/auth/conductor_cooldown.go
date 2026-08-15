@@ -753,6 +753,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			// Credential-wide terminal failures must not be overwritten by the
 			// ordinary per-model cooldown state below.
 		} else if result.Success {
+			auth.observeUpstreamRateLimitSuccess(now)
 			if modelKey != "" {
 				state := ensureModelState(auth, modelKey)
 				resetModelState(state, now)
@@ -889,13 +890,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
+		rateLimitRecovery := shouldQueueRateLimitRecovery(auth, result)
+		if rateLimitRecovery {
+			auth.freezeUpstreamRateLimit(now, result.RetryAfter)
+		}
 		auth.maybeFreezeRuntimeResult(result, now, runtimeStickyBypassSessionFromContext(ctx))
 		if terminalCredential {
 			terminalPeerSnapshots = m.propagateTerminalCredentialLocked(auth, result.Error, now)
 		} else if !result.Success && shouldPropagateCanonicalCooldown(result.Error) {
 			cooldownPeerSnapshots = m.propagateCanonicalCooldownLocked(auth, modelKey, now)
 		}
-		if shouldQueueRateLimitRecovery(auth, result) {
+		if rateLimitRecovery {
 			if generation := markRateLimitRecoveryQueuedLocked(auth, now); generation != "" {
 				recoveryAuthIDs = append(recoveryAuthIDs, auth.ID)
 			}
@@ -904,7 +909,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					continue
 				}
 				livePeer := m.auths[peer.ID]
-				coordinateRateLimitPeerLocked(livePeer, modelKey, now)
+				coordinateRateLimitPeerLocked(livePeer, modelKey, now, result.RetryAfter)
 				cooldownPeerSnapshots[index] = livePeer.Clone()
 			}
 		}

@@ -582,10 +582,11 @@ func markRateLimitRecoveryQueuedLocked(auth *Auth, now time.Time) string {
 	return generation
 }
 
-func coordinateRateLimitPeerLocked(auth *Auth, model string, now time.Time) {
+func coordinateRateLimitPeerLocked(auth *Auth, model string, now time.Time, retryAfter *time.Duration) {
 	if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
 		return
 	}
+	auth.freezeUpstreamRateLimit(now, retryAfter)
 	auth.Status = StatusError
 	auth.StatusMessage = "rate limit exceeded; recovery coordinated"
 	auth.Unavailable = true

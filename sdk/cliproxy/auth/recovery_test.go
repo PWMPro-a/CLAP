@@ -136,6 +136,13 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 	if len(restored.ModelStates) != 0 || restored.LastError != nil || restored.Quota.Exceeded {
 		t.Fatalf("recovery did not clear cooldown state: %+v", restored)
 	}
+	runtimeSnapshot := restored.RuntimeLimitSnapshot(time.Now())
+	if runtimeSnapshot.LastSkipReason != runtimeSkipReasonUpstreamRateLimit || runtimeSnapshot.RateLimitedUntil.IsZero() {
+		t.Fatalf("recovery cleared upstream rate-limit guard: %#v", runtimeSnapshot)
+	}
+	if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); !blocked || reason != blockReasonCooldown {
+		t.Fatalf("recovered credential switched models during Retry-After: blocked=%t reason=%v", blocked, reason)
+	}
 }
 
 func TestRateLimitRecoveryClassificationExcludesQuotaAndWebsocketLimits(t *testing.T) {
@@ -198,6 +205,10 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 			token, _ := current.Metadata["access_token"].(string)
 			return current.Status == StatusActive && !current.Unavailable && token == "new-access-token"
 		})
+		restored, _ := manager.GetByID(id)
+		if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); !blocked || reason != blockReasonCooldown {
+			t.Fatalf("canonical peer %s escaped account-wide rate-limit cooldown: blocked=%t reason=%v", id, blocked, reason)
+		}
 	}
 	if got := executor.refreshCalls.Load(); got != 1 {
 		t.Fatalf("canonical refresh calls = %d, want 1", got)

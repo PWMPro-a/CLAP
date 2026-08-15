@@ -16,8 +16,11 @@ import (
 const (
 	defaultRuntimeSelectionFreezeSeconds = 30
 	defaultRuntimeRateLimitWindowSeconds = 60
+	defaultUpstreamRateLimitBackoff      = 15 * time.Second
+	maximumUpstreamRateLimitBackoff      = 5 * time.Minute
 	runtimeSkipReasonQuotaPreempt        = "quota_preempt"
 	runtimeSkipReasonUsageLimitReached   = "usage_limit_reached"
+	runtimeSkipReasonUpstreamRateLimit   = "upstream_rate_limit"
 )
 
 type authRuntimeLimits struct {
@@ -32,6 +35,8 @@ type authRuntimeLimits struct {
 	usageLimitFreezeUntil        time.Time
 	quotaPreemptFreezeUntil      time.Time
 	rateLimitedUntil             time.Time
+	upstreamRateLimitedUntil     time.Time
+	upstreamRateLimitBackoff     int
 	stickyBypassNext             bool
 	stickyBypassSessions         map[string]time.Time
 	lastSkipReason               string
@@ -134,10 +139,14 @@ func (a *Auth) RuntimeLimitSnapshot(now time.Time) RuntimeLimitSnapshot {
 	if freezeReason != "" {
 		lastSkipReason = freezeReason
 	}
+	rateLimitedUntil := state.rateLimitedUntil
+	if state.upstreamRateLimitedUntil.After(rateLimitedUntil) {
+		rateLimitedUntil = state.upstreamRateLimitedUntil
+	}
 	return RuntimeLimitSnapshot{
 		CurrentConcurrency: state.currentConcurrency,
 		FrozenUntil:        frozenUntil,
-		RateLimitedUntil:   state.rateLimitedUntil,
+		RateLimitedUntil:   rateLimitedUntil,
 		LastSkipReason:     lastSkipReason,
 	}
 }
@@ -359,6 +368,9 @@ func (state *authRuntimeLimits) compactRuntimeWindowLocked(now time.Time, cfg ru
 	if !state.rateLimitedUntil.IsZero() && !state.rateLimitedUntil.After(now) {
 		state.rateLimitedUntil = time.Time{}
 	}
+	if !state.upstreamRateLimitedUntil.IsZero() && !state.upstreamRateLimitedUntil.After(now) {
+		state.upstreamRateLimitedUntil = time.Time{}
+	}
 	if state.rateWindowStart.IsZero() {
 		if state.rateWindowCount > 0 {
 			state.rateWindowCount = 0
@@ -395,6 +407,10 @@ func (state *authRuntimeLimits) activeFreezeLocked(now time.Time) (time.Time, st
 		until = state.quotaPreemptFreezeUntil
 		reason = runtimeSkipReasonQuotaPreempt
 	}
+	if state.upstreamRateLimitedUntil.After(until) {
+		until = state.upstreamRateLimitedUntil
+		reason = runtimeSkipReasonUpstreamRateLimit
+	}
 	if !until.After(now) {
 		return time.Time{}, ""
 	}
@@ -408,7 +424,74 @@ func (state *authRuntimeLimits) onlyQuotaPreemptFreezeLocked(now time.Time) bool
 	if state == nil || !state.quotaPreemptFreezeUntil.After(now) {
 		return false
 	}
-	return !state.frozenUntil.After(now) && !state.usageLimitFreezeUntil.After(now)
+	return !state.frozenUntil.After(now) && !state.usageLimitFreezeUntil.After(now) &&
+		!state.upstreamRateLimitedUntil.After(now)
+}
+
+// freezeUpstreamRateLimit applies a credential-wide cooldown for an upstream
+// transient rate limit. Codex reports these limits per request model, but the
+// underlying account budget is shared; keeping the cooldown model-local lets
+// the same account immediately fail again through another model alias.
+func (a *Auth) freezeUpstreamRateLimit(now time.Time, retryAfter *time.Duration) bool {
+	if a == nil {
+		return false
+	}
+	state := a.ensureRuntimeLimits()
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.upstreamRateLimitedUntil.After(now) {
+		state.recordSkipLocked(runtimeSkipReasonUpstreamRateLimit, state.upstreamRateLimitedUntil, now)
+		return false
+	}
+
+	level := state.upstreamRateLimitBackoff
+	if level < 0 {
+		level = 0
+	}
+	cooldown := defaultUpstreamRateLimitBackoff
+	for step := 0; step < level && cooldown < maximumUpstreamRateLimitBackoff; step++ {
+		cooldown *= 2
+	}
+	if cooldown > maximumUpstreamRateLimitBackoff {
+		cooldown = maximumUpstreamRateLimitBackoff
+	}
+	if retryAfter != nil && *retryAfter > cooldown {
+		cooldown = *retryAfter
+	}
+	if cooldown > maximumUpstreamRateLimitBackoff {
+		cooldown = maximumUpstreamRateLimitBackoff
+	}
+	if cooldown <= 0 {
+		cooldown = defaultUpstreamRateLimitBackoff
+	}
+	state.upstreamRateLimitedUntil = now.Add(cooldown)
+	if cooldown < maximumUpstreamRateLimitBackoff {
+		state.upstreamRateLimitBackoff = level + 1
+	}
+	state.recordSkipLocked(runtimeSkipReasonUpstreamRateLimit, state.upstreamRateLimitedUntil, now)
+	return true
+}
+
+// observeUpstreamRateLimitSuccess resets progressive backoff only after the
+// active window has elapsed. A success from an older in-flight request must not
+// reopen an account that has just returned Retry-After on another request.
+func (a *Auth) observeUpstreamRateLimitSuccess(now time.Time) {
+	if a == nil {
+		return
+	}
+	state := a.ensureRuntimeLimits()
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if !state.upstreamRateLimitedUntil.After(now) {
+		state.upstreamRateLimitedUntil = time.Time{}
+		state.upstreamRateLimitBackoff = 0
+	}
+	state.mu.Unlock()
 }
 
 // runtimeQuotaPreemptFallbackState separates pool-level eligibility from

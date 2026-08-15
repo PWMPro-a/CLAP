@@ -231,6 +231,76 @@ func TestRuntimeLimits_PersistentQuotaFreezeReasonSurvivesBlockedChecks(t *testi
 	}
 }
 
+func TestRuntimeLimits_UpstreamRateLimitBlocksEveryModelAndQuotaFallback(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}
+	auth.updateQuotaPreempt(now, now.Add(time.Hour), true)
+	retryAfter := 40 * time.Second
+	if !auth.freezeUpstreamRateLimit(now, &retryAfter) {
+		t.Fatal("first upstream rate limit did not open a cooldown window")
+	}
+
+	for _, model := range []string{"gpt-a", "gpt-b"} {
+		blocked, reason, retryAt := runtimeAuthBlockedForModelWithTailBurst(auth, model, now.Add(time.Second), false)
+		if !blocked || reason != blockReasonCooldown || retryAt.Before(now.Add(39*time.Second)) {
+			t.Fatalf("model %s block = (%t, %v, %v), want account-wide rate-limit cooldown", model, blocked, reason, retryAt)
+		}
+	}
+
+	fallback := auth.Clone()
+	fallback.quotaPreemptFallback = true
+	if quotaOnly, hasCapacity := runtimeQuotaPreemptFallbackState(fallback, now.Add(time.Second)); quotaOnly || hasCapacity {
+		t.Fatalf("quota fallback crossed upstream rate-limit cooldown: quotaOnly=%t hasCapacity=%t", quotaOnly, hasCapacity)
+	}
+
+	snapshot := auth.RuntimeLimitSnapshot(now.Add(time.Second))
+	if snapshot.RateLimitedUntil.Before(now.Add(39 * time.Second)) {
+		t.Fatalf("runtime snapshot = %#v, want upstream rate-limit deadline", snapshot)
+	}
+	if quotaOnly, hasCapacity := runtimeQuotaPreemptFallbackState(fallback, now.Add(41*time.Second)); !quotaOnly || !hasCapacity {
+		t.Fatalf("quota fallback did not recover after Retry-After: quotaOnly=%t hasCapacity=%t", quotaOnly, hasCapacity)
+	}
+}
+
+func TestRuntimeLimits_UpstreamRateLimitBackoffDeduplicatesBurstAndResetsAfterSuccess(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}
+	retryAfter := 5 * time.Second
+	if !auth.freezeUpstreamRateLimit(now, &retryAfter) {
+		t.Fatal("first upstream rate limit did not open a cooldown window")
+	}
+	first := auth.RuntimeLimitSnapshot(now).RateLimitedUntil
+	if auth.freezeUpstreamRateLimit(now.Add(time.Second), &retryAfter) {
+		t.Fatal("same-window rate-limit burst advanced cooldown")
+	}
+	if got := auth.RuntimeLimitSnapshot(now.Add(time.Second)).RateLimitedUntil; !got.Equal(first) {
+		t.Fatalf("same-window deadline = %v, want %v", got, first)
+	}
+
+	state := auth.ensureRuntimeLimits()
+	state.mu.Lock()
+	state.upstreamRateLimitedUntil = now.Add(-time.Second)
+	state.mu.Unlock()
+	if !auth.freezeUpstreamRateLimit(now.Add(20*time.Second), &retryAfter) {
+		t.Fatal("second rate limit did not open a new cooldown window")
+	}
+	second := auth.RuntimeLimitSnapshot(now.Add(20 * time.Second)).RateLimitedUntil
+	if second.Before(now.Add(49 * time.Second)) {
+		t.Fatalf("second cooldown deadline = %v, want progressive backoff of at least 30 seconds", second)
+	}
+
+	state.mu.Lock()
+	state.upstreamRateLimitedUntil = now.Add(-time.Second)
+	state.mu.Unlock()
+	auth.observeUpstreamRateLimitSuccess(now.Add(time.Minute))
+	state.mu.Lock()
+	level := state.upstreamRateLimitBackoff
+	state.mu.Unlock()
+	if level != 0 {
+		t.Fatalf("backoff level after successful recovery = %d, want 0", level)
+	}
+}
+
 func TestRuntimeLimits_PersistentQuotaFreezeSourcesRecoverIndependently(t *testing.T) {
 	t.Parallel()
 
