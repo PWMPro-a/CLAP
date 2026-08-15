@@ -149,6 +149,59 @@ func expiryDrainConcurrencyLimit(auth *Auth, model string, now time.Time, config
 	return boosted
 }
 
+// expiryDrainFailoverAuths returns the oldest final-window cohort that should
+// temporarily receive a warm session. Normal expiry preference applies only
+// to cold bindings so cache affinity stays intact. In the last five minutes,
+// however, preserving a later-bound credential can strand the entire balance
+// of an older supplier lease. The selector uses this list through its
+// failover cache, leaving the primary binding untouched and automatically
+// returning to it after the drain credential expires or is exhausted.
+func expiryDrainFailoverAuths(auths []*Auth, cached *Auth, model string, now time.Time) []*Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	draining := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || !authExpiryDrainActive(auth, model, now) {
+			continue
+		}
+		draining = append(draining, auth)
+	}
+	if len(draining) == 0 {
+		return nil
+	}
+	sort.SliceStable(draining, func(i, j int) bool {
+		left, _ := authSchedulingExpirationTime(draining[i])
+		right, _ := authSchedulingExpirationTime(draining[j])
+		if !left.Equal(right) {
+			return left.Before(right)
+		}
+		return draining[i].ID < draining[j].ID
+	})
+	earliest, _ := authSchedulingExpirationTime(draining[0])
+	cutoff := earliest.Add(authExpiryCohortWindow)
+	if cached != nil && authExpiryDrainActive(cached, model, now) {
+		if cachedExpiry, ok := authSchedulingExpirationTime(cached); ok && !cachedExpiry.After(cutoff) {
+			return nil
+		}
+	}
+	end := 0
+	for end < len(draining) {
+		expiresAt, _ := authSchedulingExpirationTime(draining[end])
+		if expiresAt.After(cutoff) {
+			break
+		}
+		end++
+	}
+	result := make([]*Auth, 0, end)
+	for _, auth := range draining[:end] {
+		if cached == nil || auth.ID != cached.ID {
+			result = append(result, auth)
+		}
+	}
+	return result
+}
+
 func expiringScheduledEntries(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time) []*scheduledAuth {
 	if len(entries) == 0 {
 		return nil

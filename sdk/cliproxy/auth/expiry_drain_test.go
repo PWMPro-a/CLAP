@@ -138,6 +138,75 @@ func TestSessionAffinityKeepsEstablishedBindingAgainstExpiryLane(t *testing.T) {
 	}
 }
 
+func TestSessionAffinityTemporarilyFailsOverDuringFinalExpiryDrain(t *testing.T) {
+	now := time.Now().UTC()
+	bound := authWithSupplyLeaseExpiry("bound", now.Add(50*time.Minute), now.Add(10*24*time.Hour))
+	drain := authWithSupplyLeaseExpiry("drain", now.Add(4*time.Minute), now.Add(10*24*time.Hour))
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             &RoundRobinSelector{},
+		TTL:                  time.Hour,
+		CacheAffinityEnabled: true,
+	})
+	defer selector.Stop()
+
+	cacheKey := sessionAffinityCacheKey("codex", "derived:stable-session", "gpt-5")
+	selector.cache.Set(cacheKey, bound.ID)
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.DerivedSessionIDMetadataKey: "stable-session",
+	}}
+	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", opts, []*Auth{bound, drain})
+	if errPick != nil {
+		t.Fatalf("final expiry drain pick: %v", errPick)
+	}
+	if got == nil || got.ID != drain.ID {
+		t.Fatalf("final expiry drain picked %v, want %s", got, drain.ID)
+	}
+	if primary, ok := selector.cache.Get(cacheKey); !ok || primary != bound.ID {
+		t.Fatalf("primary cache binding = %q/%t, want preserved %s", primary, ok, bound.ID)
+	}
+	if temporary, ok := selector.failoverCache.Get(cacheKey); !ok || temporary != drain.ID {
+		t.Fatalf("temporary drain binding = %q/%t, want %s", temporary, ok, drain.ID)
+	}
+
+	drain.ModelStates = map[string]*ModelState{
+		"gpt-5": {Quota: QuotaState{Exceeded: true}},
+	}
+	got, errPick = selector.Pick(context.Background(), "codex", "gpt-5", opts, []*Auth{bound, drain})
+	if errPick != nil {
+		t.Fatalf("post-drain affinity pick: %v", errPick)
+	}
+	if got == nil || got.ID != bound.ID {
+		t.Fatalf("post-drain affinity picked %v, want primary %s", got, bound.ID)
+	}
+	if _, ok := selector.failoverCache.Get(cacheKey); ok {
+		t.Fatal("temporary drain binding was retained after quota exhaustion")
+	}
+}
+
+func TestSessionAffinityKeepsCachedAuthWhenItIsInOldestDrainCohort(t *testing.T) {
+	now := time.Now().UTC()
+	bound := authWithSupplyLeaseExpiry("bound", now.Add(3*time.Minute), now.Add(10*24*time.Hour))
+	peer := authWithSupplyLeaseExpiry("peer", now.Add(3*time.Minute+30*time.Second), now.Add(10*24*time.Hour))
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             &RoundRobinSelector{},
+		TTL:                  time.Hour,
+		CacheAffinityEnabled: true,
+	})
+	defer selector.Stop()
+
+	cacheKey := sessionAffinityCacheKey("codex", "derived:drain-session", "gpt-5")
+	selector.cache.Set(cacheKey, bound.ID)
+	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.DerivedSessionIDMetadataKey: "drain-session",
+	}}, []*Auth{peer, bound})
+	if errPick != nil {
+		t.Fatalf("same-cohort affinity pick: %v", errPick)
+	}
+	if got == nil || got.ID != bound.ID {
+		t.Fatalf("same-cohort affinity picked %v, want bound auth %s", got, bound.ID)
+	}
+}
+
 func TestSchedulerPrefersNearExpiryWithoutPerRequestSorting(t *testing.T) {
 	now := time.Now().UTC()
 	near := authWithExpiry("near", now.Add(2*time.Hour))
