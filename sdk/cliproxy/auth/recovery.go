@@ -280,8 +280,9 @@ func (m *Manager) transitionLifecycle(request authRecoveryRequest, tokenPhase bo
 	auth.Unavailable = true
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
-	snapshot := auth.Clone()
-	m.auths[auth.ID] = snapshot
+	stored := auth.Clone()
+	snapshot := stored.Clone()
+	m.auths[auth.ID] = stored
 	m.mu.Unlock()
 	m.publishLifecycleUpdate(snapshot)
 	return snapshot.Clone(), nil
@@ -440,8 +441,9 @@ func (m *Manager) completeLifecycle(request authRecoveryRequest) error {
 			peerSnapshots = append(peerSnapshots, candidate.Clone())
 		}
 	}
-	snapshot := auth.Clone()
-	m.auths[auth.ID] = snapshot
+	stored := auth.Clone()
+	snapshot := stored.Clone()
+	m.auths[auth.ID] = stored
 	m.mu.Unlock()
 	m.invalidateSessionAffinity(request.authID)
 	for authID, models := range modelsByAuth {
@@ -493,8 +495,9 @@ func (m *Manager) failLifecycle(request authRecoveryRequest, lifecycleErr error)
 	auth.Unavailable = true
 	auth.NextRetryAfter = nextRetry
 	auth.UpdatedAt = now
-	snapshot := auth.Clone()
-	m.auths[auth.ID] = snapshot
+	stored := auth.Clone()
+	snapshot := stored.Clone()
+	m.auths[auth.ID] = stored
 	m.mu.Unlock()
 	m.publishLifecycleUpdate(snapshot)
 	log.WithError(lifecycleErr).Warnf("auth lifecycle recovery failed for %s; retrying in %s", request.authID, retry)

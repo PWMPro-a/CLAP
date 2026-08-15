@@ -288,6 +288,9 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if auth.Metadata == nil {
 		return nil
 	}
-	_, err := m.store.Save(ctx, auth)
+	// Stores may normalize persistence-only metadata (for example the disabled
+	// flag and backend path attributes). Never let those writes reach an auth
+	// object owned by Manager or the scheduler.
+	_, err := m.store.Save(ctx, auth.Clone())
 	return err
 }
