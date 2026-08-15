@@ -58,6 +58,22 @@ func TestNormalizeCodexStructuredOutputCompatibility(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "assistant JSON history does not satisfy prompt requirement",
+			body: `{"model":"gpt-5.5","input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Prior JSON response."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"Return one object."}]}],"text":{"format":{"type":"json_object"}}}`,
+			assert: func(t *testing.T, body []byte) {
+				input := gjson.GetBytes(body, "input").Array()
+				if len(input) != 3 || input[2].Get("role").String() != "developer" ||
+					input[2].Get("content.0.text").String() != codexJSONOutputInstruction {
+					t.Fatalf("assistant history suppressed JSON prompt repair: %s", body)
+				}
+			},
+		},
+		{
+			name:      "developer JSON prompt remains unchanged",
+			body:      `{"model":"gpt-5.5","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"Return JSON."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"Return one object."}]}],"text":{"format":{"type":"json_object"}}}`,
+			unchanged: true,
+		},
 	}
 
 	for _, tt := range tests {

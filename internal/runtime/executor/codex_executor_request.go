@@ -393,8 +393,17 @@ func codexStructuredOutputInputContainsJSON(value gjson.Result) bool {
 			return true
 		}
 		itemType := strings.TrimSpace(item.Get("type").String())
-		role := strings.TrimSpace(item.Get("role").String())
+		role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
 		if itemType != "message" && role == "" {
+			continue
+		}
+		// The upstream json_object validator only accepts JSON references from
+		// request-side prompt roles. Historical assistant/output messages do not
+		// satisfy it, so counting them here would suppress the compatibility
+		// instruction and leave an otherwise repairable request failing with 400.
+		switch role {
+		case "user", "developer", "system":
+		default:
 			continue
 		}
 		if codexStructuredOutputTextContainsJSON(item.Get("content")) {
