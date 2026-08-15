@@ -62,6 +62,14 @@ const (
 	DerivedSessionIDMetadataKey = "derived_session_id"
 	// CallerScopeMetadataKey isolates inferred session identities between downstream callers.
 	CallerScopeMetadataKey = "caller_scope"
+	// DownstreamAPIKeyHashMetadataKey identifies the authenticated downstream API key without exposing it.
+	DownstreamAPIKeyHashMetadataKey = "downstream_api_key_hash"
+	// AccountGroupPolicyEvaluatedMetadataKey marks requests with an active group restriction.
+	AccountGroupPolicyEvaluatedMetadataKey = "account_group_policy_evaluated"
+	// AllowedAccountGroupIDsMetadataKey carries the normalized groups permitted for this request.
+	AllowedAccountGroupIDsMetadataKey = "allowed_account_group_ids"
+	// AccountGroupPolicyKeyMetadataKey carries the stable group-set key used by scheduler view caches.
+	AccountGroupPolicyKeyMetadataKey = "account_group_policy_key"
 	// CacheAffinityRouteKeyMetadataKey stores the coordinator's stable local routing key.
 	CacheAffinityRouteKeyMetadataKey = "__cliproxy_cache_affinity_route_key"
 	// CacheAffinityUpstreamKeyMetadataKey stores the stable upstream prompt-cache identity.

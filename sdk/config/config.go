@@ -12,6 +12,8 @@ type Config = internalconfig.Config
 
 type StreamingConfig = internalconfig.StreamingConfig
 type ClaudeCodeConfig = internalconfig.ClaudeCodeConfig
+type AccountGroup = internalconfig.AccountGroup
+type APIKeyGroupPolicy = internalconfig.APIKeyGroupPolicy
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type OAuthModelAlias = internalconfig.OAuthModelAlias
@@ -44,6 +46,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 }
 
 func ParseConfigBytes(data []byte) (*Config, error) { return internalconfig.ParseConfigBytes(data) }
+
+func HashAPIKeyForGroupPolicy(apiKey string) string {
+	return internalconfig.HashAPIKeyForGroupPolicy(apiKey)
+}
 
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	return internalconfig.SaveConfigPreserveComments(configFile, cfg)

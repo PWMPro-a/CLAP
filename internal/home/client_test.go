@@ -324,7 +324,7 @@ func TestNewLifetimePreservesClusterFailoverState(t *testing.T) {
 }
 
 func TestEnsureClientsWaitsForPreviousTargetClose(t *testing.T) {
-	client := New(config.HomeConfig{Enabled: true, Host: "next.example.com", Port: 8327})
+	client := New(config.HomeConfig{Enabled: true, Host: "127.0.0.1", Port: 8327})
 	closing := make(chan struct{})
 	client.closing = closing
 	done := make(chan error, 1)

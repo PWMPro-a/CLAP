@@ -101,6 +101,7 @@ type Auth struct {
 	recentRequests recentRequestRing  `json:"-"`
 	indexAssigned  bool               `json:"-"`
 	runtimeLimits  *authRuntimeLimits `json:"-"`
+	groupIDs       []int64            `json:"-"`
 
 	// quotaPreemptFallback is set only on a request-local clone selected by the
 	// all-pool quota fallback. It never mutates or persists the registered auth.
@@ -299,8 +300,47 @@ func (a *Auth) Clone() *Auth {
 			copyAuth.ModelStates[key] = state.Clone()
 		}
 	}
+	if len(a.groupIDs) > 0 {
+		copyAuth.groupIDs = append([]int64(nil), a.groupIDs...)
+	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// GroupIDs returns the normalized account groups assigned to this auth.
+func (a *Auth) GroupIDs() []int64 {
+	if a == nil || len(a.groupIDs) == 0 {
+		return nil
+	}
+	return append([]int64(nil), a.groupIDs...)
+}
+
+func (a *Auth) syncGroupIDsFromMetadata() {
+	if a == nil || a.Metadata == nil {
+		if a != nil {
+			a.groupIDs = nil
+		}
+		return
+	}
+	a.groupIDs = normalizeRuntimeGroupIDs(a.Metadata["group_ids"])
+}
+
+func (a *Auth) matchesAnyGroup(allowed []int64) bool {
+	if a == nil || len(a.groupIDs) == 0 || len(allowed) == 0 {
+		return false
+	}
+	i, j := 0, 0
+	for i < len(a.groupIDs) && j < len(allowed) {
+		switch {
+		case a.groupIDs[i] == allowed[j]:
+			return true
+		case a.groupIDs[i] < allowed[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	return false
 }
 
 func stableAuthIndex(seed string) string {

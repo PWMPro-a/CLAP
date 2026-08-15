@@ -99,6 +99,9 @@ type authSelectionEligibility struct {
 	requiredKind                    string
 	credentialPolicy                string
 	disallowFreeAuth                bool
+	accountGroupPolicyEvaluated     bool
+	allowedAccountGroupIDs          []int64
+	accountGroupPolicyKey           string
 	codexClientRestrictionEvaluated bool
 	codexClientAllowed              bool
 	codexAppServerAllowed           bool
@@ -123,6 +126,11 @@ func credentialPolicyFromContext(ctx context.Context) string {
 func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecutor.Options) authSelectionEligibility {
 	eligibility := authSelectionEligibility{disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata)}
 	if len(opts.Metadata) > 0 {
+		eligibility.accountGroupPolicyEvaluated, _ = opts.Metadata[cliproxyexecutor.AccountGroupPolicyEvaluatedMetadataKey].(bool)
+		if eligibility.accountGroupPolicyEvaluated {
+			eligibility.allowedAccountGroupIDs = normalizeRuntimeGroupIDs(opts.Metadata[cliproxyexecutor.AllowedAccountGroupIDsMetadataKey])
+			eligibility.accountGroupPolicyKey = accountGroupSelectionKey(eligibility.allowedAccountGroupIDs)
+		}
 		eligibility.codexClientRestrictionEvaluated, _ = opts.Metadata[codexClientRestrictionEvaluatedMetadataKey].(bool)
 		eligibility.codexClientAllowed, _ = opts.Metadata[codexClientRestrictionAllowedMetadataKey].(bool)
 		eligibility.codexAppServerAllowed, _ = opts.Metadata[codexClientRestrictionAppServerAllowedMetadataKey].(bool)
@@ -144,6 +152,9 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if e.credentialPolicy != "" && !credentialPolicyAllows(e.credentialPolicy, auth) {
 		return false
 	}
+	if e.accountGroupPolicyEvaluated && !auth.matchesAnyGroup(e.allowedAccountGroupIDs) {
+		return false
+	}
 	if e.codexClientRestrictionEvaluated && codexClientRestrictionEnabledForAuth(auth) {
 		if codexClientRestrictionAppServerEnabledForAuth(auth) {
 			if !e.codexAppServerAllowed {
@@ -154,6 +165,16 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 		}
 	}
 	return !e.disallowFreeAuth || !isFreeCodexAuth(auth)
+}
+
+func (e authSelectionEligibility) accountGroups() *accountGroupSelection {
+	if !e.accountGroupPolicyEvaluated || len(e.allowedAccountGroupIDs) == 0 {
+		return nil
+	}
+	return &accountGroupSelection{
+		key: e.accountGroupPolicyKey,
+		ids: e.allowedAccountGroupIDs,
+	}
 }
 
 func (m *Manager) syncSchedulerFromSnapshot(auths []*Auth) {
@@ -1542,6 +1563,7 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	opts = m.withAccountGroupPolicyFromContext(ctx, opts)
 	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
 		if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
 			return auth, executor, nil
@@ -1552,7 +1574,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return auth, exec, err
 	}
 
-	if !m.newCandidateMode() {
+	if !m.newCandidateMode() && !accountGroupPolicyActive(opts.Metadata) {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	executor, okExecutor := m.Executor(provider)
@@ -1699,6 +1721,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	opts = m.withAccountGroupPolicyFromContext(ctx, opts)
 	if hasCodexProvider(providers) {
 		if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
 			return auth, executor, "codex", nil
@@ -1708,7 +1731,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
-	if !m.newCandidateMode() {
+	if !m.newCandidateMode() && !accountGroupPolicyActive(opts.Metadata) {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 

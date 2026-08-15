@@ -145,6 +145,9 @@ type Manager struct {
 	// apiKeyModelRouting atomically publishes per-auth aliases and configured capabilities.
 	apiKeyModelRouting atomic.Value
 
+	// apiKeyGroupPolicies atomically publishes downstream key to account-group restrictions.
+	apiKeyGroupPolicies atomic.Value
+
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
 	modelPoolOffsets map[string]int
 
@@ -195,6 +198,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.codexTailBurstCandidates.Store(codexTailBurstCandidateIndex{})
 	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: &internalconfig.Config{}})
+	manager.apiKeyGroupPolicies.Store(&apiKeyGroupPolicySnapshot{byHash: map[string]accountGroupSelection{}})
 	defaultInFlightConfig, errInFlightConfig := HomeInFlightPublisherConfigFromConfig(internalconfig.DefaultCredentialInFlightConfig())
 	if errInFlightConfig == nil {
 		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)

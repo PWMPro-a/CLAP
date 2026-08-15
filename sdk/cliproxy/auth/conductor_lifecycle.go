@@ -69,6 +69,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	auth.syncGroupIDsFromMetadata()
 	ApplyInitializationStateFromMetadata(auth)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("register auth: %w", errWeight)
@@ -109,6 +110,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	auth.syncGroupIDsFromMetadata()
 	ApplyInitializationStateFromMetadata(auth)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("update auth: %w", errWeight)
@@ -245,6 +247,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
+		auth.syncGroupIDsFromMetadata()
 		ApplyInitializationStateFromMetadata(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()

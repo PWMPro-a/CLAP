@@ -207,6 +207,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if callerScope := requestCallerScope(ginCtx); callerScope != "" {
 		meta[coreexecutor.CallerScopeMetadataKey] = callerScope
 	}
+	if apiKeyHash := requestAPIKeyHash(ginCtx); apiKeyHash != "" {
+		meta[coreexecutor.DownstreamAPIKeyHashMetadataKey] = apiKeyHash
+	}
 	if authenticatedAppServerRequest(ginCtx) {
 		meta[coreexecutor.CodexAppServerMetadataKey] = true
 	}
@@ -245,6 +248,17 @@ func requestCallerScope(ginCtx *gin.Context) string {
 		return ""
 	}
 	return coresession.CallerScope(fmt.Sprint(value))
+}
+
+func requestAPIKeyHash(ginCtx *gin.Context) string {
+	if ginCtx == nil {
+		return ""
+	}
+	value, exists := ginCtx.Get("userApiKey")
+	if !exists || value == nil {
+		return ""
+	}
+	return config.HashAPIKeyForGroupPolicy(fmt.Sprint(value))
 }
 
 func addAuthSelectionModelMetadata(meta map[string]any, model string) {

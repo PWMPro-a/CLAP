@@ -401,6 +401,9 @@ type ClaudeKey struct {
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// GroupIDs assigns this credential to operator-managed account groups.
+	GroupIDs []int64 `yaml:"group-ids,omitempty" json:"group-ids,omitempty"`
+
 	// Priority controls selection preference when multiple credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -495,6 +498,9 @@ func (m ClaudeModel) GetThinking() *registry.ThinkingSupport { return m.Thinking
 type CodexKey struct {
 	// APIKey is the authentication key for accessing Codex API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// GroupIDs assigns this credential to operator-managed account groups.
+	GroupIDs []int64 `yaml:"group-ids,omitempty" json:"group-ids,omitempty"`
 
 	// Priority controls selection preference when multiple credentials match.
 	// Higher values are preferred; defaults to 0.
@@ -595,6 +601,9 @@ type GeminiKey struct {
 	// APIKey is the authentication key for accessing Gemini API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// GroupIDs assigns this credential to operator-managed account groups.
+	GroupIDs []int64 `yaml:"group-ids,omitempty" json:"group-ids,omitempty"`
+
 	// Priority controls selection preference when multiple credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -691,6 +700,9 @@ type OpenAICompatibility struct {
 	// BaseURL is the base URL for the external OpenAI-compatible API endpoint.
 	BaseURL string `yaml:"base-url" json:"base-url"`
 
+	// GroupIDs assigns a keyless compatibility credential to account groups.
+	GroupIDs []int64 `yaml:"group-ids,omitempty" json:"group-ids,omitempty"`
+
 	// APIKeyEntries defines API keys with optional per-key proxy configuration.
 	APIKeyEntries []OpenAICompatibilityAPIKey `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
 
@@ -711,6 +723,9 @@ type OpenAICompatibility struct {
 type OpenAICompatibilityAPIKey struct {
 	// APIKey is the authentication key for accessing the external API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// GroupIDs assigns this credential to operator-managed account groups.
+	GroupIDs []int64 `yaml:"group-ids,omitempty" json:"group-ids,omitempty"`
 
 	// Weight controls proportional selection under weighted-round-robin.
 	// An omitted value defaults to 1; non-positive values exclude this credential; maximum 1,000,000.

@@ -98,13 +98,14 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	nameFilter := strings.TrimSpace(c.Query("name"))
 	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
+	includeConfig := strings.EqualFold(strings.TrimSpace(c.Query("include_config")), "true")
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) {
 			continue
 		}
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
+		if entry := h.buildAuthFileEntryForList(auth, includeConfig); entry != nil {
 			files = append(files, entry)
 		}
 	}
@@ -306,6 +307,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						}
 					}
 				}
+				if groupIDs := authFileJSONGroupIDs(data); len(groupIDs) > 0 {
+					fileData["group_ids"] = groupIDs
+				} else {
+					fileData["group_ids"] = []int64{}
+				}
 				applyAuthFileRuntimeLimitFieldsFromJSON(fileData, data)
 			}
 
@@ -316,22 +322,27 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
-	authFileEntryMu.Lock()
-	defer authFileEntryMu.Unlock()
-	return h.buildAuthFileEntryLocked(auth)
+	return h.buildAuthFileEntryForList(auth, false)
 }
 
-func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
+func (h *Handler) buildAuthFileEntryForList(auth *coreauth.Auth, includeConfig bool) gin.H {
+	authFileEntryMu.Lock()
+	defer authFileEntryMu.Unlock()
+	return h.buildAuthFileEntryLocked(auth, includeConfig)
+}
+
+func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, includeConfig bool) gin.H {
 	if auth == nil {
 		return nil
 	}
 	auth.EnsureIndex()
 	runtimeOnly := isRuntimeOnlyAuth(auth)
+	configBacked := isConfigBackedAuth(auth)
 	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
 		return nil
 	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" && !runtimeOnly {
+	if path == "" && !runtimeOnly && !(includeConfig && configBacked) {
 		return nil
 	}
 	name := strings.TrimSpace(auth.FileName)
@@ -353,8 +364,13 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		"source":         "memory",
 		"size":           int64(0),
 	}
+	if configBacked {
+		entry["source"] = "config"
+		entry["config_backed"] = true
+	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
+	entry["group_ids"] = auth.GroupIDs()
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
@@ -471,6 +487,40 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		}
 	}
 	return entry
+}
+
+func authFileJSONGroupIDs(data []byte) []int64 {
+	value := gjson.GetBytes(data, "group_ids")
+	if !value.Exists() || !value.IsArray() {
+		return nil
+	}
+	ids := make([]int64, 0, len(value.Array()))
+	seen := make(map[int64]struct{})
+	for _, item := range value.Array() {
+		var id int64
+		switch item.Type {
+		case gjson.Number:
+			id = item.Int()
+		case gjson.String:
+			parsed, errParse := strconv.ParseInt(strings.TrimSpace(item.String()), 10, 64)
+			if errParse != nil {
+				continue
+			}
+			id = parsed
+		default:
+			continue
+		}
+		if id <= 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 func applyAuthFileRuntimeLimitFields(entry gin.H, auth *coreauth.Auth) {
@@ -723,6 +773,14 @@ func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true")
+}
+
+func isConfigBackedAuth(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	source := strings.ToLower(strings.TrimSpace(authAttribute(auth, coreauth.AttributeSource)))
+	return strings.HasPrefix(source, "config:")
 }
 
 func isUnsafeAuthFileName(name string) bool {

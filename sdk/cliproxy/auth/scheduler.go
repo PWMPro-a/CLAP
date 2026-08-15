@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -20,6 +21,9 @@ const (
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+
+	maxAccountGroupReadyViewCacheEntries = 64
+	maxAccountGroupMixedStateEntries     = 256
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -42,6 +46,8 @@ type authScheduler struct {
 	mixedWeightedStates   map[string]*smoothWeightedState
 	mixedExpiryCursors    map[string]int
 	mixedExpiryWeighted   map[string]*smoothWeightedState
+	mixedGroupStateKeys   map[string]struct{}
+	mixedGroupStateOrder  []string
 	selectionModelForAuth func(*Auth, string) string
 	quotaFallback         func([]*Auth, string, time.Time) *Auth
 }
@@ -87,8 +93,12 @@ type scheduledAuth struct {
 
 // readyBucket keeps the ready views for one priority level.
 type readyBucket struct {
-	all readyView
-	ws  readyView
+	all             readyView
+	ws              readyView
+	groupViews      map[string]*readyView
+	websocketGroups map[string]*readyView
+	groupViewOrder  []string
+	websocketOrder  []string
 }
 
 // readyView holds the selection order for flat round-robin traversal.
@@ -178,6 +188,7 @@ func newAuthScheduler(selector Selector) *authScheduler {
 		mixedWeightedStates: make(map[string]*smoothWeightedState),
 		mixedExpiryCursors:  make(map[string]int),
 		mixedExpiryWeighted: make(map[string]*smoothWeightedState),
+		mixedGroupStateKeys: make(map[string]struct{}),
 	}
 }
 
@@ -207,6 +218,8 @@ func (s *authScheduler) setSelector(selector Selector) {
 	clear(s.mixedWeightedStates)
 	clear(s.mixedExpiryCursors)
 	clear(s.mixedExpiryWeighted)
+	clear(s.mixedGroupStateKeys)
+	s.mixedGroupStateOrder = s.mixedGroupStateOrder[:0]
 }
 
 func (s *authScheduler) setSelectionModelResolver(resolve func(*Auth, string) string) {
@@ -253,6 +266,10 @@ func (s *authScheduler) rebuildWithSelectionModels(auths []*Auth, selectionModel
 	s.authProviders = make(map[string]string)
 	s.mixedCursors = make(map[string]int)
 	s.mixedWeightedStates = make(map[string]*smoothWeightedState)
+	s.mixedExpiryCursors = make(map[string]int)
+	s.mixedExpiryWeighted = make(map[string]*smoothWeightedState)
+	s.mixedGroupStateKeys = make(map[string]struct{})
+	s.mixedGroupStateOrder = nil
 	now := time.Now()
 	for _, auth := range auths {
 		var modelSet map[string]string
@@ -388,7 +405,8 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin, now)
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+	groups := eligibility.accountGroups()
+	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate, groups); picked != nil {
 		return picked, nil
 	}
 	if s.quotaFallback != nil && providerKey == "codex" {
@@ -455,7 +473,8 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 		shard := providerState.ensureModelLocked(modelKey, now)
 		predicate := scheduledAuthPredicate(eligibility, tried, pinnedAuthID, strategy == schedulerStrategyWeightedRoundRobin, now)
-		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
+		groups := eligibility.accountGroups()
+		if picked := shard.pickReadyLocked(false, strategy, predicate, groups); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -463,6 +482,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 
 	now := time.Now()
 	predicate := scheduledAuthPredicate(eligibility, tried, "", strategy == schedulerStrategyWeightedRoundRobin, now)
+	groups := eligibility.accountGroups()
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
 	hasCandidate := false
@@ -476,7 +496,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		priorityReady, okPriority := shard.highestReadyPriorityLocked(false, predicate)
+		priorityReady, okPriority := shard.highestReadyPriorityLocked(false, predicate, groups)
 		if !okPriority {
 			continue
 		}
@@ -501,6 +521,12 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
+	if groups != nil && groups.key != "" {
+		cursorKey += ":groups=" + groups.key
+		if strategy != schedulerStrategyFillFirst {
+			s.retainMixedGroupStateKeyLocked(cursorKey)
+		}
+	}
 	expiringEntries := make([]*scheduledAuth, 0)
 	for _, shard := range candidateShards {
 		if shard == nil {
@@ -510,7 +536,8 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if bucket == nil {
 			continue
 		}
-		expiringEntries = append(expiringEntries, expiringScheduledEntries(bucket.all.flat, predicate, now)...)
+		view := bucket.view(false, groups)
+		expiringEntries = append(expiringEntries, expiringScheduledEntries(view.flat, predicate, now)...)
 	}
 	if len(expiringEntries) > 0 {
 		expiringEntries = narrowScheduledExpiryLane(expiringEntries)
@@ -546,7 +573,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate, groups)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -562,7 +589,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			}
 			bucket := shard.readyByPriority[bestPriority]
 			if bucket != nil {
-				entries = append(entries, bucket.all.flat...)
+				entries = append(entries, bucket.view(false, groups).flat...)
 			}
 		}
 		sort.Slice(entries, func(i, j int) bool {
@@ -597,7 +624,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	for providerIndex, shard := range candidateShards {
 		segmentStarts[providerIndex] = totalWeight
 		if shard != nil {
-			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority, predicate)
+			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority, predicate, groups)
 		}
 		totalWeight += weights[providerIndex]
 		segmentEnds[providerIndex] = totalWeight
@@ -635,7 +662,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate, groups)
 		if picked == nil {
 			continue
 		}
@@ -702,6 +729,29 @@ func scheduledAuthPredicate(eligibility authSelectionEligibility, tried map[stri
 		}
 		return true
 	}
+}
+
+func (s *authScheduler) retainMixedGroupStateKeyLocked(key string) {
+	if s == nil || key == "" {
+		return
+	}
+	if s.mixedGroupStateKeys == nil {
+		s.mixedGroupStateKeys = make(map[string]struct{})
+	}
+	if _, exists := s.mixedGroupStateKeys[key]; exists {
+		return
+	}
+	if len(s.mixedGroupStateOrder) >= maxAccountGroupMixedStateEntries {
+		oldest := s.mixedGroupStateOrder[0]
+		s.mixedGroupStateOrder = s.mixedGroupStateOrder[1:]
+		delete(s.mixedGroupStateKeys, oldest)
+		delete(s.mixedCursors, oldest)
+		delete(s.mixedWeightedStates, oldest)
+		delete(s.mixedExpiryCursors, oldest)
+		delete(s.mixedExpiryWeighted, oldest)
+	}
+	s.mixedGroupStateKeys[key] = struct{}{}
+	s.mixedGroupStateOrder = append(s.mixedGroupStateOrder, key)
 }
 
 // normalizeProviderKeys lowercases, trims, and de-duplicates provider keys while preserving order.
@@ -985,6 +1035,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	previousCanonicalScore := 0
 	previousExpiresAt := time.Time{}
 	previousSupplyLeaseExpiresAt := time.Time{}
+	var previousGroupIDs []int64
 	if entry.meta != nil {
 		previousPriority = entry.meta.priority
 		previousWebsocketEnabled = entry.meta.websocketEnabled
@@ -992,6 +1043,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		previousCanonicalScore = entry.meta.canonicalScore
 		previousExpiresAt = entry.expiresAt
 		previousSupplyLeaseExpiresAt = entry.supplyLeaseExpiresAt
+		previousGroupIDs = entry.auth.groupIDs
 	}
 
 	entry.meta = meta
@@ -1022,7 +1074,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority &&
 		previousWebsocketEnabled == meta.websocketEnabled && previousCanonicalIdentity == meta.canonicalIdentity &&
 		previousCanonicalScore == meta.canonicalScore && previousExpiresAt.Equal(entry.expiresAt) &&
-		previousSupplyLeaseExpiresAt.Equal(entry.supplyLeaseExpiresAt) {
+		previousSupplyLeaseExpiresAt.Equal(entry.supplyLeaseExpiresAt) && slices.Equal(previousGroupIDs, meta.auth.groupIDs) {
 		return
 	}
 	m.rebuildIndexesLocked()
@@ -1076,21 +1128,21 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, groups *accountGroupSelection) *Auth {
 	if m == nil {
 		return nil
 	}
 	m.promoteExpiredLocked(time.Now())
-	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
+	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate, groups)
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate, groups)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) (int, bool) {
+func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool, groups *accountGroupSelection) (int, bool) {
 	if m == nil {
 		return 0, false
 	}
@@ -1102,7 +1154,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 			if bucket == nil {
 				continue
 			}
-			if bucket.ws.pickFirst(predicate) != nil {
+			if bucket.view(true, groups).pickFirst(predicate) != nil {
 				return priority, true
 			}
 		}
@@ -1112,7 +1164,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 		if bucket == nil {
 			continue
 		}
-		if bucket.all.pickFirst(predicate) != nil {
+		if bucket.view(false, groups).pickFirst(predicate) != nil {
 			return priority, true
 		}
 	}
@@ -1121,7 +1173,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, groups *accountGroupSelection) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -1129,9 +1181,9 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if bucket == nil {
 		return nil
 	}
-	view := &bucket.all
-	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
-		view = &bucket.ws
+	view := bucket.view(false, groups)
+	if preferWebsocket && bucket.view(true, groups).pickFirst(predicate) != nil {
+		view = bucket.view(true, groups)
 	}
 	if picked := view.pickExpiring(predicate, strategy, time.Now()); picked != nil {
 		return picked.auth
@@ -1151,7 +1203,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	return picked.auth
 }
 
-func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) int {
+func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool, groups *accountGroupSelection) int {
 	if m == nil {
 		return 0
 	}
@@ -1159,9 +1211,9 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 	if bucket == nil {
 		return 0
 	}
-	view := &bucket.all
-	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
-		view = &bucket.ws
+	view := bucket.view(false, groups)
+	if preferWebsocket && bucket.view(true, groups).pickFirst(predicate) != nil {
+		view = bucket.view(true, groups)
 	}
 	count := 0
 	for _, entry := range view.flat {
@@ -1317,7 +1369,10 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 
 // buildReadyBucket prepares the general and websocket-only ready views for one priority bucket.
 func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
-	bucket := &readyBucket{}
+	bucket := &readyBucket{
+		groupViews:      make(map[string]*readyView),
+		websocketGroups: make(map[string]*readyView),
+	}
 	bucket.all = buildReadyView(entries)
 	wsEntries := make([]*scheduledAuth, 0, len(entries))
 	for _, entry := range entries {
@@ -1327,6 +1382,45 @@ func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
 	}
 	bucket.ws = buildReadyView(wsEntries)
 	return bucket
+}
+
+func (b *readyBucket) view(websocketOnly bool, groups *accountGroupSelection) *readyView {
+	if b == nil {
+		return &readyView{}
+	}
+	base := &b.all
+	cache := b.groupViews
+	order := &b.groupViewOrder
+	if websocketOnly {
+		base = &b.ws
+		cache = b.websocketGroups
+		order = &b.websocketOrder
+	}
+	if groups == nil || len(groups.ids) == 0 {
+		return base
+	}
+	key := strings.TrimSpace(groups.key)
+	if key == "" {
+		key = accountGroupSelectionKey(groups.ids)
+	}
+	if cached := cache[key]; cached != nil {
+		return cached
+	}
+	entries := make([]*scheduledAuth, 0)
+	for _, entry := range base.flat {
+		if entry != nil && entry.auth != nil && entry.auth.matchesAnyGroup(groups.ids) {
+			entries = append(entries, entry)
+		}
+	}
+	view := buildReadyView(entries)
+	if len(cache) >= maxAccountGroupReadyViewCacheEntries && len(*order) > 0 {
+		oldest := (*order)[0]
+		*order = (*order)[1:]
+		delete(cache, oldest)
+	}
+	cache[key] = &view
+	*order = append(*order, key)
+	return &view
 }
 
 // buildReadyView creates a flat view for rotation.

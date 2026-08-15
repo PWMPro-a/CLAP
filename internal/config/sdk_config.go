@@ -54,6 +54,13 @@ type SDKConfig struct {
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
+	// AccountGroups defines operator-managed groups used to organize upstream credentials.
+	AccountGroups []AccountGroup `yaml:"account-groups,omitempty" json:"account-groups,omitempty"`
+
+	// APIKeyGroupPolicies limits downstream API keys to credentials in selected account groups.
+	// Keys without a policy remain unrestricted for backward compatibility.
+	APIKeyGroupPolicies []APIKeyGroupPolicy `yaml:"api-key-group-policies,omitempty" json:"api-key-group-policies,omitempty"`
+
 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`

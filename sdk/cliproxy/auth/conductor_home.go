@@ -728,6 +728,7 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 }
 
 func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	opts = m.withAccountGroupPolicyFromContext(ctx, opts)
 	baseCount := homeAuthCountFromMetadata(opts.Metadata)
 	if baseCount < 1 {
 		baseCount = 1
@@ -740,7 +741,9 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 			return nil, errSelection
 		}
 		auth := selection.CloneAuth()
-		if codexClientRestrictionAllowsAuth(opts, auth) {
+		codexAllowed := codexClientRestrictionAllowsAuth(opts, auth)
+		groupsAllowed := accountGroupPolicyAllowsAuth(opts.Metadata, auth)
+		if codexAllowed && groupsAllowed {
 			return selection, nil
 		}
 
@@ -748,13 +751,20 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 		if auth != nil {
 			authID = strings.TrimSpace(auth.ID)
 		}
-		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "codex_client_restricted"); errEnd != nil {
+		reason := "codex_client_restricted"
+		if !groupsAllowed {
+			reason = "account_group_restricted"
+		}
+		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, reason); errEnd != nil {
 			return nil, errEnd
 		}
 		if authID == "" {
 			return nil, &Error{Code: "invalid_auth", Message: "home returned auth without id", HTTPStatus: http.StatusBadGateway}
 		}
 		if _, repeated := triedRestricted[authID]; repeated {
+			if !groupsAllowed {
+				return nil, &Error{Code: "auth_not_found", Message: "no auth available for allowed account groups", HTTPStatus: http.StatusServiceUnavailable}
+			}
 			return nil, &Error{Code: "codex_client_restricted", Message: codexClientRestrictionMessage, HTTPStatus: http.StatusForbidden}
 		}
 		triedRestricted[authID] = struct{}{}
@@ -890,6 +900,7 @@ func (m *Manager) pickHomeDispatchSelectionOnce(ctx context.Context, model strin
 			return nil, &Error{Code: "invalid_auth", Message: "home returned invalid auth payload", HTTPStatus: http.StatusBadGateway}
 		}
 	}
+	auth.syncGroupIDsFromMetadata()
 	observedModel := canonicalHomeDispatchModel(dispatch.Model, requestedModel)
 	if envelope.Present {
 		observedConcurrencyModel, validModel := validCanonicalHomeConcurrencyModelKey(observedModel)
@@ -1008,11 +1019,16 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	if m == nil || !m.localExecutionAllowed() {
 		return nil, nil
 	}
+	opts = m.withAccountGroupPolicyFromContext(ctx, opts)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	var candidates []creditsCandidateEntry
 	m.mu.RLock()
 	for _, auth := range m.auths {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if !eligibility.allows(auth) {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {

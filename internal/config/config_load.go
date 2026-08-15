@@ -194,6 +194,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	// Normalize account groups and downstream API key group policies.
+	cfg.NormalizeAccountGroups()
+
 	// Return the populated configuration struct.
 	return &cfg, nil
 }

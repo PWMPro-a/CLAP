@@ -67,6 +67,9 @@ func TestRequestExecutionMetadataIncludesHashedCallerScope(t *testing.T) {
 	if got == "downstream-secret" {
 		t.Fatal("caller scope contains the raw downstream credential")
 	}
+	if apiKeyHash, _ := meta[coreexecutor.DownstreamAPIKeyHashMetadataKey].(string); apiKeyHash != config.HashAPIKeyForGroupPolicy("downstream-secret") {
+		t.Fatalf("DownstreamAPIKeyHashMetadataKey = %q", apiKeyHash)
+	}
 	if trusted, _ := meta[coreexecutor.CodexAppServerMetadataKey].(bool); !trusted {
 		t.Fatal("authenticated request is missing internal Codex app-server proof")
 	}

@@ -32,6 +32,13 @@ func addWeightToAttrs(weight *int, attrs map[string]string) {
 	attrs[coreauth.AttributeWeight] = strconv.Itoa(normalized)
 }
 
+func addAccountGroupsToMetadata(groupIDs []int64, metadata map[string]any) {
+	ids := config.NormalizeAccountGroupIDs(groupIDs)
+	if len(ids) > 0 {
+		metadata["group_ids"] = ids
+	}
+}
+
 // Synthesize generates Auth entries from config API keys.
 func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	out := make([]*coreauth.Auth, 0, 32)
@@ -93,6 +100,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 			"config_index": strconv.Itoa(i),
 		}
 		metadata := map[string]any{}
+		addAccountGroupsToMetadata(entry.GroupIDs, metadata)
 		if entry.DisableCooling {
 			metadata["disable_cooling"] = true
 		}
@@ -151,6 +159,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			"config_index": strconv.Itoa(i),
 		}
 		metadata := map[string]any{}
+		addAccountGroupsToMetadata(ck.GroupIDs, metadata)
 		if ck.DisableCooling {
 			metadata["disable_cooling"] = true
 		}
@@ -223,6 +232,7 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 			"config_index": strconv.Itoa(i),
 		}
 		metadata := map[string]any{}
+		addAccountGroupsToMetadata(entry.GroupIDs, metadata)
 		if entry.DisableCooling {
 			metadata["disable_cooling"] = true
 		}
@@ -303,6 +313,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"config_index": strconv.Itoa(i),
 			}
 			metadata := map[string]any{}
+			addAccountGroupsToMetadata(entry.GroupIDs, metadata)
 			if disableCooling {
 				metadata["disable_cooling"] = true
 			}
@@ -348,6 +359,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"config_index": strconv.Itoa(i),
 			}
 			metadata := map[string]any{}
+			addAccountGroupsToMetadata(compat.GroupIDs, metadata)
 			if disableCooling {
 				metadata["disable_cooling"] = true
 			}
@@ -402,6 +414,8 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			"provider_key": providerName,
 			"config_index": strconv.Itoa(i),
 		}
+		metadata := map[string]any{}
+		addAccountGroupsToMetadata(compat.GroupIDs, metadata)
 		if compat.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(compat.Priority)
 		}
@@ -422,10 +436,14 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			ProxyURL:   proxyURL,
 			SourceIP:   sourceIP,
 			Attributes: attrs,
+			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, compat.ExcludedModels, "apikey")
+		if len(a.Metadata) == 0 {
+			a.Metadata = nil
+		}
 		out = append(out, a)
 	}
 	return out

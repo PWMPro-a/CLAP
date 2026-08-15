@@ -297,6 +297,27 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			return
 		} else if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
+		} else if fieldPath == "group_ids" {
+			groupIDs, errGroups := normalizeAccountGroupIDsValue(value)
+			if errGroups != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errGroups.Error()})
+				return
+			}
+			h.mu.Lock()
+			knownGroups := knownAccountGroupIDs(h.cfg.AccountGroups)
+			h.mu.Unlock()
+			if missing := missingAccountGroupIDs(groupIDs, knownGroups); len(missing) > 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unknown account group ids: %v", missing)})
+				return
+			}
+			if len(groupIDs) == 0 {
+				delete(targetAuth.Metadata, "group_ids")
+			} else {
+				targetAuth.Metadata["group_ids"] = groupIDs
+			}
+		} else if rootAuthFileField(fieldPath) == "group_ids" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "group_ids does not support nested fields"})
+			return
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
 			return
