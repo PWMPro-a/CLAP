@@ -18,9 +18,17 @@ const (
 	// authExpiryDrainWindow is the final window in which an account may use a
 	// bounded concurrency boost to consume remaining quota before expiry.
 	authExpiryDrainWindow = 5 * time.Minute
-	// authExpiryDrainMaxConcurrency prevents a configured single-slot account
-	// from becoming an unbounded fan-out during the drain window.
-	authExpiryDrainMaxConcurrency = 8
+	// authExpiryPriorityDefaultConcurrency prevents an unconfigured near-expiry
+	// account from absorbing the whole request stream. Once the oldest cohort is
+	// full, normal availability filtering lets requests spill into the next
+	// expiry cohort instead of provoking upstream rate limits on one account.
+	authExpiryPriorityDefaultConcurrency = 8
+	// The final drain ceiling is selected from the remaining quota. Accounts
+	// with substantial unused quota may fan out further, while mostly-consumed
+	// accounts stay at the normal near-expiry limit to avoid needless 429s.
+	authExpiryDrainMinConcurrency    = 8
+	authExpiryDrainNormalConcurrency = 10
+	authExpiryDrainUrgentConcurrency = 12
 )
 
 var authSupplyLeaseExpiryKeys = [...]string{
@@ -132,19 +140,48 @@ func expiryPriorityAuths(auths []*Auth, now time.Time) []*Auth {
 	return priority[:end]
 }
 
+func expiryPriorityConcurrencyLimit(auth *Auth, model string, now time.Time, configured int) int {
+	if configured < 0 {
+		configured = 0
+	}
+	if _, ok := authExpiryRemaining(auth, now); !ok {
+		return configured
+	}
+	if configured == 0 {
+		configured = authExpiryPriorityDefaultConcurrency
+	}
+	return expiryDrainConcurrencyLimit(auth, model, now, configured)
+}
+
+func expiryDrainConcurrencyCeiling(auth *Auth, model string, now time.Time) int {
+	snapshot, ok := auth.codexQuotaSnapshot(model, now)
+	if !ok {
+		return authExpiryDrainNormalConcurrency
+	}
+	switch {
+	case snapshot.UsedRatio < 0.50:
+		return authExpiryDrainUrgentConcurrency
+	case snapshot.UsedRatio < 0.80:
+		return authExpiryDrainNormalConcurrency
+	default:
+		return authExpiryDrainMinConcurrency
+	}
+}
+
 func expiryDrainConcurrencyLimit(auth *Auth, model string, now time.Time, configured int) int {
 	if configured <= 0 || !authExpiryDrainActive(auth, model, now) {
 		return configured
 	}
-	if configured >= authExpiryDrainMaxConcurrency {
+	ceiling := expiryDrainConcurrencyCeiling(auth, model, now)
+	if configured >= ceiling {
 		return configured
 	}
 	boosted := configured * 2
 	if boosted < configured+1 {
 		boosted = configured + 1
 	}
-	if boosted > authExpiryDrainMaxConcurrency {
-		boosted = authExpiryDrainMaxConcurrency
+	if boosted > ceiling {
+		boosted = ceiling
 	}
 	return boosted
 }

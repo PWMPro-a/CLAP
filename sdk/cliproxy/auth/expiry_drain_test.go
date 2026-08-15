@@ -207,6 +207,67 @@ func TestSessionAffinityKeepsCachedAuthWhenItIsInOldestDrainCohort(t *testing.T)
 	}
 }
 
+func TestSessionAffinityTemporarilySpillsPastBusyExpiryCohort(t *testing.T) {
+	now := time.Now().UTC()
+	tokenExpiry := now.Add(10 * 24 * time.Hour)
+	bound := authWithSupplyLeaseExpiry("bound", now.Add(20*time.Minute), tokenExpiry)
+	next := authWithSupplyLeaseExpiry("next", now.Add(23*time.Minute), tokenExpiry)
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             &RoundRobinSelector{},
+		TTL:                  time.Hour,
+		CacheAffinityEnabled: true,
+	})
+	defer selector.Stop()
+
+	releases := make([]func(), 0, authExpiryPriorityDefaultConcurrency)
+	for i := 0; i < authExpiryPriorityDefaultConcurrency; i++ {
+		release, acquired, reason, _ := bound.acquireRuntimeSlotForModel(now, "gpt-5", false)
+		if !acquired {
+			t.Fatalf("bound slot %d not acquired: %s", i+1, reason)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			if release != nil {
+				release()
+			}
+		}
+	}()
+
+	cacheKey := sessionAffinityCacheKey("codex", "derived:busy-expiry-session", "gpt-5")
+	selector.cache.Set(cacheKey, bound.ID)
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.DerivedSessionIDMetadataKey: "busy-expiry-session",
+	}}
+	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", opts, []*Auth{bound, next})
+	if errPick != nil {
+		t.Fatalf("busy expiry failover pick: %v", errPick)
+	}
+	if got == nil || got.ID != next.ID {
+		t.Fatalf("busy expiry failover pick = %v, want %s", got, next.ID)
+	}
+	if primary, ok := selector.cache.Get(cacheKey); !ok || primary != bound.ID {
+		t.Fatalf("primary cache binding = %q/%t, want preserved %s", primary, ok, bound.ID)
+	}
+	if temporary, ok := selector.failoverCache.Get(cacheKey); !ok || temporary != next.ID {
+		t.Fatalf("temporary overflow binding = %q/%t, want %s", temporary, ok, next.ID)
+	}
+
+	releases[len(releases)-1]()
+	releases[len(releases)-1] = nil
+	got, errPick = selector.Pick(context.Background(), "codex", "gpt-5", opts, []*Auth{bound, next})
+	if errPick != nil {
+		t.Fatalf("restored expiry affinity pick: %v", errPick)
+	}
+	if got == nil || got.ID != bound.ID {
+		t.Fatalf("restored expiry affinity pick = %v, want %s", got, bound.ID)
+	}
+	if _, ok := selector.failoverCache.Get(cacheKey); ok {
+		t.Fatal("temporary overflow binding remained after the primary had capacity")
+	}
+}
+
 func TestSchedulerPrefersNearExpiryWithoutPerRequestSorting(t *testing.T) {
 	now := time.Now().UTC()
 	near := authWithExpiry("near", now.Add(2*time.Hour))
@@ -298,7 +359,7 @@ func TestExpiryDrainConcurrencyBoostIsBoundedAndModelAware(t *testing.T) {
 	now := time.Now().UTC()
 	auth := authWithExpiry("drain", now.Add(4*time.Minute))
 	auth.Metadata["max_concurrency"] = 1
-	for configured, want := range map[int]int{1: 2, 2: 4, 4: 8, 7: 8, 8: 8, 10: 10} {
+	for configured, want := range map[int]int{1: 2, 2: 4, 4: 8, 7: 10, 8: 10, 10: 10, 12: 12} {
 		if got := expiryDrainConcurrencyLimit(auth, "gpt-5", now, configured); got != want {
 			t.Fatalf("configured concurrency %d boosted to %d, want %d", configured, got, want)
 		}
@@ -330,6 +391,77 @@ func TestExpiryDrainConcurrencyBoostIsBoundedAndModelAware(t *testing.T) {
 	defer firstRelease()
 	if _, acquired, reason, _ := far.acquireRuntimeSlotForModel(now, "gpt-5", false); acquired || reason != "concurrency_limit" {
 		t.Fatalf("far-expiry second slot acquired=%t reason=%q, want false/concurrency_limit", acquired, reason)
+	}
+}
+
+func TestExpiryPriorityDefaultConcurrencySpillsIntoNextCohort(t *testing.T) {
+	now := time.Now().UTC()
+	tokenExpiry := now.Add(10 * 24 * time.Hour)
+	oldest := authWithSupplyLeaseExpiry("oldest", now.Add(20*time.Minute), tokenExpiry)
+	next := authWithSupplyLeaseExpiry("next", now.Add(23*time.Minute), tokenExpiry)
+
+	if got := oldest.runtimeLimitConfigForModel("gpt-5", now).maxConcurrency; got != authExpiryPriorityDefaultConcurrency {
+		t.Fatalf("oldest default max concurrency = %d, want %d", got, authExpiryPriorityDefaultConcurrency)
+	}
+	releases := make([]func(), 0, authExpiryPriorityDefaultConcurrency)
+	for i := 0; i < authExpiryPriorityDefaultConcurrency; i++ {
+		release, acquired, reason, _ := oldest.acquireRuntimeSlotForModel(now, "gpt-5", false)
+		if !acquired {
+			t.Fatalf("oldest slot %d not acquired: %s", i+1, reason)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+	if _, acquired, reason, _ := oldest.acquireRuntimeSlotForModel(now, "gpt-5", false); acquired || reason != "concurrency_limit" {
+		t.Fatalf("oldest overflow acquired=%t reason=%q, want false/concurrency_limit", acquired, reason)
+	}
+
+	selector := &RoundRobinSelector{}
+	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, []*Auth{oldest, next})
+	if errPick != nil {
+		t.Fatalf("next-cohort pick: %v", errPick)
+	}
+	if got == nil || got.ID != next.ID {
+		t.Fatalf("next-cohort pick = %v, want %s", got, next.ID)
+	}
+}
+
+func TestExpiryPriorityDefaultConcurrencyKeepsFarUnconfiguredAuthUnlimited(t *testing.T) {
+	now := time.Now().UTC()
+	far := authWithExpiry("far", now.Add(48*time.Hour))
+	if got := far.runtimeLimitConfigForModel("gpt-5", now).maxConcurrency; got != 0 {
+		t.Fatalf("far unconfigured max concurrency = %d, want 0", got)
+	}
+}
+
+func TestExpiryDrainDefaultConcurrencyUsesRemainingQuota(t *testing.T) {
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		name      string
+		usedRatio float64
+		want      int
+	}{
+		{name: "large remainder", usedRatio: 0.20, want: authExpiryDrainUrgentConcurrency},
+		{name: "medium remainder", usedRatio: 0.60, want: authExpiryDrainNormalConcurrency},
+		{name: "small remainder", usedRatio: 0.90, want: authExpiryDrainMinConcurrency},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := authWithExpiry("drain", now.Add(4*time.Minute))
+			auth.ensureRuntimeLimits().codexQuotaSnapshots.Store(codexQuotaSnapshotStore{
+				"gpt-5": {
+					UsedRatio: tc.usedRatio,
+					SampledAt: now,
+					ExpiresAt: now.Add(time.Minute),
+				},
+			})
+			if got := auth.runtimeLimitConfigForModel("gpt-5", now).maxConcurrency; got != tc.want {
+				t.Fatalf("drain max concurrency = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 

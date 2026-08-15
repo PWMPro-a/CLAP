@@ -113,7 +113,7 @@ func (a *Auth) runtimeLimitConfig() runtimeLimitConfig {
 
 func (a *Auth) runtimeLimitConfigForModel(model string, now time.Time) runtimeLimitConfig {
 	cfg := a.runtimeLimitConfig()
-	cfg.maxConcurrency = expiryDrainConcurrencyLimit(a, model, now, cfg.maxConcurrency)
+	cfg.maxConcurrency = expiryPriorityConcurrencyLimit(a, model, now, cfg.maxConcurrency)
 	return cfg
 }
 
