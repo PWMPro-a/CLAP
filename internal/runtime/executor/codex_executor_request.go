@@ -177,6 +177,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		cache.ID = identityState.promptCacheKey
 	}
 	rawJSON, appServerHeaders := applyCodexAppServerFingerprint(rawJSON, nil, req.Metadata)
+	rawJSON = normalizeCodexReasoningEffortForModel(rawJSON, gjson.GetBytes(rawJSON, "model").String())
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err

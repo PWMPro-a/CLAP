@@ -83,6 +83,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errPromptCache
 	}
 	body, wsHeaders = applyCodexAppServerFingerprint(body, wsHeaders, req.Metadata)
+	body = normalizeCodexReasoningEffortForModel(body, baseModel)
 	clientBody := body
 	var identityState codexIdentityConfuseState
 	upstreamBody, identityState := applyCodexIdentityConfuseBody(e.cfg, auth, originalPayloadSource, body)

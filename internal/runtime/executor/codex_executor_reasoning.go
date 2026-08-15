@@ -7,6 +7,7 @@ import (
 	"hash"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -26,6 +27,54 @@ type codexReasoningReplayScope struct {
 	modelName          string
 	sessionKey         string
 	requestFingerprint string
+}
+
+// normalizeCodexReasoningEffortForModel is the final outbound guard for Codex
+// request bodies. Payload overrides and compatibility transforms run after the
+// model capability pass, so they can otherwise reintroduce effort=max for an
+// older model and make every upstream attempt fail with the same 400.
+func normalizeCodexReasoningEffortForModel(body []byte, model string) []byte {
+	effort := gjson.GetBytes(body, "reasoning.effort")
+	if effort.Type != gjson.String || !strings.EqualFold(strings.TrimSpace(effort.String()), "max") {
+		return body
+	}
+
+	normalized := "xhigh"
+	if codexModelSupportsMaxReasoningEffort(model) {
+		normalized = "max"
+	}
+	if effort.String() == normalized {
+		return body
+	}
+	updated, errSet := sjson.SetBytes(body, "reasoning.effort", normalized)
+	if errSet != nil {
+		return body
+	}
+	return updated
+}
+
+func codexModelSupportsMaxReasoningEffort(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if slash := strings.LastIndexByte(model, '/'); slash >= 0 {
+		model = model[slash+1:]
+	}
+	if !strings.HasPrefix(model, "gpt-") {
+		return false
+	}
+	version := strings.TrimPrefix(model, "gpt-")
+	if dash := strings.IndexByte(version, '-'); dash >= 0 {
+		version = version[:dash]
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	minor, errMinor := strconv.Atoi(parts[1])
+	if errMajor != nil || errMinor != nil {
+		return false
+	}
+	return major > 5 || (major == 5 && minor >= 6)
 }
 
 func (s codexReasoningReplayScope) valid() bool {
