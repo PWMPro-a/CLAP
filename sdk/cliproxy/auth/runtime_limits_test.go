@@ -262,7 +262,7 @@ func TestRuntimeLimits_UpstreamRateLimitBlocksEveryModelAndQuotaFallback(t *test
 	}
 }
 
-func TestRuntimeLimits_UpstreamRateLimitBackoffDeduplicatesBurstAndResetsAfterSuccess(t *testing.T) {
+func TestRuntimeLimits_UpstreamRateLimitBackoffDeduplicatesBurstAndRequiresStableRecovery(t *testing.T) {
 	now := time.Now()
 	auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}
 	retryAfter := 5 * time.Second
@@ -296,8 +296,49 @@ func TestRuntimeLimits_UpstreamRateLimitBackoffDeduplicatesBurstAndResetsAfterSu
 	state.mu.Lock()
 	level := state.upstreamRateLimitBackoff
 	state.mu.Unlock()
+	if level == 0 {
+		t.Fatal("short success reset backoff before the account was stable")
+	}
+
+	auth.observeUpstreamRateLimitSuccess(now.Add(6 * time.Minute))
+	state.mu.Lock()
+	level = state.upstreamRateLimitBackoff
+	lastSeen := state.upstreamRateLimitLastSeen
+	state.mu.Unlock()
+	if level != 0 || !lastSeen.IsZero() {
+		t.Fatalf("backoff after stable recovery = %d, last seen = %v, want reset", level, lastSeen)
+	}
+}
+
+func TestRuntimeLimits_UpstreamRateLimitBurstExtendsStableRecoveryWindow(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}
+	retryAfter := 5 * time.Second
+	if !auth.freezeUpstreamRateLimit(now, &retryAfter) {
+		t.Fatal("first upstream rate limit did not open a cooldown window")
+	}
+	if auth.freezeUpstreamRateLimit(now.Add(10*time.Second), &retryAfter) {
+		t.Fatal("same-window rate-limit burst advanced cooldown")
+	}
+
+	state := auth.ensureRuntimeLimits()
+	state.mu.Lock()
+	state.upstreamRateLimitedUntil = now.Add(-time.Second)
+	state.mu.Unlock()
+	auth.observeUpstreamRateLimitSuccess(now.Add(5*time.Minute + time.Second))
+	state.mu.Lock()
+	level := state.upstreamRateLimitBackoff
+	state.mu.Unlock()
+	if level == 0 {
+		t.Fatal("same-window 429 did not extend the stable recovery window")
+	}
+
+	auth.observeUpstreamRateLimitSuccess(now.Add(5*time.Minute + 11*time.Second))
+	state.mu.Lock()
+	level = state.upstreamRateLimitBackoff
+	state.mu.Unlock()
 	if level != 0 {
-		t.Fatalf("backoff level after successful recovery = %d, want 0", level)
+		t.Fatalf("backoff level after five stable minutes = %d, want 0", level)
 	}
 }
 

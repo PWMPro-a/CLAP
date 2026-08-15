@@ -18,6 +18,7 @@ const (
 	defaultRuntimeRateLimitWindowSeconds = 60
 	defaultUpstreamRateLimitBackoff      = 15 * time.Second
 	maximumUpstreamRateLimitBackoff      = 5 * time.Minute
+	upstreamRateLimitStableResetWindow   = 5 * time.Minute
 	runtimeSkipReasonQuotaPreempt        = "quota_preempt"
 	runtimeSkipReasonUsageLimitReached   = "usage_limit_reached"
 	runtimeSkipReasonUpstreamRateLimit   = "upstream_rate_limit"
@@ -37,6 +38,7 @@ type authRuntimeLimits struct {
 	rateLimitedUntil             time.Time
 	upstreamRateLimitedUntil     time.Time
 	upstreamRateLimitBackoff     int
+	upstreamRateLimitLastSeen    time.Time
 	stickyBypassNext             bool
 	stickyBypassSessions         map[string]time.Time
 	lastSkipReason               string
@@ -442,6 +444,9 @@ func (a *Auth) freezeUpstreamRateLimit(now time.Time, retryAfter *time.Duration)
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.upstreamRateLimitLastSeen.Before(now) {
+		state.upstreamRateLimitLastSeen = now
+	}
 	if state.upstreamRateLimitedUntil.After(now) {
 		state.recordSkipLocked(runtimeSkipReasonUpstreamRateLimit, state.upstreamRateLimitedUntil, now)
 		return false
@@ -476,8 +481,10 @@ func (a *Auth) freezeUpstreamRateLimit(now time.Time, retryAfter *time.Duration)
 }
 
 // observeUpstreamRateLimitSuccess resets progressive backoff only after the
-// active window has elapsed. A success from an older in-flight request must not
-// reopen an account that has just returned Retry-After on another request.
+// active window has elapsed and the account has remained free of upstream 429s
+// for a stable interval. Concurrent successes are common while an account is
+// throttling, so treating the first one as recovery creates a permanent 15s
+// retry loop instead of allowing the backoff to converge.
 func (a *Auth) observeUpstreamRateLimitSuccess(now time.Time) {
 	if a == nil {
 		return
@@ -487,9 +494,13 @@ func (a *Auth) observeUpstreamRateLimitSuccess(now time.Time) {
 		return
 	}
 	state.mu.Lock()
-	if !state.upstreamRateLimitedUntil.After(now) {
+	stableSinceLastRateLimit := !state.upstreamRateLimitLastSeen.IsZero() &&
+		!now.Before(state.upstreamRateLimitLastSeen) &&
+		now.Sub(state.upstreamRateLimitLastSeen) >= upstreamRateLimitStableResetWindow
+	if !state.upstreamRateLimitedUntil.After(now) && stableSinceLastRateLimit {
 		state.upstreamRateLimitedUntil = time.Time{}
 		state.upstreamRateLimitBackoff = 0
+		state.upstreamRateLimitLastSeen = time.Time{}
 	}
 	state.mu.Unlock()
 }
