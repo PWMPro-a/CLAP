@@ -195,7 +195,92 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 
 func normalizeCodexUpstreamCompatibility(body []byte) []byte {
 	body = normalizeCodexOrphanToolCalls(body)
+	body = normalizeCodexToolChoiceCompatibility(body)
 	return normalizeCodexStructuredOutputCompatibility(body)
+}
+
+func normalizeCodexToolChoiceCompatibility(body []byte) []byte {
+	choice := gjson.GetBytes(body, "tool_choice")
+	if !choice.Exists() {
+		return body
+	}
+	tools := codexDeclaredTools(body)
+	if choice.Type == gjson.String {
+		switch strings.ToLower(strings.TrimSpace(choice.String())) {
+		case "auto", "none", "required":
+			return body
+		}
+		return codexFallbackToolChoice(body, len(tools) > 0)
+	}
+	if !choice.IsObject() {
+		return codexFallbackToolChoice(body, len(tools) > 0)
+	}
+
+	choiceType := strings.ToLower(strings.TrimSpace(choice.Get("type").String()))
+	if choiceType == "allowed_tools" {
+		return body
+	}
+	name := strings.TrimSpace(choice.Get("name").String())
+	if name == "" {
+		name = strings.TrimSpace(choice.Get("function.name").String())
+	}
+	for _, tool := range tools {
+		toolType := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+		toolName := strings.TrimSpace(tool.Get("name").String())
+		if toolName == "" {
+			toolName = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		switch choiceType {
+		case "function", "custom":
+			if toolType == choiceType && name != "" && toolName == name {
+				return body
+			}
+		case "tool":
+			if name != "" && (toolName == name || toolType == strings.ToLower(name)) {
+				return body
+			}
+		default:
+			if choiceType != "" && toolType == choiceType {
+				return body
+			}
+		}
+	}
+	return codexFallbackToolChoice(body, len(tools) > 0)
+}
+
+func codexDeclaredTools(body []byte) []gjson.Result {
+	tools := gjson.GetBytes(body, "tools")
+	declared := make([]gjson.Result, 0)
+	if tools.IsArray() {
+		declared = append(declared, tools.Array()...)
+	}
+	input := gjson.GetBytes(body, "input")
+	if input.IsArray() {
+		for _, item := range input.Array() {
+			if strings.TrimSpace(item.Get("type").String()) != "additional_tools" {
+				continue
+			}
+			if additional := item.Get("tools"); additional.IsArray() {
+				declared = append(declared, additional.Array()...)
+			}
+		}
+	}
+	return declared
+}
+
+func codexFallbackToolChoice(body []byte, hasTools bool) []byte {
+	if hasTools {
+		if updated, errSet := sjson.SetBytes(body, "tool_choice", "auto"); errSet == nil {
+			return updated
+		}
+		return body
+	}
+	updated, errDelete := sjson.DeleteBytes(body, "tool_choice")
+	if errDelete != nil {
+		return body
+	}
+	updated, _ = sjson.DeleteBytes(updated, "parallel_tool_calls")
+	return updated
 }
 
 // A truncated or retried client transcript can retain a tool call after losing
@@ -271,8 +356,8 @@ func normalizeCodexStructuredOutputCompatibility(body []byte) []byte {
 	if !strings.EqualFold(formatType, "json_object") {
 		return body
 	}
-	if codexStructuredOutputContainsJSON(gjson.GetBytes(body, "instructions")) ||
-		codexStructuredOutputContainsJSON(gjson.GetBytes(body, "input")) {
+	if codexStructuredOutputTextContainsJSON(gjson.GetBytes(body, "instructions")) ||
+		codexStructuredOutputInputContainsJSON(gjson.GetBytes(body, "input")) {
 		return body
 	}
 
@@ -296,22 +381,47 @@ func normalizeCodexStructuredOutputCompatibility(body []byte) []byte {
 	return body
 }
 
-func codexStructuredOutputContainsJSON(value gjson.Result) bool {
+func codexStructuredOutputInputContainsJSON(value gjson.Result) bool {
 	if value.Type == gjson.String {
 		return strings.Contains(strings.ToLower(value.String()), "json")
 	}
-	if !value.IsArray() && !value.IsObject() {
+	if !value.IsArray() {
 		return false
 	}
-	found := false
-	value.ForEach(func(_, child gjson.Result) bool {
-		if codexStructuredOutputContainsJSON(child) {
-			found = true
-			return false
+	for _, item := range value.Array() {
+		if item.Type == gjson.String && strings.Contains(strings.ToLower(item.String()), "json") {
+			return true
 		}
-		return true
-	})
-	return found
+		itemType := strings.TrimSpace(item.Get("type").String())
+		role := strings.TrimSpace(item.Get("role").String())
+		if itemType != "message" && role == "" {
+			continue
+		}
+		if codexStructuredOutputTextContainsJSON(item.Get("content")) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexStructuredOutputTextContainsJSON(value gjson.Result) bool {
+	if value.Type == gjson.String {
+		return strings.Contains(strings.ToLower(value.String()), "json")
+	}
+	if !value.IsArray() {
+		return false
+	}
+	for _, part := range value.Array() {
+		if part.Type == gjson.String && strings.Contains(strings.ToLower(part.String()), "json") {
+			return true
+		}
+		for _, field := range []string{"text", "content"} {
+			if strings.Contains(strings.ToLower(part.Get(field).String()), "json") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func applyCodexAppServerFingerprint(body []byte, headers http.Header, metadata map[string]any) ([]byte, http.Header) {

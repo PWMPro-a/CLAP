@@ -48,6 +48,16 @@ func TestNormalizeCodexStructuredOutputCompatibility(t *testing.T) {
 			body:      `{"model":"gpt-5.5","input":"Return one object.","text":{"format":{"type":"text"}}}`,
 			unchanged: true,
 		},
+		{
+			name: "structural JSON name does not satisfy prompt requirement",
+			body: `{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Return one object."}]},{"type":"function_call","call_id":"call_1","name":"json_lookup","arguments":"{}"}],"text":{"format":{"type":"json_object"}}}`,
+			assert: func(t *testing.T, body []byte) {
+				input := gjson.GetBytes(body, "input").Array()
+				if len(input) != 3 || input[2].Get("content.0.text").String() != codexJSONOutputInstruction {
+					t.Fatalf("structural JSON string suppressed prompt repair: %s", body)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -62,6 +72,40 @@ func TestNormalizeCodexStructuredOutputCompatibility(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNormalizeCodexToolChoiceCompatibility(t *testing.T) {
+	t.Run("removes choice when tools are absent", func(t *testing.T) {
+		body := []byte(`{"tool_choice":{"type":"function","name":"lookup"},"parallel_tool_calls":true,"input":"hello"}`)
+		got := normalizeCodexToolChoiceCompatibility(body)
+		if gjson.GetBytes(got, "tool_choice").Exists() || gjson.GetBytes(got, "parallel_tool_calls").Exists() {
+			t.Fatalf("orphan tool choice was not removed: %s", got)
+		}
+	})
+
+	t.Run("falls back to auto when named tool is missing", func(t *testing.T) {
+		body := []byte(`{"tools":[{"type":"function","name":"other","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"lookup"},"input":"hello"}`)
+		got := normalizeCodexToolChoiceCompatibility(body)
+		if choice := gjson.GetBytes(got, "tool_choice"); choice.Type != gjson.String || choice.String() != "auto" {
+			t.Fatalf("invalid named choice did not fall back to auto: %s", got)
+		}
+	})
+
+	t.Run("keeps valid named tool byte for byte", func(t *testing.T) {
+		body := []byte(`{"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"lookup"},"input":"hello"}`)
+		got := normalizeCodexToolChoiceCompatibility(body)
+		if !bytes.Equal(got, body) {
+			t.Fatalf("valid named tool choice changed:\noriginal: %s\nupdated:  %s", body, got)
+		}
+	})
+
+	t.Run("keeps standard mode byte for byte", func(t *testing.T) {
+		body := []byte(`{"tool_choice":"required","tools":[{"type":"function","name":"lookup"}],"input":"hello"}`)
+		got := normalizeCodexToolChoiceCompatibility(body)
+		if !bytes.Equal(got, body) {
+			t.Fatalf("standard tool mode changed:\noriginal: %s\nupdated:  %s", body, got)
+		}
+	})
 }
 
 func TestNormalizeCodexOrphanToolCalls(t *testing.T) {
