@@ -29,10 +29,10 @@ type codexReasoningReplayScope struct {
 	requestFingerprint string
 }
 
-// normalizeCodexReasoningEffortForModel is the final outbound guard for Codex
-// request bodies. Payload overrides and compatibility transforms run after the
-// model capability pass, so they can otherwise reintroduce effort=max for an
-// older model and make every upstream attempt fail with the same 400.
+// normalizeCodexReasoningEffortForModel keeps Codex request bodies compatible
+// with the selected upstream model. Callers use it before capability validation
+// for direct client input and again at final outbound assembly because payload
+// overrides can reintroduce effort=max after the capability pass.
 func normalizeCodexReasoningEffortForModel(body []byte, model string) []byte {
 	effort := gjson.GetBytes(body, "reasoning.effort")
 	if effort.Type != gjson.String || !strings.EqualFold(strings.TrimSpace(effort.String()), "max") {

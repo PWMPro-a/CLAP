@@ -43,8 +43,8 @@ func TestNormalizeCodexReasoningEffortForModel(t *testing.T) {
 	}
 }
 
-func TestCodexHTTPExecutorsClampLateMaxReasoningOverride(t *testing.T) {
-	tests := []struct {
+func TestCodexHTTPExecutorsClampMaxReasoningEffort(t *testing.T) {
+	routes := []struct {
 		name    string
 		compact bool
 		stream  bool
@@ -53,109 +53,163 @@ func TestCodexHTTPExecutorsClampLateMaxReasoningOverride(t *testing.T) {
 		{name: "stream", stream: true},
 		{name: "compact", compact: true},
 	}
+	scenarios := []struct {
+		name    string
+		config  *config.Config
+		payload string
+	}{
+		{
+			name:    "direct client max",
+			config:  &config.Config{},
+			payload: `{"model":"gpt-5.5","input":"hello","reasoning":{"effort":"max"}}`,
+		},
+		{
+			name:    "late payload override",
+			config:  codexLateMaxOverrideConfig(),
+			payload: `{"model":"gpt-5.5","input":"hello"}`,
+		},
+	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var gotBody []byte
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				gotBody, _ = io.ReadAll(r.Body)
-				if test.compact {
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
-					return
-				}
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
-			}))
-			defer server.Close()
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			for _, route := range routes {
+				t.Run(route.name, func(t *testing.T) {
+					var gotBody []byte
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						gotBody, _ = io.ReadAll(r.Body)
+						if route.compact {
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = w.Write([]byte(`{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+							return
+						}
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+					}))
+					defer server.Close()
 
-			exec := NewCodexExecutor(codexLateMaxOverrideConfig())
-			auth := codexReasoningEffortTestAuth(server.URL)
-			req := cliproxyexecutor.Request{
-				Model:   "gpt-5.5",
-				Payload: []byte(`{"model":"gpt-5.5","input":"hello"}`),
-			}
-			opts := cliproxyexecutor.Options{
-				SourceFormat: sdktranslator.FromString("openai-response"),
-				Stream:       test.stream,
-			}
-			if test.compact {
-				opts.Alt = "responses/compact"
-			}
+					exec := NewCodexExecutor(scenario.config)
+					auth := codexReasoningEffortTestAuth(server.URL)
+					req := cliproxyexecutor.Request{
+						Model:   "gpt-5.5",
+						Payload: []byte(scenario.payload),
+					}
+					opts := cliproxyexecutor.Options{
+						SourceFormat: sdktranslator.FromString("openai-response"),
+						Stream:       route.stream,
+					}
+					if route.compact {
+						opts.Alt = "responses/compact"
+					}
 
-			if test.stream {
-				result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
-				if errExecute != nil {
-					t.Fatalf("ExecuteStream() error = %v", errExecute)
-				}
-				for range result.Chunks {
-				}
-			} else if _, errExecute := exec.Execute(context.Background(), auth, req, opts); errExecute != nil {
-				t.Fatalf("Execute() error = %v", errExecute)
-			}
+					if route.stream {
+						result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+						if errExecute != nil {
+							t.Fatalf("ExecuteStream() error = %v", errExecute)
+						}
+						for range result.Chunks {
+						}
+					} else if _, errExecute := exec.Execute(context.Background(), auth, req, opts); errExecute != nil {
+						t.Fatalf("Execute() error = %v", errExecute)
+					}
 
-			if effort := gjson.GetBytes(gotBody, "reasoning.effort").String(); effort != "xhigh" {
-				t.Fatalf("upstream reasoning.effort = %q, want xhigh; body=%s", effort, gotBody)
+					if effort := gjson.GetBytes(gotBody, "reasoning.effort").String(); effort != "xhigh" {
+						t.Fatalf("upstream reasoning.effort = %q, want xhigh; body=%s", effort, gotBody)
+					}
+				})
 			}
 		})
 	}
 }
 
-func TestCodexWebsocketExecutorsClampLateMaxReasoningOverride(t *testing.T) {
-	for _, stream := range []bool{false, true} {
-		name := "execute"
-		if stream {
-			name = "stream"
-		}
-		t.Run(name, func(t *testing.T) {
-			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-			captured := make(chan []byte, 1)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				conn, errUpgrade := upgrader.Upgrade(w, r, nil)
-				if errUpgrade != nil {
-					t.Errorf("upgrade websocket: %v", errUpgrade)
-					return
+func TestCodexWebsocketExecutorsClampMaxReasoningEffort(t *testing.T) {
+	scenarios := []struct {
+		name    string
+		config  *config.Config
+		payload string
+	}{
+		{
+			name:    "direct client max",
+			config:  &config.Config{},
+			payload: `{"model":"gpt-5.5","input":"hello","reasoning":{"effort":"max"}}`,
+		},
+		{
+			name:    "late payload override",
+			config:  codexLateMaxOverrideConfig(),
+			payload: `{"model":"gpt-5.5","input":"hello"}`,
+		},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			for _, stream := range []bool{false, true} {
+				name := "execute"
+				if stream {
+					name = "stream"
 				}
-				defer func() { _ = conn.Close() }()
-				_, payload, errRead := conn.ReadMessage()
-				if errRead != nil {
-					t.Errorf("read websocket request: %v", errRead)
-					return
-				}
-				captured <- payload
-				completed := []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
-				if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
-					t.Errorf("write websocket response: %v", errWrite)
-				}
-			}))
-			defer server.Close()
+				t.Run(name, func(t *testing.T) {
+					upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+					captured := make(chan []byte, 1)
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+						if errUpgrade != nil {
+							t.Errorf("upgrade websocket: %v", errUpgrade)
+							return
+						}
+						defer func() { _ = conn.Close() }()
+						_, payload, errRead := conn.ReadMessage()
+						if errRead != nil {
+							t.Errorf("read websocket request: %v", errRead)
+							return
+						}
+						captured <- payload
+						completed := []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+						if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+							t.Errorf("write websocket response: %v", errWrite)
+						}
+					}))
+					defer server.Close()
 
-			exec := NewCodexWebsocketsExecutor(codexLateMaxOverrideConfig())
-			auth := codexReasoningEffortTestAuth(server.URL)
-			req := cliproxyexecutor.Request{
-				Model:   "gpt-5.5",
-				Payload: []byte(`{"model":"gpt-5.5","input":"hello"}`),
-			}
-			opts := cliproxyexecutor.Options{
-				SourceFormat: sdktranslator.FromString("openai-response"),
-				Stream:       stream,
-			}
-			if stream {
-				result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
-				if errExecute != nil {
-					t.Fatalf("ExecuteStream() error = %v", errExecute)
-				}
-				for range result.Chunks {
-				}
-			} else if _, errExecute := exec.Execute(context.Background(), auth, req, opts); errExecute != nil {
-				t.Fatalf("Execute() error = %v", errExecute)
-			}
+					exec := NewCodexWebsocketsExecutor(scenario.config)
+					auth := codexReasoningEffortTestAuth(server.URL)
+					req := cliproxyexecutor.Request{
+						Model:   "gpt-5.5",
+						Payload: []byte(scenario.payload),
+					}
+					opts := cliproxyexecutor.Options{
+						SourceFormat: sdktranslator.FromString("openai-response"),
+						Stream:       stream,
+					}
+					if stream {
+						result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+						if errExecute != nil {
+							t.Fatalf("ExecuteStream() error = %v", errExecute)
+						}
+						for range result.Chunks {
+						}
+					} else if _, errExecute := exec.Execute(context.Background(), auth, req, opts); errExecute != nil {
+						t.Fatalf("Execute() error = %v", errExecute)
+					}
 
-			upstreamBody := <-captured
-			if effort := gjson.GetBytes(upstreamBody, "reasoning.effort").String(); effort != "xhigh" {
-				t.Fatalf("websocket reasoning.effort = %q, want xhigh; body=%s", effort, upstreamBody)
+					upstreamBody := <-captured
+					if effort := gjson.GetBytes(upstreamBody, "reasoning.effort").String(); effort != "xhigh" {
+						t.Fatalf("websocket reasoning.effort = %q, want xhigh; body=%s", effort, upstreamBody)
+					}
+				})
 			}
 		})
+	}
+}
+
+func TestCodexCountTokensClampsInboundMaxReasoningEffort(t *testing.T) {
+	exec := NewCodexExecutor(&config.Config{})
+	response, errCount := exec.CountTokens(context.Background(), nil, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello","reasoning":{"effort":"max"}}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+	if errCount != nil {
+		t.Fatalf("CountTokens() error = %v", errCount)
+	}
+	if len(response.Payload) == 0 {
+		t.Fatal("CountTokens() returned an empty response")
 	}
 }
 
