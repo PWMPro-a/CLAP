@@ -137,11 +137,11 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 		t.Fatalf("recovery did not clear cooldown state: %+v", restored)
 	}
 	runtimeSnapshot := restored.RuntimeLimitSnapshot(time.Now())
-	if runtimeSnapshot.LastSkipReason != runtimeSkipReasonUpstreamRateLimit || runtimeSnapshot.RateLimitedUntil.IsZero() {
-		t.Fatalf("recovery cleared upstream rate-limit guard: %#v", runtimeSnapshot)
+	if runtimeSnapshot.LastSkipReason != "" || !runtimeSnapshot.RateLimitedUntil.IsZero() || !runtimeSnapshot.FrozenUntil.IsZero() {
+		t.Fatalf("recovery retained stale transient rate-limit guards: %#v", runtimeSnapshot)
 	}
-	if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); !blocked || reason != blockReasonCooldown {
-		t.Fatalf("recovered credential switched models during Retry-After: blocked=%t reason=%v", blocked, reason)
+	if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); blocked || reason != blockReasonNone {
+		t.Fatalf("recovered credential remained blocked after verified refresh: blocked=%t reason=%v", blocked, reason)
 	}
 }
 
@@ -206,8 +206,8 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 			return current.Status == StatusActive && !current.Unavailable && token == "new-access-token"
 		})
 		restored, _ := manager.GetByID(id)
-		if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); !blocked || reason != blockReasonCooldown {
-			t.Fatalf("canonical peer %s escaped account-wide rate-limit cooldown: blocked=%t reason=%v", id, blocked, reason)
+		if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); blocked || reason != blockReasonNone {
+			t.Fatalf("canonical peer %s retained stale rate-limit cooldown: blocked=%t reason=%v", id, blocked, reason)
 		}
 	}
 	if got := executor.refreshCalls.Load(); got != 1 {

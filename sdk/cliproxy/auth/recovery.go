@@ -406,6 +406,9 @@ func (m *Manager) completeLifecycle(request authRecoveryRequest) error {
 	auth.NextRetryAfter = time.Time{}
 	auth.NextRefreshAfter = time.Time{}
 	auth.UpdatedAt = now
+	if request.kind == authLifecycleRecovery {
+		auth.clearTransientRateLimitRecovery(now)
+	}
 	if request.kind == authLifecycleInitialization {
 		auth.Metadata[MetadataInitializationState] = string(InitializationStateReady)
 		auth.Metadata[MetadataInitializationReadyAt] = now.Format(time.RFC3339Nano)
@@ -438,6 +441,7 @@ func (m *Manager) completeLifecycle(request authRecoveryRequest) error {
 			candidate.NextRefreshAfter = time.Time{}
 			candidate.LastRefreshedAt = auth.LastRefreshedAt
 			candidate.UpdatedAt = now
+			candidate.clearTransientRateLimitRecovery(now)
 			peerSnapshots = append(peerSnapshots, candidate.Clone())
 		}
 	}

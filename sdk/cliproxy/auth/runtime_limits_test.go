@@ -342,6 +342,43 @@ func TestRuntimeLimits_UpstreamRateLimitBurstExtendsStableRecoveryWindow(t *test
 	}
 }
 
+func TestRuntimeLimits_SuccessfulLifecycleRecoveryClearsOnlyTransientGuards(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID:       "auth-a",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"selection_error_freeze_seconds": 60},
+	}
+	retryAfter := 5 * time.Minute
+	auth.freezeUpstreamRateLimit(now, &retryAfter)
+	auth.freezeUsageLimit(now, &retryAfter)
+	auth.updateQuotaPreempt(now, now.Add(time.Hour), true)
+	auth.maybeFreezeRuntimeResult(Result{Error: &Error{
+		HTTPStatus: http.StatusTooManyRequests,
+		Code:       "rate_limit_exceeded",
+		Message:    "Rate limit exceeded",
+	}}, now, "")
+
+	auth.clearTransientRateLimitRecovery(now.Add(time.Second))
+	state := auth.ensureRuntimeLimits()
+	state.mu.Lock()
+	frozenUntil := state.frozenUntil
+	upstreamUntil := state.upstreamRateLimitedUntil
+	usageUntil := state.usageLimitFreezeUntil
+	quotaUntil := state.quotaPreemptFreezeUntil
+	backoff := state.upstreamRateLimitBackoff
+	lastSeen := state.upstreamRateLimitLastSeen
+	state.mu.Unlock()
+
+	if !frozenUntil.IsZero() || !upstreamUntil.IsZero() || backoff != 0 || !lastSeen.IsZero() {
+		t.Fatalf("transient recovery guards remain: frozen=%v upstream=%v backoff=%d lastSeen=%v", frozenUntil, upstreamUntil, backoff, lastSeen)
+	}
+	if !usageUntil.After(now) || !quotaUntil.After(now) {
+		t.Fatalf("persistent quota guards were cleared: usage=%v quota=%v", usageUntil, quotaUntil)
+	}
+}
+
 func TestRuntimeLimits_PersistentQuotaFreezeSourcesRecoverIndependently(t *testing.T) {
 	t.Parallel()
 

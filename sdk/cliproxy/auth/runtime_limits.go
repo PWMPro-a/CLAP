@@ -505,6 +505,34 @@ func (a *Auth) observeUpstreamRateLimitSuccess(now time.Time) {
 	state.mu.Unlock()
 }
 
+// clearTransientRateLimitRecovery releases the request-error and upstream
+// rate-limit guards after the credential lifecycle has successfully refreshed
+// both the token and quota. Those guards describe the credential state before
+// recovery and must not keep an otherwise verified account out of rotation.
+// Persistent usage-limit and quota-preempt freezes remain independent so a
+// real exhausted account cannot be revived by a transient recovery.
+func (a *Auth) clearTransientRateLimitRecovery(now time.Time) {
+	if a == nil {
+		return
+	}
+	state := a.ensureRuntimeLimits()
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	state.frozenUntil = time.Time{}
+	state.upstreamRateLimitedUntil = time.Time{}
+	state.upstreamRateLimitBackoff = 0
+	state.upstreamRateLimitLastSeen = time.Time{}
+	if state.lastSkipReason == "frozen" || state.lastSkipReason == runtimeSkipReasonUpstreamRateLimit {
+		state.lastSkipReason = ""
+		state.lastSkipRecordedAt = time.Time{}
+		state.lastSkipRecoveryTarget = time.Time{}
+	}
+	state.compactRuntimeWindowLocked(now, a.runtimeLimitConfig())
+	state.mu.Unlock()
+}
+
 // runtimeQuotaPreemptFallbackState separates pool-level eligibility from
 // request-time capacity. Callers may ignore a busy fallback credential and use
 // the next-lowest valid quota snapshot, while acquisition still enforces a
