@@ -30,6 +30,13 @@ type ProviderExecutor interface {
 	HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
 }
 
+// QuotaRefresher is implemented by provider executors that can verify quota
+// after a credential token rotation. It is called only by background lifecycle
+// workers and never from request execution.
+type QuotaRefresher interface {
+	RefreshQuota(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error)
+}
+
 // RequestAuthPreparer lets an executor update missing auth metadata immediately
 // before a request. Manager serializes and persists returned updates.
 type RequestAuthPreparer interface {
@@ -156,6 +163,7 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+	recoveryLoop  *authRecoveryLoop
 
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent

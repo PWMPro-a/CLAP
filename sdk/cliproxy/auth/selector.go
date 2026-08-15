@@ -551,6 +551,9 @@ func isAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.Time,
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if IsAuthLifecycleBlocking(auth) {
+		return true, blockReasonOther, auth.NextRetryAfter
+	}
 	if authSupplyLeaseExpired(auth, now) {
 		return true, blockReasonDisabled, time.Time{}
 	}

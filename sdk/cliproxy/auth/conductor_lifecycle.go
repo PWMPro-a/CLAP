@@ -69,6 +69,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	ApplyInitializationStateFromMetadata(auth)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("register auth: %w", errWeight)
 	}
@@ -93,6 +94,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.queueLifecycleRecovery(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	if cooldownStateChanged {
@@ -106,6 +108,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	ApplyInitializationStateFromMetadata(auth)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("update auth: %w", errWeight)
 	}
@@ -148,6 +151,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
+	m.queueLifecycleRecovery(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if cooldownStateChanged {
@@ -239,6 +243,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
+		ApplyInitializationStateFromMetadata(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
@@ -250,6 +255,11 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Unlock()
 	m.syncScheduler()
 	m.refreshCodexTailBurstCandidates()
+	for _, auth := range items {
+		if auth != nil {
+			m.queueLifecycleRecovery(auth.ID)
+		}
+	}
 	return nil
 }
 

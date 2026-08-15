@@ -688,6 +688,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		auth.Disabled = true
 		auth.Status = cliproxyauth.StatusDisabled
 	}
+	cliproxyauth.ApplyInitializationStateFromMetadata(auth)
 	return auth, nil
 }
 

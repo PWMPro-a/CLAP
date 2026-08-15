@@ -200,6 +200,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	coreauth.ApplyInitializationStateFromMetadata(a)
 	if errAgentIdentity := attachAgentIdentityRuntime(a, fullPath, cfg); errAgentIdentity != nil {
 		return nil, errAgentIdentity
 	}

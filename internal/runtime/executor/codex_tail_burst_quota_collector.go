@@ -254,6 +254,15 @@ func fetchCodexTailBurstQuotaSnapshot(
 	return snapshot, nil
 }
 
+// RefreshQuota verifies a freshly rotated Codex credential against the usage
+// endpoint. Lifecycle recovery calls this in a bounded background worker.
+func (e *CodexExecutor) RefreshQuota(ctx context.Context, auth *cliproxyauth.Auth) (cliproxyauth.CodexQuotaSnapshot, error) {
+	if e == nil {
+		return cliproxyauth.CodexQuotaSnapshot{}, fmt.Errorf("codex executor is nil")
+	}
+	return fetchCodexTailBurstQuotaSnapshot(ctx, e.cfg, auth, defaultCodexQuotaCollectorSnapshotTTL)
+}
+
 func parseCodexTailBurstQuotaSnapshot(body []byte, sampledAt time.Time, ttl time.Duration) (cliproxyauth.CodexQuotaSnapshot, bool) {
 	if !gjson.ValidBytes(body) {
 		return cliproxyauth.CodexQuotaSnapshot{}, false

@@ -618,6 +618,7 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 		auth.Disabled = true
 		auth.Status = cliproxyauth.StatusDisabled
 	}
+	cliproxyauth.ApplyInitializationStateFromMetadata(auth)
 	return auth, nil
 }
 

@@ -714,6 +714,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	var authSnapshot *Auth
 	var terminalPeerSnapshots []*Auth
 	var cooldownPeerSnapshots []*Auth
+	var recoveryAuthIDs []string
 	cooldownStateChanged := false
 
 	m.mu.Lock()
@@ -894,6 +895,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else if !result.Success && shouldPropagateCanonicalCooldown(result.Error) {
 			cooldownPeerSnapshots = m.propagateCanonicalCooldownLocked(auth, modelKey, now)
 		}
+		if shouldQueueRateLimitRecovery(auth, result) {
+			if generation := markRateLimitRecoveryQueuedLocked(auth, now); generation != "" {
+				recoveryAuthIDs = append(recoveryAuthIDs, auth.ID)
+			}
+			for index, peer := range cooldownPeerSnapshots {
+				if peer == nil {
+					continue
+				}
+				livePeer := m.auths[peer.ID]
+				coordinateRateLimitPeerLocked(livePeer, modelKey, now)
+				cooldownPeerSnapshots[index] = livePeer.Clone()
+			}
+		}
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
@@ -945,7 +959,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
 	}
-
 	if clearModelQuota && modelKey != "" {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, modelKey)
 	}
@@ -956,6 +969,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, modelKey)
 	} else if shouldSuspendModel {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, modelKey, suspendReason)
+	}
+	// Start asynchronous recovery only after all synchronous quota/suspension
+	// bookkeeping is visible. A very fast recovery must not be re-suspended by
+	// the tail of this MarkResult call.
+	for _, authID := range recoveryAuthIDs {
+		m.invalidateSessionAffinity(authID)
+		m.queueLifecycleRecovery(authID)
 	}
 
 	m.hook.OnResult(ctx, result)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -256,6 +257,10 @@ func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []b
 	if err != nil {
 		return err
 	}
+	data, err = prepareImportedTeamInitialization(data)
+	if err != nil {
+		return err
+	}
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
 		return err
@@ -272,6 +277,21 @@ func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []b
 		starter.StartTaskRegistration()
 	}
 	return nil
+}
+
+func prepareImportedTeamInitialization(data []byte) ([]byte, error) {
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, fmt.Errorf("invalid auth file: %w", err)
+	}
+	if _, prepared := coreauth.PrepareImportedCodexTeamInitialization(metadata); !prepared {
+		return data, nil
+	}
+	canonical, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("serialize auth initialization state: %w", err)
+	}
+	return append(canonical, '\n'), nil
 }
 
 // preserveExistingAgentIdentityCredentials prevents an older incomplete export

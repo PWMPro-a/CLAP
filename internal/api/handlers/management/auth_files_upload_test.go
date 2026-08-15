@@ -79,6 +79,24 @@ func TestUploadAuthFile_AppliesCodexImportDefaults(t *testing.T) {
 	assertWebsockets("claude-default.json", nil, false)
 }
 
+func TestPrepareImportedTeamInitialization(t *testing.T) {
+	payload := []byte(`{"type":"codex","plan_type":"team","access_token":"access","refresh_token":"refresh"}`)
+	prepared, err := prepareImportedTeamInitialization(payload)
+	if err != nil {
+		t.Fatalf("prepareImportedTeamInitialization: %v", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(prepared, &metadata); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if metadata[coreauth.MetadataInitializationState] != string(coreauth.InitializationStateInitializing) {
+		t.Fatalf("initialization state = %#v", metadata[coreauth.MetadataInitializationState])
+	}
+	if generation, _ := metadata[coreauth.MetadataInitializationGeneration].(string); generation == "" {
+		t.Fatal("initialization generation is empty")
+	}
+}
+
 func TestUploadAuthFile_RejectsInvalidImportDefaults(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

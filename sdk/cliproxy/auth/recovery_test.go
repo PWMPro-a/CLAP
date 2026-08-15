@@ -1,0 +1,276 @@
+package auth
+
+import (
+	"context"
+	"net/http"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+)
+
+type recoveryTestExecutor struct {
+	refreshStarted chan struct{}
+	refreshRelease chan struct{}
+	refreshCalls   atomic.Int32
+	quotaCalls     atomic.Int32
+	quotaToken     atomic.Value
+}
+
+func (e *recoveryTestExecutor) Identifier() string { return "codex" }
+
+func (e *recoveryTestExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *recoveryTestExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *recoveryTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	e.refreshCalls.Add(1)
+	if e.refreshStarted != nil {
+		select {
+		case e.refreshStarted <- struct{}{}:
+		default:
+		}
+	}
+	if e.refreshRelease != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-e.refreshRelease:
+		}
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["access_token"] = "new-access-token"
+	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339Nano)
+	return auth, nil
+}
+
+func (e *recoveryTestExecutor) RefreshQuota(_ context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
+	e.quotaCalls.Add(1)
+	if auth != nil && auth.Metadata != nil {
+		e.quotaToken.Store(auth.Metadata["access_token"])
+	}
+	now := time.Now().UTC()
+	return CodexQuotaSnapshot{UsedRatio: 0.25, SampledAt: now, ExpiresAt: now.Add(time.Minute)}, nil
+}
+
+func (e *recoveryTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *recoveryTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
+	executor := &recoveryTestExecutor{
+		refreshStarted: make(chan struct{}, 1),
+		refreshRelease: make(chan struct{}),
+	}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(executor)
+	auth := &Auth{
+		ID:              "codex-recovery",
+		Provider:        "codex",
+		Status:          StatusActive,
+		LastRefreshedAt: time.Now(),
+		Metadata: map[string]any{
+			"type":          "codex",
+			"access_token":  "old-access-token",
+			"refresh_token": "refresh-token",
+			"expired":       time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.StartAutoRefresh(ctx, time.Hour)
+	defer manager.StopAutoRefresh()
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.3-codex",
+		Error: &Error{
+			Code:       "rate_limit_exceeded",
+			Message:    "Rate limit exceeded",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	})
+
+	select {
+	case <-executor.refreshStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery token refresh did not start")
+	}
+	blocked, ok := manager.GetByID(auth.ID)
+	if !ok || blocked.Status != StatusRecoveringToken || !blocked.Unavailable || !IsAuthRecoveryBlocking(blocked) {
+		t.Fatalf("blocked auth = %+v", blocked)
+	}
+	if _, err := manager.pickNextIndexed(context.Background(), "codex", []string{"codex"}, "gpt-5.3-codex", cliproxyexecutor.Options{}, nil); err == nil {
+		t.Fatal("recovering auth remained schedulable")
+	}
+
+	close(executor.refreshRelease)
+	eventuallyAuth(t, manager, auth.ID, func(current *Auth) bool {
+		return current.Status == StatusActive && !current.Unavailable && AuthRecoveryState(current) == RecoveryStateReady
+	})
+	if got := executor.refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
+	}
+	if got := executor.quotaCalls.Load(); got != 1 {
+		t.Fatalf("quota calls = %d, want 1", got)
+	}
+	if got, _ := executor.quotaToken.Load().(string); got != "new-access-token" {
+		t.Fatalf("quota token = %q, want refreshed token", got)
+	}
+	restored, _ := manager.GetByID(auth.ID)
+	if len(restored.ModelStates) != 0 || restored.LastError != nil || restored.Quota.Exceeded {
+		t.Fatalf("recovery did not clear cooldown state: %+v", restored)
+	}
+}
+
+func TestRateLimitRecoveryClassificationExcludesQuotaAndWebsocketLimits(t *testing.T) {
+	auth := &Auth{Provider: "codex", Metadata: map[string]any{"type": "codex"}}
+	for _, testCase := range []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{name: "rate limit", message: "rate_limit_exceeded: Rate limit exceeded", want: true},
+		{name: "quota", message: "usage_limit_reached", want: false},
+		{name: "websocket", message: "websocket_connection_limit_reached", want: false},
+		{name: "generic 429", message: "too many requests", want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := shouldQueueRateLimitRecovery(auth, Result{Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: testCase.message}})
+			if got != testCase.want {
+				t.Fatalf("shouldQueueRateLimitRecovery() = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
+	executor := &recoveryTestExecutor{}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	now := time.Now()
+	for _, id := range []string{"canonical-a", "canonical-b"} {
+		_, err := manager.Register(context.Background(), &Auth{
+			ID:              id,
+			Provider:        "codex",
+			Status:          StatusActive,
+			LastRefreshedAt: now,
+			Metadata: map[string]any{
+				"type":               "codex",
+				"email":              "same-member@example.com",
+				"chatgpt_account_id": "workspace-1",
+				"access_token":       "shared-old-access",
+				"refresh_token":      "shared-refresh",
+				"expired":            now.Add(time.Hour).UTC().Format(time.RFC3339Nano),
+			},
+		})
+		if err != nil {
+			t.Fatalf("Register %s: %v", id, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.StartAutoRefresh(ctx, time.Hour)
+	defer manager.StopAutoRefresh()
+	manager.MarkResult(context.Background(), Result{
+		AuthID: "canonical-a",
+		Model:  "gpt-5.3-codex",
+		Error:  &Error{Code: "rate_limit_exceeded", Message: "Rate limit exceeded", HTTPStatus: http.StatusTooManyRequests},
+	})
+
+	for _, id := range []string{"canonical-a", "canonical-b"} {
+		eventuallyAuth(t, manager, id, func(current *Auth) bool {
+			token, _ := current.Metadata["access_token"].(string)
+			return current.Status == StatusActive && !current.Unavailable && token == "new-access-token"
+		})
+	}
+	if got := executor.refreshCalls.Load(); got != 1 {
+		t.Fatalf("canonical refresh calls = %d, want 1", got)
+	}
+}
+
+func TestLifecycleRefreshGenerationGuardPreservesReimport(t *testing.T) {
+	executor := &recoveryTestExecutor{
+		refreshStarted: make(chan struct{}, 1),
+		refreshRelease: make(chan struct{}),
+	}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &Auth{
+		ID:       "team-reimport",
+		Provider: "codex",
+		Status:   StatusInitializing,
+		Metadata: map[string]any{
+			"type":                           "codex",
+			"access_token":                   "old-import-token",
+			"refresh_token":                  "refresh-token",
+			MetadataInitializationState:      string(InitializationStateInitializing),
+			MetadataInitializationGeneration: "generation-old",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	request := authRecoveryRequest{authID: auth.ID, kind: authLifecycleInitialization, generation: "generation-old"}
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := manager.forceRefreshLifecycleToken(context.Background(), request)
+		resultCh <- err
+	}()
+
+	select {
+	case <-executor.refreshStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initialization refresh did not start")
+	}
+	reimported, _ := manager.GetByID(auth.ID)
+	reimported.Metadata["access_token"] = "reimport-token"
+	reimported.Metadata[MetadataInitializationGeneration] = "generation-new"
+	reimported.Metadata[MetadataInitializationState] = string(InitializationStateInitializing)
+	reimported.Status = StatusInitializing
+	reimported.Unavailable = true
+	if _, err := manager.Update(context.Background(), reimported); err != nil {
+		t.Fatalf("Update reimport: %v", err)
+	}
+	close(executor.refreshRelease)
+	select {
+	case err := <-resultCh:
+		if err != errStaleAuthLifecycle {
+			t.Fatalf("old refresh error = %v, want stale generation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("old refresh did not finish")
+	}
+	current, _ := manager.GetByID(auth.ID)
+	if got, _ := current.Metadata["access_token"].(string); got != "reimport-token" {
+		t.Fatalf("access token = %q, old generation overwrote reimport", got)
+	}
+}
+
+func eventuallyAuth(t *testing.T, manager *Manager, authID string, predicate func(*Auth) bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if auth, ok := manager.GetByID(authID); ok && predicate(auth) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	auth, _ := manager.GetByID(authID)
+	t.Fatalf("auth condition was not met: %+v", auth)
+}

@@ -47,6 +47,7 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	cancelPrev := m.refreshCancel
 	m.refreshCancel = nil
 	m.refreshLoop = nil
+	m.recoveryLoop = nil
 	m.mu.Unlock()
 	if cancelPrev != nil {
 		cancelPrev()
@@ -58,14 +59,18 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 		workers = cfg.AuthAutoRefreshWorkers
 	}
 	loop := newAuthAutoRefreshLoop(m, interval, workers)
+	recoveryLoop := newAuthRecoveryLoop(m, min(workers, defaultAuthRecoveryConcurrency))
 
 	m.mu.Lock()
 	m.refreshCancel = cancelCtx
 	m.refreshLoop = loop
+	m.recoveryLoop = recoveryLoop
 	m.mu.Unlock()
 
 	loop.rebuild(time.Now())
 	go loop.run(ctx)
+	go recoveryLoop.run(ctx)
+	recoveryLoop.rebuild(time.Now())
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
@@ -75,6 +80,7 @@ func (m *Manager) StopAutoRefresh() {
 	cancel := m.refreshCancel
 	m.refreshCancel = nil
 	m.refreshLoop = nil
+	m.recoveryLoop = nil
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -113,6 +119,9 @@ func (m *Manager) queueRefreshUnschedule(authID string) {
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
+		return false
+	}
+	if IsAuthLifecycleBlocking(a) {
 		return false
 	}
 	if hasUnauthorizedAuthFailure(a) {

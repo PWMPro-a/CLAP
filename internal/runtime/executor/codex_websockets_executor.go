@@ -105,6 +105,13 @@ func (e *CodexAutoExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth
 	return e.httpExec.Refresh(ctx, auth)
 }
 
+func (e *CodexAutoExecutor) RefreshQuota(ctx context.Context, auth *cliproxyauth.Auth) (cliproxyauth.CodexQuotaSnapshot, error) {
+	if e == nil || e.httpExec == nil {
+		return cliproxyauth.CodexQuotaSnapshot{}, fmt.Errorf("codex auto executor: http executor is nil")
+	}
+	return e.httpExec.RefreshQuota(ctx, auth)
+}
+
 func (e *CodexAutoExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	if e == nil || e.httpExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: http executor is nil")
