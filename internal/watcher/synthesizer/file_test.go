@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -72,6 +73,53 @@ func TestFileSynthesizerExplicitUnpinUsesJWTPlan(t *testing.T) {
 	}
 	if got := auths[0].Attributes["plan_type"]; got != "free" {
 		t.Fatalf("effective plan_type = %q, want free after explicit unpin", got)
+	}
+}
+
+func TestFileSynthesizerDerivesSupplierLeaseFromDeliveryFileName(t *testing.T) {
+	now := time.Date(2026, 8, 15, 8, 20, 0, 0, time.UTC)
+	expiresAt := now.Add(50 * time.Minute)
+	data := []byte(`{"type":"codex","email":"member@example.com","access_token":"access"}`)
+	fileName := "team-sso-delivery-125917-oauth_7d-" + strconv.FormatInt(expiresAt.Unix(), 10) + ".json"
+	auths, errSynthesize := SynthesizeAuthFile(
+		&SynthesisContext{Config: &config.Config{}, Now: now, IDGenerator: NewStableIDGenerator()},
+		filepath.Join(t.TempDir(), fileName),
+		data,
+	)
+	if errSynthesize != nil || len(auths) != 1 {
+		t.Fatalf("auths=%d err=%v", len(auths), errSynthesize)
+	}
+	if got := auths[0].Metadata["supply_lease_expires_at_ms"]; got != expiresAt.UnixMilli() {
+		t.Fatalf("supply lease milliseconds = %#v, want %d", got, expiresAt.UnixMilli())
+	}
+	if got := auths[0].Metadata["supply_lease_expires_at"]; got != expiresAt.Format(time.RFC3339) {
+		t.Fatalf("supply lease = %#v, want %s", got, expiresAt.Format(time.RFC3339))
+	}
+}
+
+func TestFileSynthesizerKeepsExplicitSupplierLease(t *testing.T) {
+	now := time.Date(2026, 8, 15, 8, 20, 0, 0, time.UTC)
+	explicit := now.Add(20 * time.Minute)
+	fileExpiry := now.Add(50 * time.Minute)
+	data, errMarshal := json.Marshal(map[string]any{
+		"type":                       "codex",
+		"access_token":               "access",
+		"supply_lease_expires_at_ms": explicit.UnixMilli(),
+	})
+	if errMarshal != nil {
+		t.Fatalf("Marshal: %v", errMarshal)
+	}
+	fileName := "team-sso-delivery-125917-oauth_7d-" + strconv.FormatInt(fileExpiry.Unix(), 10) + ".json"
+	auths, errSynthesize := SynthesizeAuthFile(
+		&SynthesisContext{Config: &config.Config{}, Now: now, IDGenerator: NewStableIDGenerator()},
+		filepath.Join(t.TempDir(), fileName),
+		data,
+	)
+	if errSynthesize != nil || len(auths) != 1 {
+		t.Fatalf("auths=%d err=%v", len(auths), errSynthesize)
+	}
+	if got := auths[0].Metadata["supply_lease_expires_at_ms"]; got != float64(explicit.UnixMilli()) {
+		t.Fatalf("explicit supply lease = %#v, want %d", got, explicit.UnixMilli())
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -88,6 +89,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	provider := strings.ToLower(strings.TrimSpace(t))
 	if provider == "gemini" {
 		provider = "gemini-cli"
+	}
+	if provider == "codex" {
+		applySupplierLeaseMetadataFromFileName(metadata, filepath.Base(fullPath), now)
 	}
 	if ctx.PluginAuthParser != nil {
 		auths, handled, errParse := parsePluginFileAuths(ctx.PluginAuthParser, pluginapi.AuthParseRequest{
@@ -263,6 +267,63 @@ func authFileStringValue(metadata map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func applySupplierLeaseMetadataFromFileName(metadata map[string]any, fileName string, now time.Time) {
+	if metadata == nil || hasSupplierLeaseMetadata(metadata) {
+		return
+	}
+	expiresAt, ok := supplierLeaseExpiryFromFileName(fileName, now)
+	if !ok {
+		return
+	}
+	metadata["supply_lease_expires_at_ms"] = expiresAt.UnixMilli()
+	metadata["supply_lease_expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+}
+
+func hasSupplierLeaseMetadata(metadata map[string]any) bool {
+	for _, key := range []string{
+		"supply_lease_expires_at_ms",
+		"supplyLeaseExpiresAtMs",
+		"supply_lease_expires_at",
+		"supplyLeaseExpiresAt",
+	} {
+		if value, exists := metadata[key]; exists && value != nil && strings.TrimSpace(fmt.Sprint(value)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func supplierLeaseExpiryFromFileName(fileName string, now time.Time) (time.Time, bool) {
+	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(filepath.Base(fileName))), ".json")
+	if !strings.Contains(base, "-delivery-") {
+		return time.Time{}, false
+	}
+	parts := strings.Split(base, "-")
+	if len(parts) < 3 {
+		return time.Time{}, false
+	}
+	product := parts[len(parts)-2]
+	switch product {
+	case "team_1h", "oauth_7d", "oauth_30d":
+	default:
+		return time.Time{}, false
+	}
+	epochSeconds, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+	if err != nil || epochSeconds <= 0 {
+		return time.Time{}, false
+	}
+	expiresAt := time.Unix(epochSeconds, 0).UTC()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	// Delivery filenames are external input. Keep the accepted range wide
+	// enough for 30-day products while rejecting unrelated numeric suffixes.
+	if expiresAt.Before(now.Add(-45*24*time.Hour)) || expiresAt.After(now.Add(45*24*time.Hour)) {
+		return time.Time{}, false
+	}
+	return expiresAt, true
 }
 
 func authFileBoolValue(metadata map[string]any, keys ...string) (bool, bool) {
