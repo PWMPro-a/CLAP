@@ -29,6 +29,8 @@ const (
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	codexJSONOutputInstruction = "Return the response as JSON."
+	codexJSONOutputMessage     = `{"type":"message","role":"developer","content":[{"type":"input_text","text":"Return the response as JSON."}]}`
 )
 
 var dataTag = []byte("data:")
@@ -161,6 +163,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if len(headerSets) > 0 {
 		headers = headerSets[0]
 	}
+	rawJSON = normalizeCodexStructuredOutputCompatibility(rawJSON)
 	cache, errCache := codexPromptCacheForRequest(ctx, e.cfg, from, req, rawJSON, headers)
 	if errCache != nil {
 		return nil, nil, codexIdentityConfuseState{}, errCache
@@ -187,6 +190,57 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 	mergeMissingHeaders(httpReq.Header, appServerHeaders)
 	return httpReq, rawJSON, identityState, nil
+}
+
+// The Responses API requires an explicit JSON reference when json_object output
+// is requested. Keep the mutation deterministic and append-only so the existing
+// prompt prefix and cache-affinity identity remain stable.
+func normalizeCodexStructuredOutputCompatibility(body []byte) []byte {
+	formatType := strings.TrimSpace(gjson.GetBytes(body, "text.format.type").String())
+	if !strings.EqualFold(formatType, "json_object") {
+		return body
+	}
+	if codexStructuredOutputContainsJSON(gjson.GetBytes(body, "instructions")) ||
+		codexStructuredOutputContainsJSON(gjson.GetBytes(body, "input")) {
+		return body
+	}
+
+	input := gjson.GetBytes(body, "input")
+	switch {
+	case input.Type == gjson.String:
+		value := input.String()
+		if strings.TrimSpace(value) == "" {
+			value = codexJSONOutputInstruction
+		} else {
+			value += "\n\n" + codexJSONOutputInstruction
+		}
+		if updated, errSet := sjson.SetBytes(body, "input", value); errSet == nil {
+			return updated
+		}
+	case input.IsArray():
+		if updated, errSet := sjson.SetRawBytes(body, "input.-1", []byte(codexJSONOutputMessage)); errSet == nil {
+			return updated
+		}
+	}
+	return body
+}
+
+func codexStructuredOutputContainsJSON(value gjson.Result) bool {
+	if value.Type == gjson.String {
+		return strings.Contains(strings.ToLower(value.String()), "json")
+	}
+	if !value.IsArray() && !value.IsObject() {
+		return false
+	}
+	found := false
+	value.ForEach(func(_, child gjson.Result) bool {
+		if codexStructuredOutputContainsJSON(child) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func applyCodexAppServerFingerprint(body []byte, headers http.Header, metadata map[string]any) ([]byte, http.Header) {
