@@ -159,6 +159,24 @@ func TestNormalizeCodexOrphanToolCalls(t *testing.T) {
 		}
 	})
 
+	t.Run("removes outputs whose calls were truncated", func(t *testing.T) {
+		body := []byte(`{"input":[{"type":"custom_tool_call_output","call_id":"call_custom","output":"orphan"},{"type":"function_call_output","call_id":"call_function","output":"orphan"},{"type":"message","role":"user","content":"continue"}]}`)
+		got := normalizeCodexOrphanToolCalls(body)
+		input := gjson.GetBytes(got, "input").Array()
+		if len(input) != 1 || input[0].Get("role").String() != "user" {
+			t.Fatalf("orphan outputs remained in transcript: %s", got)
+		}
+	})
+
+	t.Run("drops duplicate outputs for one call", func(t *testing.T) {
+		body := []byte(`{"input":[{"type":"custom_tool_call","call_id":"call_custom","name":"search","input":"query"},{"type":"custom_tool_call_output","call_id":"call_custom","output":"first"},{"type":"custom_tool_call_output","call_id":"call_custom","output":"duplicate"}]}`)
+		got := normalizeCodexOrphanToolCalls(body)
+		input := gjson.GetBytes(got, "input").Array()
+		if len(input) != 2 || input[1].Get("output").String() != "first" {
+			t.Fatalf("duplicate output was not removed: %s", got)
+		}
+	})
+
 	t.Run("keeps non array input unchanged", func(t *testing.T) {
 		body := []byte(`{"input":"hello"}`)
 		if got := normalizeCodexOrphanToolCalls(body); !bytes.Equal(got, body) {

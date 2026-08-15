@@ -293,23 +293,51 @@ func normalizeCodexOrphanToolCalls(body []byte) []byte {
 		return body
 	}
 	items := input.Array()
+	calls := make(map[string]struct{}, len(items))
 	outputs := make(map[string]struct{}, len(items))
 	for _, item := range items {
 		itemType := strings.TrimSpace(item.Get("type").String())
-		if itemType != "function_call_output" && itemType != "custom_tool_call_output" {
+		callID := strings.TrimSpace(item.Get("call_id").String())
+		if callID == "" {
 			continue
 		}
-		if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+		switch itemType {
+		case "function_call":
+			calls["function_call_output\x00"+callID] = struct{}{}
+		case "custom_tool_call":
+			calls["custom_tool_call_output\x00"+callID] = struct{}{}
+		case "function_call_output", "custom_tool_call_output":
 			outputs[itemType+"\x00"+callID] = struct{}{}
 		}
 	}
 
 	normalized := make([][]byte, 0, len(items))
 	synthesized := make(map[string]struct{})
+	keptOutputs := make(map[string]struct{})
 	changed := false
 	for _, item := range items {
-		normalized = append(normalized, []byte(item.Raw))
 		callType := strings.TrimSpace(item.Get("type").String())
+		callID := strings.TrimSpace(item.Get("call_id").String())
+		if callType == "function_call_output" || callType == "custom_tool_call_output" {
+			key := callType + "\x00" + callID
+			if callID == "" {
+				changed = true
+				continue
+			}
+			if _, ok := calls[key]; !ok {
+				changed = true
+				continue
+			}
+			if _, duplicate := keptOutputs[key]; duplicate {
+				changed = true
+				continue
+			}
+			keptOutputs[key] = struct{}{}
+			normalized = append(normalized, []byte(item.Raw))
+			continue
+		}
+
+		normalized = append(normalized, []byte(item.Raw))
 		outputType := ""
 		switch callType {
 		case "function_call":
@@ -319,7 +347,6 @@ func normalizeCodexOrphanToolCalls(body []byte) []byte {
 		default:
 			continue
 		}
-		callID := strings.TrimSpace(item.Get("call_id").String())
 		if callID == "" {
 			continue
 		}
