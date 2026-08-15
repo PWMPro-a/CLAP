@@ -82,16 +82,17 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
-	authClone := auth.Clone()
+	stored := auth.Clone()
+	schedulerSnapshot := stored.Clone()
 	m.mu.Lock()
-	m.auths[auth.ID] = authClone
+	m.auths[auth.ID] = stored
 	m.mu.Unlock()
 	m.refreshCodexTailBurstCandidates()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
 	m.queueRefreshReschedule(auth.ID)
 	m.queueLifecycleRecovery(auth.ID)
@@ -140,15 +141,16 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
-	authClone := auth.Clone()
-	m.auths[auth.ID] = authClone
+	stored := auth.Clone()
+	schedulerSnapshot := stored.Clone()
+	m.auths[auth.ID] = stored
 	m.mu.Unlock()
 	m.refreshCodexTailBurstCandidates()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		m.scheduler.upsertAuth(schedulerSnapshot)
 	}
 	m.queueRefreshReschedule(auth.ID)
 	m.queueLifecycleRecovery(auth.ID)

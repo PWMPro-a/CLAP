@@ -818,6 +818,14 @@ func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 }
 
 func buildScheduledAuthMetaWithSelectionModels(auth *Auth, selectionModels map[string]string) *scheduledAuthMeta {
+	// The scheduler owns an immutable credential snapshot. Manager lifecycle
+	// workers mutate their stored Auth under a different mutex, so retaining a
+	// caller-owned pointer here can race token/quota recovery against request
+	// selection and crash on concurrent Metadata map access.
+	auth = auth.Clone()
+	if auth == nil {
+		return nil
+	}
 	providerKey := executorKeyFromAuth(auth)
 	selectionModelSet := make(map[string]string)
 	if selectionModels == nil {

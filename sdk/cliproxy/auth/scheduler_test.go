@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -1631,6 +1632,71 @@ func TestManager_SchedulerTracksRegisterAndUpdate(t *testing.T) {
 	if got == nil || got.ID != "auth-b" {
 		t.Fatalf("scheduler.pickSingle() after update auth = %v, want auth-b", got)
 	}
+}
+
+func TestManagerSchedulerSnapshotDoesNotShareMutableMetadata(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       "isolated-codex",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"chatgpt_account_id": "workspace-one",
+			"email":              "before@example.com",
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	manager.mu.Lock()
+	manager.auths["isolated-codex"].Metadata["email"] = "after@example.com"
+	manager.mu.Unlock()
+
+	candidates := manager.scheduler.snapshotCandidates([]string{"codex"}, "")
+	if len(candidates) != 1 {
+		t.Fatalf("snapshotCandidates() count = %d, want 1", len(candidates))
+	}
+	if got := authMetadataString(candidates[0], "email"); got != "before@example.com" {
+		t.Fatalf("scheduler metadata email = %q, want immutable snapshot", got)
+	}
+}
+
+func TestManagerSchedulerSnapshotSurvivesConcurrentManagerMetadataUpdates(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       "concurrent-codex",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"chatgpt_account_id": "workspace-one",
+			"email":              "member@example.com",
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+
+	const iterations = 2_000
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for index := 0; index < iterations; index++ {
+			manager.mu.Lock()
+			manager.auths["concurrent-codex"].Metadata["recovery_state"] = index
+			manager.mu.Unlock()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for index := 0; index < iterations; index++ {
+			candidates := manager.scheduler.snapshotCandidates([]string{"codex"}, "")
+			if len(candidates) != 1 || candidates[0].ID != "concurrent-codex" {
+				t.Errorf("snapshotCandidates() = %#v", candidates)
+				return
+			}
+		}
+	}()
+	wg.Wait()
 }
 
 func TestManager_PickNextMixed_UsesSchedulerRotation(t *testing.T) {
