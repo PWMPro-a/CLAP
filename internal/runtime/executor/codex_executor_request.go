@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/cacheaffinity"
@@ -194,9 +195,151 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 }
 
 func normalizeCodexUpstreamCompatibility(body []byte) []byte {
+	body = normalizeCodexImageInputCompatibility(body)
 	body = normalizeCodexOrphanToolCalls(body)
 	body = normalizeCodexToolChoiceCompatibility(body)
 	return normalizeCodexStructuredOutputCompatibility(body)
+}
+
+func normalizeCodexImageInputCompatibility(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"quality"`)) &&
+		!bytes.Contains(body, []byte(`"type":"image_url"`)) &&
+		!bytes.Contains(body, []byte(`"type": "image_url"`)) {
+		return body
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body
+	}
+
+	changed := false
+	items := make([][]byte, 0, len(input.Array()))
+	for _, item := range input.Array() {
+		itemRaw := []byte(item.Raw)
+		if content := gjson.GetBytes(itemRaw, "content"); content.IsArray() {
+			parts := make([][]byte, 0, len(content.Array()))
+			contentChanged := false
+			for _, part := range content.Array() {
+				normalized, keep, partChanged := normalizeCodexImageInputPart([]byte(part.Raw))
+				if !keep {
+					contentChanged = true
+					continue
+				}
+				contentChanged = contentChanged || partChanged
+				parts = append(parts, normalized)
+			}
+			if contentChanged {
+				if updated, err := sjson.SetRawBytes(itemRaw, "content", translatorcommon.JoinRawArray(parts)); err == nil {
+					itemRaw = updated
+					changed = true
+				}
+			}
+		}
+
+		normalized, keep, itemChanged := normalizeCodexImageInputPart(itemRaw)
+		if !keep {
+			changed = true
+			continue
+		}
+		changed = changed || itemChanged
+		items = append(items, normalized)
+	}
+	if !changed {
+		return body
+	}
+	updated, err := sjson.SetRawBytes(body, "input", translatorcommon.JoinRawArray(items))
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+func normalizeCodexImageInputPart(part []byte) ([]byte, bool, bool) {
+	changed := false
+	quality := strings.ToLower(strings.TrimSpace(gjson.GetBytes(part, "quality").String()))
+	if gjson.GetBytes(part, "quality").Exists() {
+		if updated, err := sjson.DeleteBytes(part, "quality"); err == nil {
+			part = updated
+			changed = true
+		}
+	}
+
+	partType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(part, "type").String()))
+	if partType != "input_image" && partType != "image_url" {
+		return part, true, changed
+	}
+
+	detail := strings.TrimSpace(gjson.GetBytes(part, "detail").String())
+	if detail == "" {
+		detail = strings.TrimSpace(gjson.GetBytes(part, "image_url.detail").String())
+	}
+	imageURL := strings.TrimSpace(gjson.GetBytes(part, "image_url").String())
+	if gjson.GetBytes(part, "image_url").IsObject() {
+		imageURL = strings.TrimSpace(gjson.GetBytes(part, "image_url.url").String())
+	}
+	if imageURL == "" {
+		imageURL = strings.TrimSpace(gjson.GetBytes(part, "url").String())
+	}
+	fileID := strings.TrimSpace(gjson.GetBytes(part, "file_id").String())
+	if fileID == "" {
+		fileID = strings.TrimSpace(gjson.GetBytes(part, "image_url.file_id").String())
+	}
+	if imageURL == "" && fileID == "" {
+		return nil, false, true
+	}
+
+	if partType != "input_image" {
+		if updated, err := sjson.SetBytes(part, "type", "input_image"); err == nil {
+			part = updated
+			changed = true
+		}
+	}
+	if imageURL != "" {
+		if current := gjson.GetBytes(part, "image_url"); current.Type != gjson.String || current.String() != imageURL {
+			if updated, err := sjson.SetBytes(part, "image_url", imageURL); err == nil {
+				part = updated
+				changed = true
+			}
+		}
+		for _, path := range []string{"file_id", "url"} {
+			if gjson.GetBytes(part, path).Exists() {
+				if updated, err := sjson.DeleteBytes(part, path); err == nil {
+					part = updated
+					changed = true
+				}
+			}
+		}
+	} else {
+		if updated, err := sjson.SetBytes(part, "file_id", fileID); err == nil {
+			part = updated
+			changed = true
+		}
+		if gjson.GetBytes(part, "image_url").Exists() {
+			if updated, err := sjson.DeleteBytes(part, "image_url"); err == nil {
+				part = updated
+				changed = true
+			}
+		}
+	}
+	if detail != "" {
+		if updated, err := sjson.SetBytes(part, "detail", detail); err == nil {
+			part = updated
+			changed = true
+		}
+	} else if quality != "" {
+		detail = quality
+		switch quality {
+		case "hd":
+			detail = "high"
+		case "standard":
+			detail = "auto"
+		}
+		if updated, err := sjson.SetBytes(part, "detail", detail); err == nil {
+			part = updated
+			changed = true
+		}
+	}
+	return part, true, changed
 }
 
 func normalizeCodexToolChoiceCompatibility(body []byte) []byte {

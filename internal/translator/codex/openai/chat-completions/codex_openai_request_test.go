@@ -1404,3 +1404,29 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 		t.Errorf("tool 'search' not found in output tools: %s", gjson.Get(result, "tools").Raw)
 	}
 }
+
+func TestStringImageURLContentTranslatesWithoutEmptyImagePart(t *testing.T) {
+	input := []byte(`{
+		"model":"gpt-5.5",
+		"messages":[{"role":"user","content":[
+			{"type":"text","text":"Inspect this screenshot."},
+			{"type":"image_url","image_url":"data:image/jpeg;base64,AA=="},
+			{"type":"image_url","image_url":{"file_id":"file-image-1","detail":"high"}},
+			{"type":"image_url","image_url":{"detail":"low"}}
+		]}]
+	}`)
+	out := ConvertOpenAIRequestToCodex("gpt-5.5", input, true)
+	parts := gjson.GetBytes(out, "input.0.content").Array()
+	if len(parts) != 3 {
+		t.Fatalf("content parts = %d, want text plus two valid images: %s", len(parts), out)
+	}
+	if got := parts[1].Get("image_url").String(); got != "data:image/jpeg;base64,AA==" {
+		t.Fatalf("string image_url = %q, want data URL", got)
+	}
+	if got := parts[2].Get("file_id").String(); got != "file-image-1" {
+		t.Fatalf("file-backed image = %q, want file-image-1", got)
+	}
+	if got := parts[2].Get("detail").String(); got != "high" {
+		t.Fatalf("image detail = %q, want high", got)
+	}
+}
