@@ -39,9 +39,13 @@ func TestNormalizeCodexStructuredOutputCompatibility(t *testing.T) {
 			},
 		},
 		{
-			name:      "existing JSON hint",
-			body:      `{"model":"gpt-5.5","instructions":"Respond using JSON.","input":"Return one object.","text":{"format":{"type":"json_object"}}}`,
-			unchanged: true,
+			name: "top level instructions do not satisfy input requirement",
+			body: `{"model":"gpt-5.5","instructions":"Respond using JSON.","input":"Return one object.","text":{"format":{"type":"json_object"}}}`,
+			assert: func(t *testing.T, body []byte) {
+				if got := gjson.GetBytes(body, "input").String(); got != "Return one object.\n\n"+codexJSONOutputInstruction {
+					t.Fatalf("top-level instructions suppressed JSON input repair: %s", body)
+				}
+			},
 		},
 		{
 			name:      "non json object format",

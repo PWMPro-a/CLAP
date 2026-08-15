@@ -356,8 +356,10 @@ func normalizeCodexStructuredOutputCompatibility(body []byte) []byte {
 	if !strings.EqualFold(formatType, "json_object") {
 		return body
 	}
-	if codexStructuredOutputTextContainsJSON(gjson.GetBytes(body, "instructions")) ||
-		codexStructuredOutputInputContainsJSON(gjson.GetBytes(body, "input")) {
+	// The upstream validator checks input messages only. Top-level
+	// `instructions` may contain JSON and still be rejected, so it must not
+	// suppress the compatibility message appended below.
+	if codexStructuredOutputInputContainsJSON(gjson.GetBytes(body, "input")) {
 		return body
 	}
 
