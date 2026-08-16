@@ -27,11 +27,10 @@ func authWithSupplyLeaseExpiry(id string, leaseExpiry, tokenExpiry time.Time) *A
 func TestExpiryPriorityAuthsKeepsClosestExpiryLane(t *testing.T) {
 	now := time.Now().UTC()
 	far := authWithExpiry("far", now.Add(48*time.Hour))
-	later := authWithExpiry("later", now.Add(3*time.Hour))
 	sooner := authWithExpiry("sooner", now.Add(30*time.Minute))
 	noExpiry := &Auth{ID: "no-expiry", Provider: "codex", Status: StatusActive}
 
-	got := expiryPriorityAuths([]*Auth{far, later, noExpiry, sooner}, now)
+	got := expiryPriorityAuths([]*Auth{far, noExpiry, sooner}, now)
 	if len(got) != 1 {
 		t.Fatalf("closest-expiry candidates = %d, want 1", len(got))
 	}
@@ -45,16 +44,28 @@ func TestExpiryPriorityAuthsKeepsClosestExpiryLane(t *testing.T) {
 	}
 }
 
-func TestExpiryPriorityAuthsKeepsOnlyOldestSupplierCohort(t *testing.T) {
+func TestExpiryPriorityAuthsKeepsMinimumCandidatesAndBoundaryCohort(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
-	oldestA := authWithSupplyLeaseExpiry("oldest-a", now.Add(20*time.Minute), tokenExpiry)
-	oldestB := authWithSupplyLeaseExpiry("oldest-b", now.Add(20*time.Minute+30*time.Second), tokenExpiry)
-	nextBatch := authWithSupplyLeaseExpiry("next", now.Add(22*time.Minute), tokenExpiry)
+	auths := make([]*Auth, 0, 10)
+	for i := 0; i < 10; i++ {
+		expiresAt := now.Add(time.Duration(20+i*2) * time.Minute)
+		if i == 8 {
+			// The ninth candidate belongs to the eighth candidate's batch and
+			// must not be split off at the minimum-size boundary.
+			expiresAt = now.Add(34*time.Minute + 30*time.Second)
+		}
+		auths = append(auths, authWithSupplyLeaseExpiry(string(rune('a'+i)), expiresAt, tokenExpiry))
+	}
 
-	got := expiryPriorityAuths([]*Auth{nextBatch, oldestB, oldestA}, now)
-	if len(got) != 2 || got[0].ID != "oldest-a" || got[1].ID != "oldest-b" {
-		t.Fatalf("oldest supplier cohort = %#v, want [oldest-a oldest-b]", got)
+	got := expiryPriorityAuths(auths, now)
+	if len(got) != 9 {
+		t.Fatalf("expiry priority candidates = %d, want 9", len(got))
+	}
+	for i := 0; i < 9; i++ {
+		if got[i].ID != string(rune('a'+i)) {
+			t.Fatalf("expiry priority candidate %d = %s, want %s", i, got[i].ID, string(rune('a'+i)))
+		}
 	}
 }
 

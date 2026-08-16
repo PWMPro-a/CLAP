@@ -11,10 +11,13 @@ const (
 	// group becomes a drain lane.
 	authExpiryPriorityWindow = 24 * time.Hour
 	// authExpiryCohortWindow keeps one supplier batch moving together while
-	// preventing a large short-lived pool from degenerating into round-robin
-	// across every account. The next batch enters the lane after the oldest
-	// minute-wide cohort is exhausted, blocked, or expired.
+	// preserving batch boundaries when the active lane is widened for capacity.
 	authExpiryCohortWindow = time.Minute
+	// authExpiryPriorityMinCandidates keeps the near-expiry lane large enough to
+	// absorb normal concurrent traffic. A one-account supplier batch otherwise
+	// attracts every cold session until it saturates, forcing established hot
+	// sessions onto another account and losing their upstream prompt cache.
+	authExpiryPriorityMinCandidates = 8
 	// authExpiryDrainWindow is the final window in which an account may use a
 	// bounded concurrency boost to consume remaining quota before expiry.
 	authExpiryDrainWindow = 5 * time.Minute
@@ -103,6 +106,9 @@ func authExpiryDrainActive(auth *Auth, model string, now time.Time) bool {
 }
 
 // expiryPriorityAuths narrows a ready candidate set to the near-expiry lane.
+// The lane includes at least authExpiryPriorityMinCandidates and then extends
+// through the boundary candidate's supplier cohort. This preserves expiry
+// preference without concentrating all cold sessions on a tiny batch.
 // The caller has already applied provider/model availability and priority
 // rules. Returning the original slice when no lane exists preserves the hot
 // request path's existing allocation and ordering behavior.
@@ -127,8 +133,12 @@ func expiryPriorityAuths(auths []*Auth, now time.Time) []*Auth {
 		}
 		return priority[i].ID < priority[j].ID
 	})
-	earliest, _ := authSchedulingExpirationTime(priority[0])
-	cutoff := earliest.Add(authExpiryCohortWindow)
+	boundary := authExpiryPriorityMinCandidates
+	if boundary > len(priority) {
+		boundary = len(priority)
+	}
+	boundaryExpiry, _ := authSchedulingExpirationTime(priority[boundary-1])
+	cutoff := boundaryExpiry.Add(authExpiryCohortWindow)
 	end := 1
 	for end < len(priority) {
 		expiresAt, _ := authSchedulingExpirationTime(priority[end])
