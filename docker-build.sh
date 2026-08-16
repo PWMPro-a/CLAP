@@ -31,7 +31,7 @@ case "$choice" in
     echo "--- Building from Source and Running ---"
 
     # Get Version Information
-    VERSION="$(git describe --tags --always --dirty)"
+    VERSION="$(./scripts/compact-version.sh)"
     COMMIT="$(git rev-parse --short HEAD)"
     BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 

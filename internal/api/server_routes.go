@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/claude/models"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
@@ -41,12 +42,21 @@ const codexAlphaSearchSourceFormat = "codex-alpha-search"
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
 	healthzHandler := func(c *gin.Context) {
+		c.Header("X-CPA-VERSION", buildinfo.Version)
+		c.Header("X-CPA-COMMIT", buildinfo.Commit)
+		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
 		if c.Request.Method == http.MethodHead {
 			c.Status(http.StatusOK)
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "ok",
+			"service":   "cli-proxy-api",
+			"version":   buildinfo.Version,
+			"commit":    buildinfo.Commit,
+			"buildDate": buildinfo.BuildDate,
+		})
 	}
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)

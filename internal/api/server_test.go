@@ -464,13 +464,23 @@ func TestHealthz(t *testing.T) {
 		}
 
 		var resp struct {
-			Status string `json:"status"`
+			Status    string `json:"status"`
+			Service   string `json:"service"`
+			Version   string `json:"version"`
+			Commit    string `json:"commit"`
+			BuildDate string `json:"buildDate"`
 		}
 		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
 		}
 		if resp.Status != "ok" {
 			t.Fatalf("unexpected response status: got %q want %q", resp.Status, "ok")
+		}
+		if resp.Service != "cli-proxy-api" || resp.Version == "" || resp.Commit == "" || resp.BuildDate == "" {
+			t.Fatalf("unexpected health metadata: %#v", resp)
+		}
+		if rr.Header().Get("X-CPA-VERSION") != resp.Version {
+			t.Fatalf("unexpected version header: got %q want %q", rr.Header().Get("X-CPA-VERSION"), resp.Version)
 		}
 	})
 
@@ -484,6 +494,9 @@ func TestHealthz(t *testing.T) {
 		}
 		if rr.Body.Len() != 0 {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
+		}
+		if rr.Header().Get("X-CPA-VERSION") == "" {
+			t.Fatal("expected version header for HEAD request")
 		}
 	})
 }
