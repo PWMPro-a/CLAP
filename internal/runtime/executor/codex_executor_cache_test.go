@@ -466,6 +466,31 @@ func TestCodexIdentityConfuseUsesStablePerAccountInstallationFingerprint(t *test
 	}
 }
 
+func TestCodexIdentityConfuseUsesStableMemberSeedWhenAuthIDIsMissing(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{HighCacheMode: true},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email":              "member@example.com",
+			"chatgpt_account_id": "workspace-1",
+		},
+	}
+	payload := []byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"session-1"}`)
+	upstream, state := applyCodexIdentityConfuseBody(cfg, auth, payload, payload)
+	if !state.enabled || state.authID == "" || state.installationID == "" {
+		t.Fatalf("identity-confuse did not activate for stable member claims: state=%+v", state)
+	}
+	if got := gjson.GetBytes(upstream, "prompt_cache_key").String(); got == "session-1" || got == "" {
+		t.Fatalf("prompt_cache_key was not remapped: %q", got)
+	}
+	if got := gjson.GetBytes(upstream, "client_metadata.x-codex-installation-id").String(); got == "" {
+		t.Fatal("installation fingerprint was not injected")
+	}
+}
+
 func TestCodexAccountInstallationFingerprintSurvivesRenameAndSeparatesTeamMembers(t *testing.T) {
 	first := &cliproxyauth.Auth{ID: "old-name.json", Metadata: map[string]any{
 		"email": "first@example.com", "chatgpt_account_id": "shared-team-workspace",

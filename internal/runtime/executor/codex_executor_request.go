@@ -722,20 +722,33 @@ func codexAPIKeyPromptCacheID(ctx context.Context) string {
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
-	if !codexIdentityConfuseEnabled(cfg) || auth == nil || strings.TrimSpace(auth.ID) == "" || len(rawJSON) == 0 {
+	if !codexIdentityConfuseEnabled(cfg) || auth == nil || len(rawJSON) == 0 {
+		return rawJSON, codexIdentityConfuseState{}
+	}
+
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		// Imported credentials can briefly enter the runtime before the watcher
+		// assigns a file ID. Use stable member claims so the upstream identity is
+		// still account-scoped instead of becoming request-scoped.
+		if seed := codexAccountFingerprintSeed(auth); seed != "" {
+			authID = codexIdentityConfuseUUID("", "auth", seed)
+		}
+	}
+	if authID == "" {
 		return rawJSON, codexIdentityConfuseState{}
 	}
 
 	state := codexIdentityConfuseState{
 		enabled:        true,
-		authID:         strings.TrimSpace(auth.ID),
+		authID:         authID,
 		installationID: codexAccountInstallationID(auth),
 	}
 	clientPromptCacheKey := strings.TrimSpace(gjson.GetBytes(userPayload, "prompt_cache_key").String())
 	promptCacheKey := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String())
 	if promptCacheKey != "" {
 		state.originalPromptCacheKey = clientPromptCacheKey
-		state.promptCacheKey = codexIdentityConfuseUUID(auth.ID, "prompt-cache", promptCacheKey)
+		state.promptCacheKey = codexIdentityConfuseUUID(state.authID, "prompt-cache", promptCacheKey)
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", state.promptCacheKey)
 	}
 	// Installation identity is an account-level device fingerprint. It must not
