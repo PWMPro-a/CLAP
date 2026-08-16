@@ -257,6 +257,10 @@ func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []b
 	if err != nil {
 		return err
 	}
+	data, err = prepareCodexIdentityFingerprintForImport(dst, data)
+	if err != nil {
+		return err
+	}
 	data, err = prepareImportedTeamInitialization(data)
 	if err != nil {
 		return err
@@ -277,6 +281,44 @@ func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []b
 		starter.StartTaskRegistration()
 	}
 	return nil
+}
+
+func prepareCodexIdentityFingerprintForImport(path string, data []byte) ([]byte, error) {
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return data, nil
+	}
+	provider, _ := metadata["type"].(string)
+	fallbackIdentity := filepath.Base(path)
+	incoming := &coreauth.Auth{
+		ID:       fallbackIdentity,
+		Provider: provider,
+		Metadata: metadata,
+	}
+	changed := false
+	if existingData, errRead := os.ReadFile(path); errRead == nil {
+		existingMetadata := make(map[string]any)
+		if json.Unmarshal(existingData, &existingMetadata) == nil {
+			existingProvider, _ := existingMetadata["type"].(string)
+			existing := &coreauth.Auth{
+				ID:       fallbackIdentity,
+				Provider: existingProvider,
+				Metadata: existingMetadata,
+			}
+			_, changed = coreauth.InheritCodexIdentityFingerprint(incoming, existing, fallbackIdentity)
+		}
+	}
+	if !changed {
+		_, changed = coreauth.EnsureCodexIdentityFingerprint(incoming, fallbackIdentity)
+	}
+	if !changed {
+		return data, nil
+	}
+	canonical, errMarshal := json.MarshalIndent(metadata, "", "  ")
+	if errMarshal != nil {
+		return nil, fmt.Errorf("serialize Codex identity fingerprint: %w", errMarshal)
+	}
+	return append(canonical, '\n'), nil
 }
 
 func prepareImportedTeamInitialization(data []byte) ([]byte, error) {

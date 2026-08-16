@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -164,6 +165,80 @@ func TestFileTokenStoreSaveRejectsInvalidWeight(t *testing.T) {
 	}
 	if _, errStat := os.Stat(filepath.Join(baseDir, auth.FileName)); !os.IsNotExist(errStat) {
 		t.Fatalf("invalid auth file was persisted: %v", errStat)
+	}
+}
+
+func TestFileTokenStoreListBackfillsCodexIdentityFingerprint(t *testing.T) {
+	baseDir := t.TempDir()
+	fileName := "codex-member.json"
+	path := filepath.Join(baseDir, fileName)
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","chatgpt_account_id":"workspace-one","email":"member@example.com","access_token":"token"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auths, errList := store.List(context.Background())
+	if errList != nil {
+		t.Fatalf("List() error = %v", errList)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("List() len = %d, want 1", len(auths))
+	}
+	fingerprint := cliproxyauth.CodexIdentityFingerprint(auths[0])
+	if fingerprint == "" {
+		t.Fatal("runtime auth fingerprint is empty")
+	}
+	persisted, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read backfilled auth file: %v", errRead)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(persisted, &metadata); err != nil {
+		t.Fatalf("decode backfilled auth file: %v", err)
+	}
+	if got, _ := metadata[cliproxyauth.MetadataCodexIdentityFingerprint].(string); got != fingerprint {
+		t.Fatalf("persisted fingerprint = %q, want %q", got, fingerprint)
+	}
+}
+
+func TestFileTokenStoreSaveInheritsExistingCodexIdentityFingerprint(t *testing.T) {
+	baseDir := t.TempDir()
+	fileName := "codex-member.json"
+	path := filepath.Join(baseDir, fileName)
+	if errWrite := os.WriteFile(path, []byte(`{"type":"codex","email":"old@example.com","codex_identity_fingerprint":"stable-member","access_token":"old"}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auth := &cliproxyauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":                       "codex",
+			"email":                      "new@example.com",
+			"codex_identity_fingerprint": "replacement-member",
+			"access_token":               "new",
+		},
+	}
+	if _, errSave := store.Save(context.Background(), auth); errSave != nil {
+		t.Fatalf("Save() error = %v", errSave)
+	}
+	if got := cliproxyauth.CodexIdentityFingerprint(auth); got != "stable-member" {
+		t.Fatalf("saved auth fingerprint = %q, want stable-member", got)
+	}
+	persisted, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read saved auth file: %v", errRead)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(persisted, &metadata); err != nil {
+		t.Fatalf("decode saved auth file: %v", err)
+	}
+	if got, _ := metadata[cliproxyauth.MetadataCodexIdentityFingerprint].(string); got != "stable-member" {
+		t.Fatalf("persisted fingerprint = %q, want stable-member", got)
 	}
 }
 

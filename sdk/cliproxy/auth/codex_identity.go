@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+const MetadataCodexIdentityFingerprint = "codex_identity_fingerprint"
+
 // codexCanonicalIdentityKey returns a stable member identity used only for
 // local scheduling. It deliberately combines a Team workspace with its member
 // identity because every member shares the workspace ID.
@@ -34,10 +36,91 @@ func codexCanonicalIdentityKey(auth *Auth) string {
 
 func codexIdentityFingerprintValue(auth *Auth) string {
 	return strings.ToLower(firstAuthIdentityString(auth,
-		"codex_identity_fingerprint",
+		MetadataCodexIdentityFingerprint,
 		"codex-identity-fingerprint",
 		"codexIdentityFingerprint",
 	))
+}
+
+// CodexIdentityFingerprint returns the persisted account identity used to keep
+// scheduling and upstream cache namespaces stable across credential rotation.
+func CodexIdentityFingerprint(auth *Auth) string {
+	return codexIdentityFingerprintValue(auth)
+}
+
+// EnsureCodexIdentityFingerprint adds a deterministic persisted fingerprint to
+// a Codex credential. Team workspaces are always combined with a member claim;
+// when member claims are unavailable, fallbackIdentity should be the stable
+// backing file ID.
+func EnsureCodexIdentityFingerprint(auth *Auth, fallbackIdentity string) (string, bool) {
+	if !isCodexIdentityAuth(auth) {
+		return "", false
+	}
+	if fingerprint := codexIdentityFingerprintValue(auth); fingerprint != "" {
+		return fingerprint, setCodexIdentityFingerprint(auth, fingerprint)
+	}
+
+	workspace := codexWorkspaceIdentityValue(auth)
+	member := strings.ToLower(firstAuthIdentityString(auth,
+		"chatgpt_user_id",
+		"user_id",
+		"chatgpt_account_user_id",
+		"email",
+		"outlook_email",
+	))
+	var fingerprint string
+	switch {
+	case member != "":
+		fingerprint = hashedIdentityKey("codex-persisted-fingerprint", workspace, member)
+	case firstAuthIdentityString(auth, "agent_runtime_id", "agentRuntimeId") != "":
+		fingerprint = hashedIdentityKey("codex-persisted-runtime", firstAuthIdentityString(auth, "agent_runtime_id", "agentRuntimeId"))
+	case strings.TrimSpace(fallbackIdentity) != "":
+		fingerprint = hashedIdentityKey("codex-persisted-file", fallbackIdentity)
+	default:
+		return "", false
+	}
+	return fingerprint, setCodexIdentityFingerprint(auth, fingerprint)
+}
+
+// InheritCodexIdentityFingerprint keeps the existing file's cache namespace
+// authoritative when its credential payload is replaced.
+func InheritCodexIdentityFingerprint(auth *Auth, existing *Auth, fallbackIdentity string) (string, bool) {
+	if !isCodexIdentityAuth(auth) {
+		return "", false
+	}
+	if existing != nil && isCodexIdentityAuth(existing) {
+		if fingerprint, _ := EnsureCodexIdentityFingerprint(existing, fallbackIdentity); fingerprint != "" {
+			return fingerprint, setCodexIdentityFingerprint(auth, fingerprint)
+		}
+	}
+	return EnsureCodexIdentityFingerprint(auth, fallbackIdentity)
+}
+
+func isCodexIdentityAuth(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	provider := executorKeyFromAuth(auth)
+	if provider == "" && auth.Metadata != nil {
+		provider, _ = auth.Metadata["type"].(string)
+		provider = strings.ToLower(strings.TrimSpace(provider))
+	}
+	return provider == "codex" || provider == "openai-codex"
+}
+
+func setCodexIdentityFingerprint(auth *Auth, fingerprint string) bool {
+	if auth == nil || strings.TrimSpace(fingerprint) == "" {
+		return false
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	fingerprint = strings.ToLower(strings.TrimSpace(fingerprint))
+	if current, _ := auth.Metadata[MetadataCodexIdentityFingerprint].(string); strings.TrimSpace(current) == fingerprint {
+		return false
+	}
+	auth.Metadata[MetadataCodexIdentityFingerprint] = fingerprint
+	return true
 }
 
 // codexSameMemberIdentity deliberately never treats a Team workspace ID as a
@@ -158,7 +241,7 @@ func canonicalAuthPreferenceScore(auth *Auth) int {
 		score += 100
 	}
 	if firstAuthIdentityString(auth,
-		"codex_identity_fingerprint",
+		MetadataCodexIdentityFingerprint,
 		"codex-identity-fingerprint",
 		"codexIdentityFingerprint",
 	) != "" {

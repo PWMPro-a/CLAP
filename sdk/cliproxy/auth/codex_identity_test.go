@@ -296,3 +296,52 @@ func TestSameMemberIdentityUsesFingerprintsAuthoritatively(t *testing.T) {
 		t.Fatal("credentials from another provider must remain isolated")
 	}
 }
+
+func TestEnsureCodexIdentityFingerprintIsStableAndMemberScoped(t *testing.T) {
+	first := &Auth{ID: "first.json", Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id": "workspace-one",
+		"chatgpt_user_id":    "user-one",
+	}}
+	rotated := &Auth{ID: "rotated.json", Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id": "workspace-one",
+		"chatgpt_user_id":    "USER-ONE",
+	}}
+	otherMember := &Auth{ID: "other.json", Provider: "codex", Metadata: map[string]any{
+		"chatgpt_account_id": "workspace-one",
+		"chatgpt_user_id":    "user-two",
+	}}
+
+	firstFingerprint, firstChanged := EnsureCodexIdentityFingerprint(first, first.ID)
+	rotatedFingerprint, rotatedChanged := EnsureCodexIdentityFingerprint(rotated, rotated.ID)
+	otherFingerprint, otherChanged := EnsureCodexIdentityFingerprint(otherMember, otherMember.ID)
+	if !firstChanged || !rotatedChanged || !otherChanged {
+		t.Fatalf("fingerprints were not persisted: first=%v rotated=%v other=%v", firstChanged, rotatedChanged, otherChanged)
+	}
+	if firstFingerprint == "" || firstFingerprint != rotatedFingerprint {
+		t.Fatalf("same member fingerprint changed across files: first=%q rotated=%q", firstFingerprint, rotatedFingerprint)
+	}
+	if firstFingerprint == otherFingerprint {
+		t.Fatalf("different Team members share fingerprint %q", firstFingerprint)
+	}
+	if got, _ := first.Metadata[MetadataCodexIdentityFingerprint].(string); got != firstFingerprint {
+		t.Fatalf("persisted fingerprint = %q, want %q", got, firstFingerprint)
+	}
+}
+
+func TestInheritCodexIdentityFingerprintKeepsExistingNamespace(t *testing.T) {
+	existing := &Auth{ID: "account.json", Provider: "codex", Metadata: map[string]any{
+		"email":                          "old@example.com",
+		MetadataCodexIdentityFingerprint: "stable-fingerprint",
+	}}
+	incoming := &Auth{ID: "account.json", Provider: "codex", Metadata: map[string]any{
+		"email":                          "new@example.com",
+		MetadataCodexIdentityFingerprint: "replacement-fingerprint",
+	}}
+	fingerprint, changed := InheritCodexIdentityFingerprint(incoming, existing, incoming.ID)
+	if !changed || fingerprint != "stable-fingerprint" {
+		t.Fatalf("inherit fingerprint = %q changed=%v, want stable-fingerprint/true", fingerprint, changed)
+	}
+	if got := CodexIdentityFingerprint(incoming); got != "stable-fingerprint" {
+		t.Fatalf("incoming fingerprint = %q, want stable-fingerprint", got)
+	}
+}

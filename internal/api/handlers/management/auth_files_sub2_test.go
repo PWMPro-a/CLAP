@@ -81,5 +81,31 @@ func TestWriteAuthFileExpandsSub2Bundle(t *testing.T) {
 		if enabled, ok := metadata["websockets"].(bool); !ok || !enabled {
 			t.Fatalf("generated file %q websockets = %#v, want true", entry.Name(), metadata["websockets"])
 		}
+		if fingerprint, _ := metadata["codex_identity_fingerprint"].(string); strings.TrimSpace(fingerprint) == "" {
+			t.Fatalf("generated file %q has no Codex identity fingerprint", entry.Name())
+		}
+	}
+}
+
+func TestPrepareCodexIdentityFingerprintForImportInheritsExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex-member.json")
+	existing := []byte(`{"type":"codex","email":"old@example.com","codex_identity_fingerprint":"stable-member","access_token":"old"}`)
+	if errWrite := os.WriteFile(path, existing, 0o600); errWrite != nil {
+		t.Fatalf("write existing auth file: %v", errWrite)
+	}
+	incoming := []byte(`{"type":"codex","email":"new@example.com","codex_identity_fingerprint":"replacement-member","access_token":"new"}`)
+	prepared, err := prepareCodexIdentityFingerprintForImport(path, incoming)
+	if err != nil {
+		t.Fatalf("prepare import: %v", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(prepared, &metadata); err != nil {
+		t.Fatalf("decode prepared import: %v", err)
+	}
+	if got, _ := metadata["codex_identity_fingerprint"].(string); got != "stable-member" {
+		t.Fatalf("prepared fingerprint = %q, want stable-member", got)
+	}
+	if got, _ := metadata["access_token"].(string); got != "new" {
+		t.Fatalf("prepared access token = %q, want new", got)
 	}
 }

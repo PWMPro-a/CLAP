@@ -727,7 +727,12 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 	}
 
 	authID := strings.TrimSpace(auth.ID)
-	if authID == "" {
+	if fingerprint := cliproxyauth.CodexIdentityFingerprint(auth); fingerprint != "" {
+		// The persisted member fingerprint is the cache namespace. It survives
+		// auth-file replacement, renaming, and token rotation while remaining
+		// isolated between members of the same Team workspace.
+		authID = "fingerprint:" + fingerprint
+	} else if authID == "" {
 		// Imported credentials can briefly enter the runtime before the watcher
 		// assigns a file ID. Use stable member claims so the upstream identity is
 		// still account-scoped instead of becoming request-scoped.

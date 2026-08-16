@@ -523,6 +523,36 @@ func TestCodexAccountInstallationFingerprintPrefersPersistedSeed(t *testing.T) {
 	}
 }
 
+func TestCodexIdentityConfuseUsesPersistedFingerprintAsCacheNamespace(t *testing.T) {
+	cfg := &config.Config{
+		Routing: config.RoutingConfig{HighCacheMode: true},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+	payload := []byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"session-1"}`)
+	firstAuth := &cliproxyauth.Auth{ID: "old-file.json", Provider: "codex", Metadata: map[string]any{
+		"codex_identity_fingerprint": "stable-member",
+	}}
+	replacementAuth := &cliproxyauth.Auth{ID: "new-file.json", Provider: "codex", Metadata: map[string]any{
+		"codex_identity_fingerprint": "stable-member",
+	}}
+	otherAuth := &cliproxyauth.Auth{ID: "other-file.json", Provider: "codex", Metadata: map[string]any{
+		"codex_identity_fingerprint": "other-member",
+	}}
+
+	firstBody, _ := applyCodexIdentityConfuseBody(cfg, firstAuth, payload, payload)
+	replacementBody, _ := applyCodexIdentityConfuseBody(cfg, replacementAuth, payload, payload)
+	otherBody, _ := applyCodexIdentityConfuseBody(cfg, otherAuth, payload, payload)
+	firstKey := gjson.GetBytes(firstBody, "prompt_cache_key").String()
+	replacementKey := gjson.GetBytes(replacementBody, "prompt_cache_key").String()
+	otherKey := gjson.GetBytes(otherBody, "prompt_cache_key").String()
+	if firstKey == "" || firstKey != replacementKey {
+		t.Fatalf("replacement changed cache namespace: first=%q replacement=%q", firstKey, replacementKey)
+	}
+	if firstKey == otherKey {
+		t.Fatalf("different fingerprints share cache namespace %q", firstKey)
+	}
+}
+
 func TestCodexExecutorCacheHelper_ClaudeUsesSessionHeader(t *testing.T) {
 	executor := &CodexExecutor{}
 	recorder := httptest.NewRecorder()

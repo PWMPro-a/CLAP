@@ -88,6 +88,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if path == "" {
 		return "", fmt.Errorf("auth filestore: missing file path attribute for %s", auth.ID)
 	}
+	prepareCodexIdentityFingerprintForSave(auth, path)
 
 	if auth.Disabled {
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
@@ -241,6 +242,16 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	}
 	provider, _ := metadata["type"].(string)
 	provider = strings.TrimSpace(provider)
+	id := s.idFor(path, baseDir)
+	identityAuth := &cliproxyauth.Auth{ID: id, Provider: provider, Metadata: metadata}
+	if _, changed := cliproxyauth.EnsureCodexIdentityFingerprint(identityAuth, id); changed {
+		if raw, errMarshal := json.MarshalIndent(metadata, "", "  "); errMarshal == nil {
+			raw = append(raw, '\n')
+			if errWrite := os.WriteFile(path, raw, 0o600); errWrite == nil {
+				data = raw
+			}
+		}
+	}
 	if strings.EqualFold(provider, "gemini") {
 		return nil, nil
 	}
@@ -320,7 +331,6 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	if errStat != nil {
 		return nil, fmt.Errorf("stat file: %w", errStat)
 	}
-	id := s.idFor(path, baseDir)
 	disabled, _ := metadata["disabled"].(bool)
 	status := cliproxyauth.StatusActive
 	if disabled {
@@ -350,6 +360,32 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	cliproxyauth.ApplyInitializationStateFromMetadata(auth)
 	return []*cliproxyauth.Auth{auth}, nil
+}
+
+func prepareCodexIdentityFingerprintForSave(auth *cliproxyauth.Auth, path string) {
+	if auth == nil {
+		return
+	}
+	fallbackIdentity := strings.TrimSpace(auth.ID)
+	if fallbackIdentity == "" {
+		fallbackIdentity = filepath.Base(path)
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead == nil {
+		existingMetadata := make(map[string]any)
+		if json.Unmarshal(data, &existingMetadata) == nil {
+			provider, _ := existingMetadata["type"].(string)
+			existing := &cliproxyauth.Auth{
+				ID:       fallbackIdentity,
+				Provider: provider,
+				Metadata: existingMetadata,
+			}
+			if fingerprint, _ := cliproxyauth.InheritCodexIdentityFingerprint(auth, existing, fallbackIdentity); fingerprint != "" {
+				return
+			}
+		}
+	}
+	_, _ = cliproxyauth.EnsureCodexIdentityFingerprint(auth, fallbackIdentity)
 }
 
 func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, error) {

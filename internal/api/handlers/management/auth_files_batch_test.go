@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -72,8 +73,23 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected uploaded file %s to exist: %v", file.name, err)
 		}
-		if string(data) != file.content {
-			t.Fatalf("expected file %s content %q, got %q", file.name, file.content, string(data))
+		var expected map[string]any
+		var actual map[string]any
+		if err := json.Unmarshal([]byte(file.content), &expected); err != nil {
+			t.Fatalf("decode expected file %s: %v", file.name, err)
+		}
+		if err := json.Unmarshal(data, &actual); err != nil {
+			t.Fatalf("decode uploaded file %s: %v", file.name, err)
+		}
+		if expected["type"] == "codex" {
+			fingerprint, _ := actual["codex_identity_fingerprint"].(string)
+			if fingerprint == "" {
+				t.Fatalf("uploaded Codex file %s has no identity fingerprint", file.name)
+			}
+			delete(actual, "codex_identity_fingerprint")
+		}
+		if !reflect.DeepEqual(actual, expected) {
+			t.Fatalf("expected file %s metadata %#v, got %#v", file.name, expected, actual)
 		}
 	}
 
