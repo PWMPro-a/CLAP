@@ -554,9 +554,6 @@ func isAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.Time,
 	if IsAuthLifecycleBlocking(auth) {
 		return true, blockReasonOther, auth.NextRetryAfter
 	}
-	if authSupplyLeaseExpired(auth, now) {
-		return true, blockReasonDisabled, time.Time{}
-	}
 	if availability, ok := auth.Runtime.(runtimeSelectionAvailability); ok && availability != nil && !availability.RuntimeSelectionAvailable() {
 		return true, blockReasonOther, time.Time{}
 	}

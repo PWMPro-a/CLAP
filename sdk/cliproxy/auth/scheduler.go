@@ -708,12 +708,9 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 }
 
 // scheduledAuthPredicate filters request-ineligible auths before scheduler state advances.
-func scheduledAuthPredicate(eligibility authSelectionEligibility, tried map[string]struct{}, pinnedAuthID string, requirePositiveWeight bool, now time.Time) func(*scheduledAuth) bool {
+func scheduledAuthPredicate(eligibility authSelectionEligibility, tried map[string]struct{}, pinnedAuthID string, requirePositiveWeight bool, _ time.Time) func(*scheduledAuth) bool {
 	return func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil || !eligibility.allows(entry.auth) {
-			return false
-		}
-		if !entry.supplyLeaseExpiresAt.IsZero() && !entry.supplyLeaseExpiresAt.After(now) {
 			return false
 		}
 		if requirePositiveWeight && (entry.meta == nil || entry.meta.weight <= 0) {
@@ -1488,7 +1485,8 @@ func (v *readyView) pickExpiring(predicate func(*scheduledAuth) bool, strategy s
 	}
 	priorityCutoff := now.Add(authExpiryPriorityWindow)
 	isEligible := func(entry *scheduledAuth) bool {
-		if entry == nil || entry.expiresAt.IsZero() || !entry.expiresAt.After(now) || entry.expiresAt.After(priorityCutoff) {
+		if entry == nil || entry.expiresAt.IsZero() || entry.expiresAt.After(priorityCutoff) ||
+			(!entry.expiresAt.After(now) && entry.supplyLeaseExpiresAt.IsZero()) {
 			return false
 		}
 		return predicate == nil || predicate(entry)

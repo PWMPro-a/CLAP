@@ -86,12 +86,16 @@ func TestSchedulingExpiryPrefersSupplyLeaseWithoutChangingTokenExpiry(t *testing
 	}
 }
 
-func TestExpiredSupplyLeaseIsNotSelectable(t *testing.T) {
+func TestExpiredSupplyLeaseRemainsSelectableUntilRuntimeHealthRejectsIt(t *testing.T) {
 	now := time.Now().UTC()
 	auth := authWithSupplyLeaseExpiry("expired-lease", now.Add(-time.Second), now.Add(10*24*time.Hour))
 	blocked, reason, _ := isAuthBlockedForModel(auth, "gpt-5", now)
-	if !blocked || reason != blockReasonDisabled {
-		t.Fatalf("expired supply lease blocked=%t reason=%v, want true/disabled", blocked, reason)
+	if blocked || reason != blockReasonNone {
+		t.Fatalf("expired supply lease blocked=%t reason=%v, want false/none", blocked, reason)
+	}
+	remaining, urgent := authExpiryRemaining(auth, now)
+	if !urgent || remaining >= 0 {
+		t.Fatalf("expired supply lease urgency = %s/%t, want overdue/true", remaining, urgent)
 	}
 }
 
@@ -403,7 +407,7 @@ func BenchmarkSchedulerExpiryLaneLargePool(b *testing.B) {
 	}
 }
 
-func TestSchedulerSkipsExpiredSupplierLeaseFromNormalReadyLane(t *testing.T) {
+func TestSchedulerKeepsExpiredSupplierLeaseInHighestPriorityLane(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
 	expiring := authWithSupplyLeaseExpiry("a-expiring", now.Add(20*time.Minute), tokenExpiry)
@@ -414,9 +418,8 @@ func TestSchedulerSkipsExpiredSupplierLeaseFromNormalReadyLane(t *testing.T) {
 		t.Fatalf("initial scheduler pick = %v, err=%v, want expiring supplier lease", first, errFirst)
 	}
 
-	// Simulate the fixed supplier deadline passing without an auth-file update.
-	// The entry remains in the ready view, so request-time filtering must keep it
-	// out of both the expiry lane and the normal round-robin fallback.
+	// Simulate the supplier timestamp passing without an auth-file update. The
+	// account remains healthy, so it must stay in the highest-priority lane.
 	entry := scheduler.providers["codex"].modelShards[""].entries[expiring.ID]
 	entry.expiresAt = now.Add(-time.Second)
 	entry.supplyLeaseExpiresAt = entry.expiresAt
@@ -425,8 +428,8 @@ func TestSchedulerSkipsExpiredSupplierLeaseFromNormalReadyLane(t *testing.T) {
 	if errPick != nil {
 		t.Fatalf("scheduler pick: %v", errPick)
 	}
-	if got == nil || got.ID != valid.ID {
-		t.Fatalf("scheduler pick = %v, want unexpired supplier lease", got)
+	if got == nil || got.ID != expiring.ID {
+		t.Fatalf("scheduler pick = %v, want still-healthy expired supplier lease", got)
 	}
 }
 

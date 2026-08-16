@@ -41,9 +41,10 @@ var authSupplyLeaseExpiryKeys = [...]string{
 	"supplyLeaseExpiresAt",
 }
 
-// authSupplyLeaseExpirationTime returns the supplier's serving deadline. It is
-// intentionally separate from Auth.ExpirationTime: the latter is the OAuth
-// token expiry and drives token refresh, while this deadline drives routing.
+// authSupplyLeaseExpirationTime returns the supplier's routing-priority
+// timestamp. It is intentionally separate from Auth.ExpirationTime: the latter
+// is the OAuth token expiry and drives token refresh, while this value only
+// orders healthy credentials for scheduling.
 func authSupplyLeaseExpirationTime(auth *Auth) (time.Time, bool) {
 	if auth == nil || auth.Metadata == nil {
 		return time.Time{}, false
@@ -70,21 +71,32 @@ func authSchedulingExpirationTime(auth *Auth) (time.Time, bool) {
 	return auth.ExpirationTime()
 }
 
-func authSupplyLeaseExpired(auth *Auth, now time.Time) bool {
-	expiresAt, ok := authSupplyLeaseExpirationTime(auth)
-	return ok && !expiresAt.After(now)
-}
-
 func authExpiryRemaining(auth *Auth, now time.Time) (time.Duration, bool) {
 	if auth == nil {
 		return 0, false
 	}
-	expiresAt, ok := authSchedulingExpirationTime(auth)
-	if !ok || expiresAt.IsZero() {
+	expiresAt, supplied := authSupplyLeaseExpirationTime(auth)
+	if !supplied {
+		var ok bool
+		expiresAt, ok = auth.ExpirationTime()
+		if !ok {
+			return 0, false
+		}
+	}
+	if expiresAt.IsZero() {
 		return 0, false
 	}
 	remaining := expiresAt.Sub(now)
-	if remaining <= 0 || remaining > authExpiryPriorityWindow {
+	if remaining > authExpiryPriorityWindow {
+		return 0, false
+	}
+	// Supplier lease timestamps are scheduling hints, not credential validity
+	// boundaries. Once the timestamp passes, keep the still-healthy account in
+	// the most urgent lane until normal runtime health logic rejects it.
+	if remaining <= 0 {
+		if supplied {
+			return remaining, true
+		}
 		return 0, false
 	}
 	return remaining, true
@@ -249,9 +261,8 @@ func appendExpiringScheduledEntries(out, entries []*scheduledAuth, predicate fun
 	if len(entries) == 0 {
 		return out
 	}
-	cutoff := now.Add(authExpiryPriorityWindow)
 	for _, entry := range entries {
-		if entry == nil || entry.expiresAt.IsZero() || !entry.expiresAt.After(now) || entry.expiresAt.After(cutoff) {
+		if !scheduledAuthExpiryPriorityEligible(entry, now) {
 			continue
 		}
 		if predicate != nil && !predicate(entry) {
@@ -260,6 +271,16 @@ func appendExpiringScheduledEntries(out, entries []*scheduledAuth, predicate fun
 		out = append(out, entry)
 	}
 	return out
+}
+
+// scheduledAuthExpiryPriorityEligible mirrors authExpiryRemaining for the
+// scheduler's precomputed entries. OAuth/token expirations must still be in
+// the future, while supplier lease timestamps remain urgent after they pass.
+func scheduledAuthExpiryPriorityEligible(entry *scheduledAuth, now time.Time) bool {
+	if entry == nil || entry.expiresAt.IsZero() || entry.expiresAt.After(now.Add(authExpiryPriorityWindow)) {
+		return false
+	}
+	return entry.expiresAt.After(now) || !entry.supplyLeaseExpiresAt.IsZero()
 }
 
 // narrowScheduledExpiryLane keeps the earliest healthy credentials in the
