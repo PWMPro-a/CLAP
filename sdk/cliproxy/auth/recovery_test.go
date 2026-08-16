@@ -13,6 +13,7 @@ import (
 type recoveryTestExecutor struct {
 	refreshStarted chan struct{}
 	refreshRelease chan struct{}
+	refreshErr     error
 	refreshCalls   atomic.Int32
 	quotaCalls     atomic.Int32
 	quotaToken     atomic.Value
@@ -43,6 +44,9 @@ func (e *recoveryTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, 
 		case <-e.refreshRelease:
 		}
 	}
+	if e.refreshErr != nil {
+		return nil, e.refreshErr
+	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
@@ -66,6 +70,53 @@ func (e *recoveryTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecu
 
 func (e *recoveryTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+func TestLifecycleTerminalRefreshFailureDisablesCredentialWithoutRetry(t *testing.T) {
+	executor := &recoveryTestExecutor{refreshErr: terminalCredentialTestError{}}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(executor)
+	auth := &Auth{
+		ID:       "terminal-initialization",
+		Provider: "codex",
+		Status:   StatusInitializing,
+		Metadata: map[string]any{
+			"type":                           "codex",
+			"email":                          "terminal@example.com",
+			"refresh_token":                  "invalid-refresh-token",
+			MetadataInitializationState:      string(InitializationStateInitializing),
+			MetadataInitializationGeneration: "generation-terminal",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	request := authRecoveryRequest{
+		authID:     auth.ID,
+		kind:       authLifecycleInitialization,
+		generation: "generation-terminal",
+	}
+	result := manager.runLifecycleRecovery(context.Background(), request)
+	if result.retry != 0 || result.stale {
+		t.Fatalf("terminal result = %+v, want no retry", result)
+	}
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("terminal credential disappeared")
+	}
+	if !updated.Disabled || updated.Status != StatusDisabled || !updated.Unavailable {
+		t.Fatalf("terminal lifecycle state = disabled:%t status:%s unavailable:%t", updated.Disabled, updated.Status, updated.Unavailable)
+	}
+	if updated.StatusMessage != "credential invalidated" || !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("terminal lifecycle status = %q retry=%v", updated.StatusMessage, updated.NextRetryAfter)
+	}
+	if _, queued := lifecycleRecoveryRequest(updated, time.Now()); queued {
+		t.Fatal("terminal lifecycle credential remained in the recovery queue")
+	}
+	if got := executor.refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
+	}
 }
 
 func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
@@ -100,7 +151,7 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 		Provider: "codex",
 		Model:    "gpt-5.3-codex",
 		Error: &Error{
-			Code:       "rate_limit_exceeded",
+			Code:       "retry_after",
 			Message:    "Rate limit exceeded",
 			HTTPStatus: http.StatusTooManyRequests,
 		},
@@ -136,33 +187,61 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 	if len(restored.ModelStates) != 0 || restored.LastError != nil || restored.Quota.Exceeded {
 		t.Fatalf("recovery did not clear cooldown state: %+v", restored)
 	}
-	runtimeSnapshot := restored.RuntimeLimitSnapshot(time.Now())
-	if runtimeSnapshot.LastSkipReason != "" || !runtimeSnapshot.RateLimitedUntil.IsZero() || !runtimeSnapshot.FrozenUntil.IsZero() {
-		t.Fatalf("recovery retained stale transient rate-limit guards: %#v", runtimeSnapshot)
+	now := time.Now()
+	runtimeSnapshot := restored.RuntimeLimitSnapshot(now)
+	if runtimeSnapshot.LastSkipReason != runtimeSkipReasonUpstreamRateLimit ||
+		runtimeSnapshot.RateLimitedUntil.Before(now.Add(10*time.Second)) ||
+		!runtimeSnapshot.FrozenUntil.Equal(runtimeSnapshot.RateLimitedUntil) {
+		t.Fatalf("recovery did not retain the upstream Retry-After guard: %#v", runtimeSnapshot)
 	}
-	if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); blocked || reason != blockReasonNone {
-		t.Fatalf("recovered credential remained blocked after verified refresh: blocked=%t reason=%v", blocked, reason)
+	if blocked, reason, retryAt := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", now, false); !blocked || reason != blockReasonCooldown || retryAt.Before(now.Add(10*time.Second)) {
+		t.Fatalf("recovered credential ignored Retry-After: blocked=%t reason=%v retryAt=%v", blocked, reason, retryAt)
 	}
 }
 
 func TestRateLimitRecoveryClassificationExcludesQuotaAndWebsocketLimits(t *testing.T) {
 	auth := &Auth{Provider: "codex", Metadata: map[string]any{"type": "codex"}}
 	for _, testCase := range []struct {
-		name    string
-		message string
-		want    bool
+		name       string
+		code       string
+		message    string
+		httpStatus int
+		want       bool
 	}{
-		{name: "rate limit", message: "rate_limit_exceeded: Rate limit exceeded", want: true},
-		{name: "quota", message: "usage_limit_reached", want: false},
-		{name: "websocket", message: "websocket_connection_limit_reached", want: false},
-		{name: "generic 429", message: "too many requests", want: false},
+		{name: "retry after code", code: "retry_after", message: "Rate limit exceeded", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "rate limit code", code: "rate_limit", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "rate limited code", code: "rate_limited", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "too many requests code", code: "too_many_requests", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "legacy rate limit", message: "rate_limit_exceeded: Rate limit exceeded", httpStatus: http.StatusTooManyRequests, want: true},
+		{name: "quota", code: "retry_after", message: "usage_limit_reached", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "weekly quota", code: "rate_limit", message: "weekly quota reached", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "quota json", code: "rate_limit", message: `{"error":"quota"}`, httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "websocket", code: "retry_after", message: "websocket_connection_limit_reached", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "generic 429", message: "too many requests", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "marker without 429", code: "retry_after", message: "Rate limit exceeded", httpStatus: http.StatusBadRequest, want: false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			got := shouldQueueRateLimitRecovery(auth, Result{Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: testCase.message}})
+			got := shouldQueueRateLimitRecovery(auth, Result{Error: &Error{
+				Code:       testCase.code,
+				HTTPStatus: testCase.httpStatus,
+				Message:    testCase.message,
+			}})
 			if got != testCase.want {
 				t.Fatalf("shouldQueueRateLimitRecovery() = %v, want %v", got, testCase.want)
 			}
 		})
+	}
+
+	agent := &Auth{Provider: "codex", Metadata: map[string]any{
+		"type":             "codex",
+		"agent_runtime_id": "agent-1",
+	}}
+	if shouldQueueRateLimitRecovery(agent, Result{Error: &Error{
+		Code:       "retry_after",
+		Message:    "Rate limit exceeded",
+		HTTPStatus: http.StatusTooManyRequests,
+	}}) {
+		t.Fatal("agent identity entered OAuth rate-limit recovery")
 	}
 }
 
@@ -206,8 +285,9 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 			return current.Status == StatusActive && !current.Unavailable && token == "new-access-token"
 		})
 		restored, _ := manager.GetByID(id)
-		if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); blocked || reason != blockReasonNone {
-			t.Fatalf("canonical peer %s retained stale rate-limit cooldown: blocked=%t reason=%v", id, blocked, reason)
+		now := time.Now()
+		if blocked, reason, retryAt := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", now, false); !blocked || reason != blockReasonCooldown || !retryAt.After(now) {
+			t.Fatalf("canonical peer %s did not retain Retry-After: blocked=%t reason=%v retryAt=%v", id, blocked, reason, retryAt)
 		}
 	}
 	if got := executor.refreshCalls.Load(); got != 1 {

@@ -409,6 +409,97 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 	}
 }
 
+func newRuntimeSlotSpillTestManager(t *testing.T) (*Manager, string, func()) {
+	t.Helper()
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 1)
+	m.RegisterExecutor(&authFallbackExecutor{id: "codex"})
+
+	now := time.Now().UTC()
+	model := "runtime-slot-spill-model"
+	prefix := uuid.NewString()
+	oldest := authWithSupplyLeaseExpiry(prefix+"-oldest", now.Add(20*time.Minute), now.Add(10*24*time.Hour))
+	next := authWithSupplyLeaseExpiry(prefix+"-next", now.Add(23*time.Minute), now.Add(10*24*time.Hour))
+	oldest.Metadata["max_concurrency"] = 1
+
+	reg := registry.GetGlobalRegistry()
+	for _, candidate := range []*Auth{oldest, next} {
+		reg.RegisterClient(candidate.ID, "codex", []*registry.ModelInfo{{ID: model}})
+		if _, errRegister := m.Register(context.Background(), candidate); errRegister != nil {
+			t.Fatalf("register %s: %v", candidate.ID, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		reg.UnregisterClient(oldest.ID)
+		reg.UnregisterClient(next.ID)
+	})
+
+	// Saturate the oldest credential after scheduler registration. Its indexed
+	// entry is intentionally still in the ready lane, reproducing the race where
+	// selection succeeds but runtime-slot acquisition loses to another request.
+	release, acquired, reason, _ := oldest.acquireRuntimeSlotForModel(now, model, false)
+	if !acquired {
+		t.Fatalf("saturate oldest runtime slot: %s", reason)
+	}
+	return m, next.ID, release
+}
+
+func TestManager_RuntimeSlotMissDoesNotSpendCredentialRetryBudget(t *testing.T) {
+	request := cliproxyexecutor.Request{Model: "runtime-slot-spill-model"}
+	tests := []struct {
+		name   string
+		invoke func(*Manager) (string, error)
+	}{
+		{
+			name: "execute",
+			invoke: func(m *Manager) (string, error) {
+				response, errExecute := m.Execute(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{})
+				return string(response.Payload), errExecute
+			},
+		},
+		{
+			name: "execute_count",
+			invoke: func(m *Manager) (string, error) {
+				response, errExecute := m.ExecuteCount(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{})
+				return string(response.Payload), errExecute
+			},
+		},
+		{
+			name: "execute_stream",
+			invoke: func(m *Manager) (string, error) {
+				response, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, request, cliproxyexecutor.Options{})
+				if errExecute != nil {
+					return "", errExecute
+				}
+				payload := ""
+				for chunk := range response.Chunks {
+					if chunk.Err != nil {
+						return "", chunk.Err
+					}
+					payload += string(chunk.Payload)
+				}
+				return payload, nil
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, nextAuthID, release := newRuntimeSlotSpillTestManager(t)
+			defer release()
+
+			gotAuthID, errInvoke := tc.invoke(m)
+			if errInvoke != nil {
+				t.Fatalf("invoke after saturated oldest cohort: %v", errInvoke)
+			}
+			if gotAuthID != nextAuthID {
+				t.Fatalf("selected auth = %q, want next cohort %q", gotAuthID, nextAuthID)
+			}
+		})
+	}
+}
+
 func TestManager_ModelSupportBadRequest_FallsBackAndSuspendsAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{

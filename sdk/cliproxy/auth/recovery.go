@@ -477,6 +477,7 @@ func (m *Manager) failLifecycle(request authRecoveryRequest, lifecycleErr error)
 	if request.kind == authLifecycleInitialization {
 		attempts = AuthInitializationAttempts(auth)
 	}
+	terminal := isTerminalCredentialFailure(lifecycleErr)
 	retry := authRecoveryBackoff(attempts)
 	nextRetry := now.Add(retry)
 	message := strings.TrimSpace(lifecycleErr.Error())
@@ -484,26 +485,54 @@ func (m *Manager) failLifecycle(request authRecoveryRequest, lifecycleErr error)
 		auth.Metadata[MetadataInitializationState] = string(InitializationStateFailed)
 		auth.Metadata[MetadataInitializationError] = message
 		auth.Metadata[MetadataInitializationUpdatedAt] = now.Format(time.RFC3339Nano)
-		auth.Metadata[MetadataInitializationNextRetryAt] = nextRetry.Format(time.RFC3339Nano)
-		auth.Status = StatusInitializationFailed
-		auth.StatusMessage = "initialization failed; retrying: " + message
+		if terminal {
+			delete(auth.Metadata, MetadataInitializationNextRetryAt)
+		} else {
+			auth.Metadata[MetadataInitializationNextRetryAt] = nextRetry.Format(time.RFC3339Nano)
+			auth.Status = StatusInitializationFailed
+			auth.StatusMessage = "initialization failed; retrying: " + message
+		}
 	} else {
 		auth.Metadata[MetadataRecoveryState] = string(RecoveryStateFailed)
 		auth.Metadata[MetadataRecoveryError] = message
 		auth.Metadata[MetadataRecoveryUpdatedAt] = now.Format(time.RFC3339Nano)
-		auth.Metadata[MetadataRecoveryNextRetryAt] = nextRetry.Format(time.RFC3339Nano)
-		auth.Status = StatusRecoveryFailed
-		auth.StatusMessage = "recovery failed; retrying: " + message
+		if terminal {
+			delete(auth.Metadata, MetadataRecoveryNextRetryAt)
+		} else {
+			auth.Metadata[MetadataRecoveryNextRetryAt] = nextRetry.Format(time.RFC3339Nano)
+			auth.Status = StatusRecoveryFailed
+			auth.StatusMessage = "recovery failed; retrying: " + message
+		}
 	}
 	auth.LastError = refreshErrorFromError(lifecycleErr)
 	auth.Unavailable = true
-	auth.NextRetryAfter = nextRetry
+	var peerSnapshots []*Auth
+	if terminal {
+		auth.Disabled = true
+		auth.Status = StatusDisabled
+		auth.StatusMessage = "credential invalidated"
+		auth.NextRetryAfter = time.Time{}
+		auth.NextRefreshAfter = time.Time{}
+		auth.Metadata["disabled"] = true
+		peerSnapshots = m.propagateTerminalCredentialLocked(auth, auth.LastError, now)
+	} else {
+		auth.NextRetryAfter = nextRetry
+	}
 	auth.UpdatedAt = now
 	stored := auth.Clone()
 	snapshot := stored.Clone()
 	m.auths[auth.ID] = stored
 	m.mu.Unlock()
 	m.publishLifecycleUpdate(snapshot)
+	for _, peer := range peerSnapshots {
+		m.invalidateSessionAffinity(peer.ID)
+		m.publishLifecycleUpdate(peer)
+	}
+	if terminal {
+		m.invalidateSessionAffinity(request.authID)
+		log.WithError(lifecycleErr).Warnf("auth lifecycle recovery disabled invalid credential %s", request.authID)
+		return 0
+	}
 	log.WithError(lifecycleErr).Warnf("auth lifecycle recovery failed for %s; retrying in %s", request.authID, retry)
 	return retry
 }
@@ -554,10 +583,33 @@ func shouldQueueRateLimitRecovery(auth *Auth, result Result) bool {
 		return false
 	}
 	raw := strings.ToLower(strings.Join([]string{result.Error.Code, result.Error.Message}, " "))
-	if strings.Contains(raw, "usage_limit_reached") || strings.Contains(raw, "websocket_connection_limit_reached") || strings.Contains(raw, "too many websocket") {
+	// A 429 can represent either a transient request throttle or an account
+	// quota exhaustion. Only the former should enter token/quota refresh
+	// recovery. Quota responses are already represented by model availability
+	// and refreshing credentials for them creates a needless recovery loop.
+	if strings.Contains(raw, "usage_limit_reached") ||
+		strings.Contains(raw, "usage limit") ||
+		strings.Contains(raw, "weekly quota") ||
+		strings.Contains(raw, "quota reached") ||
+		strings.Contains(raw, `"error":"quota"`) ||
+		strings.Contains(raw, `"error": "quota"`) ||
+		strings.Contains(raw, "websocket_connection_limit_reached") ||
+		strings.Contains(raw, "too many websocket") {
 		return false
 	}
-	return strings.Contains(raw, "rate_limit_exceeded") || strings.Contains(raw, "rate limit exceeded")
+	for _, marker := range []string{
+		"retry_after",
+		"rate_limit",
+		"rate_limit_exceeded",
+		"rate_limited",
+		"too_many_requests",
+		"rate limit exceeded",
+	} {
+		if strings.Contains(raw, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func markRateLimitRecoveryQueuedLocked(auth *Auth, now time.Time) string {

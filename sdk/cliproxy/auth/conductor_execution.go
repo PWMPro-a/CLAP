@@ -349,11 +349,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if len(models) == 0 {
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
 		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlotForModel(time.Now(), routeModel, tailBurst)
 		if !acquired {
 			continue
 		}
+		// Runtime-slot misses are local scheduling races, not upstream credential
+		// attempts. Do not spend max-retry-credentials on a saturated auth: the
+		// next loop can then spill from the oldest expiry cohort into the next one.
+		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -500,11 +503,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if len(models) == 0 {
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
 		releaseRuntime, acquired, _, _ := auth.acquireRuntimeSlotForModel(time.Now(), routeModel, false)
 		if !acquired {
 			continue
 		}
+		// Count only credentials that acquired a slot and will reach preparation
+		// or the upstream. A concurrent saturation miss should keep searching.
+		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
@@ -718,7 +723,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			continue
 		}
-		attempted[auth.ID] = struct{}{}
 		var releaseRuntime func()
 		if selection == nil {
 			var acquired bool
@@ -727,6 +731,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				continue
 			}
 		}
+		// Home selections already own their concurrency lifecycle. For local
+		// selections, reaching this point means a runtime slot was acquired; only
+		// then should this credential consume the cross-credential retry budget.
+		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		if selection != nil {
 			auth, errPrepare = m.prepareHomeRequestAuth(execCtx, executor, selection)
