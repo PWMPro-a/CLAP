@@ -312,6 +312,14 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				} else {
 					fileData["group_ids"] = []int64{}
 				}
+				if value := gjson.GetBytes(data, "cpamp_import"); value.IsObject() {
+					var raw map[string]any
+					if errUnmarshal := json.Unmarshal([]byte(value.Raw), &raw); errUnmarshal == nil {
+						if metadata, ok := normalizeAuthFileImportMetadata(raw); ok {
+							fileData["cpamp_import"] = metadata
+						}
+					}
+				}
 				applyAuthFileRuntimeLimitFieldsFromJSON(fileData, data)
 			}
 
@@ -474,6 +482,11 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, includeConfig bo
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	if auth.Metadata != nil {
+		if metadata, ok := normalizeAuthFileImportMetadata(auth.Metadata["cpamp_import"]); ok {
+			entry["cpamp_import"] = metadata
+		}
+	}
 	if runtime, ok := auth.Runtime.(agentIdentityRegistrationRuntime); ok && runtime != nil {
 		entry["agent_identity_registration"] = runtime.RegistrationStatus()
 	}
@@ -487,6 +500,48 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, includeConfig bo
 		}
 	}
 	return entry
+}
+
+func normalizeAuthFileImportMetadata(raw any) (gin.H, bool) {
+	if raw == nil {
+		return nil, false
+	}
+	values, ok := raw.(map[string]any)
+	if !ok {
+		data, errMarshal := json.Marshal(raw)
+		if errMarshal != nil || json.Unmarshal(data, &values) != nil {
+			return nil, false
+		}
+	}
+	metadata := gin.H{}
+	if version, okVersion := authFileIntValue(values["version"]); okVersion && version > 0 {
+		metadata["version"] = version
+	}
+	for _, field := range []string{
+		"source",
+		"method",
+		"platform_id",
+		"platform_name",
+		"imported_by",
+		"imported_at",
+	} {
+		if value, okString := values[field].(string); okString {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				metadata[field] = trimmed
+			}
+		}
+	}
+	_, hasSource := metadata["source"]
+	_, hasMethod := metadata["method"]
+	_, hasPlatformID := metadata["platform_id"]
+	_, hasPlatformName := metadata["platform_name"]
+	if !hasSource || !hasMethod || (!hasPlatformID && !hasPlatformName) {
+		return nil, false
+	}
+	if _, hasVersion := metadata["version"]; !hasVersion {
+		metadata["version"] = 1
+	}
+	return metadata, true
 }
 
 func authFileJSONGroupIDs(data []byte) []int64 {
