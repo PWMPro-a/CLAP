@@ -136,12 +136,15 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 	if len(restored.ModelStates) != 0 || restored.LastError != nil || restored.Quota.Exceeded {
 		t.Fatalf("recovery did not clear cooldown state: %+v", restored)
 	}
-	runtimeSnapshot := restored.RuntimeLimitSnapshot(time.Now())
-	if runtimeSnapshot.LastSkipReason != "" || !runtimeSnapshot.RateLimitedUntil.IsZero() || !runtimeSnapshot.FrozenUntil.IsZero() {
-		t.Fatalf("recovery retained stale transient rate-limit guards: %#v", runtimeSnapshot)
+	now := time.Now()
+	runtimeSnapshot := restored.RuntimeLimitSnapshot(now)
+	if runtimeSnapshot.LastSkipReason != runtimeSkipReasonUpstreamRateLimit ||
+		runtimeSnapshot.RateLimitedUntil.Before(now.Add(10*time.Second)) ||
+		!runtimeSnapshot.FrozenUntil.Equal(runtimeSnapshot.RateLimitedUntil) {
+		t.Fatalf("recovery did not retain the upstream Retry-After guard: %#v", runtimeSnapshot)
 	}
-	if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); blocked || reason != blockReasonNone {
-		t.Fatalf("recovered credential remained blocked after verified refresh: blocked=%t reason=%v", blocked, reason)
+	if blocked, reason, retryAt := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", now, false); !blocked || reason != blockReasonCooldown || retryAt.Before(now.Add(10*time.Second)) {
+		t.Fatalf("recovered credential ignored Retry-After: blocked=%t reason=%v retryAt=%v", blocked, reason, retryAt)
 	}
 }
 
@@ -160,6 +163,8 @@ func TestRateLimitRecoveryClassificationExcludesQuotaAndWebsocketLimits(t *testi
 		{name: "too many requests code", code: "too_many_requests", httpStatus: http.StatusTooManyRequests, want: true},
 		{name: "legacy rate limit", message: "rate_limit_exceeded: Rate limit exceeded", httpStatus: http.StatusTooManyRequests, want: true},
 		{name: "quota", code: "retry_after", message: "usage_limit_reached", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "weekly quota", code: "rate_limit", message: "weekly quota reached", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "quota json", code: "rate_limit", message: `{"error":"quota"}`, httpStatus: http.StatusTooManyRequests, want: false},
 		{name: "websocket", code: "retry_after", message: "websocket_connection_limit_reached", httpStatus: http.StatusTooManyRequests, want: false},
 		{name: "generic 429", message: "too many requests", httpStatus: http.StatusTooManyRequests, want: false},
 		{name: "marker without 429", code: "retry_after", message: "Rate limit exceeded", httpStatus: http.StatusBadRequest, want: false},
@@ -229,8 +234,9 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 			return current.Status == StatusActive && !current.Unavailable && token == "new-access-token"
 		})
 		restored, _ := manager.GetByID(id)
-		if blocked, reason, _ := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", time.Now(), false); blocked || reason != blockReasonNone {
-			t.Fatalf("canonical peer %s retained stale rate-limit cooldown: blocked=%t reason=%v", id, blocked, reason)
+		now := time.Now()
+		if blocked, reason, retryAt := runtimeAuthBlockedForModelWithTailBurst(restored, "gpt-5.4", now, false); !blocked || reason != blockReasonCooldown || !retryAt.After(now) {
+			t.Fatalf("canonical peer %s did not retain Retry-After: blocked=%t reason=%v retryAt=%v", id, blocked, reason, retryAt)
 		}
 	}
 	if got := executor.refreshCalls.Load(); got != 1 {

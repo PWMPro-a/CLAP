@@ -554,7 +554,18 @@ func shouldQueueRateLimitRecovery(auth *Auth, result Result) bool {
 		return false
 	}
 	raw := strings.ToLower(strings.Join([]string{result.Error.Code, result.Error.Message}, " "))
-	if strings.Contains(raw, "usage_limit_reached") || strings.Contains(raw, "websocket_connection_limit_reached") || strings.Contains(raw, "too many websocket") {
+	// A 429 can represent either a transient request throttle or an account
+	// quota exhaustion. Only the former should enter token/quota refresh
+	// recovery. Quota responses are already represented by model availability
+	// and refreshing credentials for them creates a needless recovery loop.
+	if strings.Contains(raw, "usage_limit_reached") ||
+		strings.Contains(raw, "usage limit") ||
+		strings.Contains(raw, "weekly quota") ||
+		strings.Contains(raw, "quota reached") ||
+		strings.Contains(raw, `"error":"quota"`) ||
+		strings.Contains(raw, `"error": "quota"`) ||
+		strings.Contains(raw, "websocket_connection_limit_reached") ||
+		strings.Contains(raw, "too many websocket") {
 		return false
 	}
 	for _, marker := range []string{

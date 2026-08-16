@@ -505,12 +505,14 @@ func (a *Auth) observeUpstreamRateLimitSuccess(now time.Time) {
 	state.mu.Unlock()
 }
 
-// clearTransientRateLimitRecovery releases the request-error and upstream
-// rate-limit guards after the credential lifecycle has successfully refreshed
-// both the token and quota. Those guards describe the credential state before
-// recovery and must not keep an otherwise verified account out of rotation.
-// Persistent usage-limit and quota-preempt freezes remain independent so a
-// real exhausted account cannot be revived by a transient recovery.
+// clearTransientRateLimitRecovery releases the generic request-error freeze
+// after the credential lifecycle has successfully refreshed both the token and
+// quota. The upstream rate-limit guard deliberately survives the refresh: the
+// quota endpoint can succeed while chat requests are still inside Retry-After,
+// and clearing that guard creates a refresh/select/429 loop. Keeping the
+// account-wide deadline lets one request probe the account after the cooldown
+// and preserves progressive backoff when the provider is still throttling.
+// Persistent usage-limit and quota-preempt freezes remain independent.
 func (a *Auth) clearTransientRateLimitRecovery(now time.Time) {
 	if a == nil {
 		return
@@ -521,15 +523,13 @@ func (a *Auth) clearTransientRateLimitRecovery(now time.Time) {
 	}
 	state.mu.Lock()
 	state.frozenUntil = time.Time{}
-	state.upstreamRateLimitedUntil = time.Time{}
-	state.upstreamRateLimitBackoff = 0
-	state.upstreamRateLimitLastSeen = time.Time{}
-	if state.lastSkipReason == "frozen" || state.lastSkipReason == runtimeSkipReasonUpstreamRateLimit {
+	state.compactRuntimeWindowLocked(now, a.runtimeLimitConfig())
+	if state.lastSkipReason == "frozen" ||
+		(state.lastSkipReason == runtimeSkipReasonUpstreamRateLimit && !state.upstreamRateLimitedUntil.After(now)) {
 		state.lastSkipReason = ""
 		state.lastSkipRecordedAt = time.Time{}
 		state.lastSkipRecoveryTarget = time.Time{}
 	}
-	state.compactRuntimeWindowLocked(now, a.runtimeLimitConfig())
 	state.mu.Unlock()
 }
 

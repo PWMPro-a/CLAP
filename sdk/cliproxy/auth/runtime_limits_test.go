@@ -342,7 +342,7 @@ func TestRuntimeLimits_UpstreamRateLimitBurstExtendsStableRecoveryWindow(t *test
 	}
 }
 
-func TestRuntimeLimits_SuccessfulLifecycleRecoveryClearsOnlyTransientGuards(t *testing.T) {
+func TestRuntimeLimits_SuccessfulLifecycleRecoveryPreservesUpstreamCooldown(t *testing.T) {
 	now := time.Now()
 	auth := &Auth{
 		ID:       "auth-a",
@@ -371,11 +371,17 @@ func TestRuntimeLimits_SuccessfulLifecycleRecoveryClearsOnlyTransientGuards(t *t
 	lastSeen := state.upstreamRateLimitLastSeen
 	state.mu.Unlock()
 
-	if !frozenUntil.IsZero() || !upstreamUntil.IsZero() || backoff != 0 || !lastSeen.IsZero() {
-		t.Fatalf("transient recovery guards remain: frozen=%v upstream=%v backoff=%d lastSeen=%v", frozenUntil, upstreamUntil, backoff, lastSeen)
+	if !frozenUntil.IsZero() {
+		t.Fatalf("generic recovery freeze remains: %v", frozenUntil)
+	}
+	if upstreamUntil.Before(now.Add(4*time.Minute)) || lastSeen.IsZero() {
+		t.Fatalf("upstream cooldown was cleared by lifecycle recovery: upstream=%v backoff=%d lastSeen=%v", upstreamUntil, backoff, lastSeen)
 	}
 	if !usageUntil.After(now) || !quotaUntil.After(now) {
 		t.Fatalf("persistent quota guards were cleared: usage=%v quota=%v", usageUntil, quotaUntil)
+	}
+	if blocked, reason, retryAt := runtimeAuthBlockedForModelWithTailBurst(auth, "gpt-5.6-sol", now.Add(2*time.Second), false); !blocked || reason != blockReasonCooldown || !retryAt.Equal(quotaUntil) {
+		t.Fatalf("post-recovery block = (%t, %v, %v), want persistent quota freeze %v", blocked, reason, retryAt, quotaUntil)
 	}
 }
 
