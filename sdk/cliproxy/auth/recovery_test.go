@@ -13,6 +13,7 @@ import (
 type recoveryTestExecutor struct {
 	refreshStarted chan struct{}
 	refreshRelease chan struct{}
+	refreshErr     error
 	refreshCalls   atomic.Int32
 	quotaCalls     atomic.Int32
 	quotaToken     atomic.Value
@@ -43,6 +44,9 @@ func (e *recoveryTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, 
 		case <-e.refreshRelease:
 		}
 	}
+	if e.refreshErr != nil {
+		return nil, e.refreshErr
+	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
@@ -66,6 +70,53 @@ func (e *recoveryTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecu
 
 func (e *recoveryTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+func TestLifecycleTerminalRefreshFailureDisablesCredentialWithoutRetry(t *testing.T) {
+	executor := &recoveryTestExecutor{refreshErr: terminalCredentialTestError{}}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(executor)
+	auth := &Auth{
+		ID:       "terminal-initialization",
+		Provider: "codex",
+		Status:   StatusInitializing,
+		Metadata: map[string]any{
+			"type":                           "codex",
+			"email":                          "terminal@example.com",
+			"refresh_token":                  "invalid-refresh-token",
+			MetadataInitializationState:      string(InitializationStateInitializing),
+			MetadataInitializationGeneration: "generation-terminal",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	request := authRecoveryRequest{
+		authID:     auth.ID,
+		kind:       authLifecycleInitialization,
+		generation: "generation-terminal",
+	}
+	result := manager.runLifecycleRecovery(context.Background(), request)
+	if result.retry != 0 || result.stale {
+		t.Fatalf("terminal result = %+v, want no retry", result)
+	}
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("terminal credential disappeared")
+	}
+	if !updated.Disabled || updated.Status != StatusDisabled || !updated.Unavailable {
+		t.Fatalf("terminal lifecycle state = disabled:%t status:%s unavailable:%t", updated.Disabled, updated.Status, updated.Unavailable)
+	}
+	if updated.StatusMessage != "credential invalidated" || !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("terminal lifecycle status = %q retry=%v", updated.StatusMessage, updated.NextRetryAfter)
+	}
+	if _, queued := lifecycleRecoveryRequest(updated, time.Now()); queued {
+		t.Fatal("terminal lifecycle credential remained in the recovery queue")
+	}
+	if got := executor.refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
+	}
 }
 
 func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
