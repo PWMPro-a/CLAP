@@ -257,6 +257,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if strings.EqualFold(strings.TrimSpace(typeValue), "codex") {
+					if fingerprint := strings.TrimSpace(gjson.GetBytes(data, "codex_identity_fingerprint").String()); fingerprint != "" {
+						fileData["codex_identity_fingerprint"] = fingerprint
+					}
+				}
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
@@ -433,6 +438,9 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, includeConfig bo
 		entry["id_token"] = claims
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if fingerprint := authCodexIdentityFingerprint(auth); fingerprint != "" {
+			entry["codex_identity_fingerprint"] = fingerprint
+		}
 		if planType := strings.TrimSpace(authAttribute(auth, "plan_type")); planType != "" {
 			entry["plan_type"] = strings.ToLower(planType)
 		}
@@ -811,6 +819,20 @@ func authEmail(auth *coreauth.Auth) string {
 		}
 		if v := strings.TrimSpace(auth.Attributes["account_email"]); v != "" {
 			return v
+		}
+	}
+	return ""
+}
+
+func authCodexIdentityFingerprint(auth *coreauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	for _, key := range []string{"codex_identity_fingerprint", "codexIdentityFingerprint"} {
+		if value, ok := auth.Metadata[key].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
 		}
 	}
 	return ""
