@@ -26,17 +26,18 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy                string
-	newCandidateMode        bool
-	sessionAffinity         bool
-	sessionAffinityTTL      time.Duration
-	highCacheMode           bool
-	cacheAffinityEnabled    bool
-	cacheAffinityMaxEntries int
-	maxSessionRequests      int
-	maxSessionDuration      time.Duration
-	quotaPreemptUsedRatio   float64
-	quotaHardStopUsedRatio  float64
+	strategy                  string
+	newCandidateMode          bool
+	sessionAffinity           bool
+	sessionAffinityTTL        time.Duration
+	highCacheMode             bool
+	cacheAffinityEnabled      bool
+	expiryDrainIgnoreAffinity bool
+	cacheAffinityMaxEntries   int
+	maxSessionRequests        int
+	maxSessionDuration        time.Duration
+	quotaPreemptUsedRatio     float64
+	quotaHardStopUsedRatio    float64
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -59,6 +60,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state.highCacheMode = cfg.Routing.HighCacheMode
 	cacheSettings := cacheaffinity.Settings(cfg)
 	state.cacheAffinityEnabled = cacheSettings.Enabled && !cacheSettings.Shadow
+	state.expiryDrainIgnoreAffinity = cacheSettings.ExpiryDrainIgnoreAffinity
 	state.cacheAffinityMaxEntries = cacheSettings.MaxEntries
 	state.maxSessionRequests = cacheSettings.MaxSessionRequests
 	state.maxSessionDuration = cacheSettings.MaxSessionDuration
@@ -84,15 +86,16 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	}
 	if state.sessionAffinity || state.highCacheMode || state.cacheAffinityEnabled {
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback:               selector,
-			TTL:                    state.sessionAffinityTTL,
-			HighCacheMode:          state.highCacheMode,
-			CacheAffinityEnabled:   state.cacheAffinityEnabled,
-			MaxEntries:             state.cacheAffinityMaxEntries,
-			MaxSessionRequests:     state.maxSessionRequests,
-			MaxSessionDuration:     state.maxSessionDuration,
-			QuotaPreemptUsedRatio:  state.quotaPreemptUsedRatio,
-			QuotaHardStopUsedRatio: state.quotaHardStopUsedRatio,
+			Fallback:                  selector,
+			TTL:                       state.sessionAffinityTTL,
+			HighCacheMode:             state.highCacheMode,
+			CacheAffinityEnabled:      state.cacheAffinityEnabled,
+			ExpiryDrainIgnoreAffinity: state.expiryDrainIgnoreAffinity,
+			MaxEntries:                state.cacheAffinityMaxEntries,
+			MaxSessionRequests:        state.maxSessionRequests,
+			MaxSessionDuration:        state.maxSessionDuration,
+			QuotaPreemptUsedRatio:     state.quotaPreemptUsedRatio,
+			QuotaHardStopUsedRatio:    state.quotaHardStopUsedRatio,
 		})
 	}
 	return selector

@@ -637,26 +637,28 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback               Selector
-	cache                  *SessionCache
-	failoverCache          *SessionCache
-	highCacheMode          bool
-	cacheAffinityEnabled   bool
-	quotaPreemptUsedRatio  float64
-	quotaHardStopUsedRatio float64
+	fallback                  Selector
+	cache                     *SessionCache
+	failoverCache             *SessionCache
+	highCacheMode             bool
+	cacheAffinityEnabled      bool
+	expiryDrainIgnoreAffinity bool
+	quotaPreemptUsedRatio     float64
+	quotaHardStopUsedRatio    float64
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback               Selector
-	TTL                    time.Duration
-	HighCacheMode          bool
-	CacheAffinityEnabled   bool
-	MaxEntries             int
-	MaxSessionRequests     int
-	MaxSessionDuration     time.Duration
-	QuotaPreemptUsedRatio  float64
-	QuotaHardStopUsedRatio float64
+	Fallback                  Selector
+	TTL                       time.Duration
+	HighCacheMode             bool
+	CacheAffinityEnabled      bool
+	ExpiryDrainIgnoreAffinity bool
+	MaxEntries                int
+	MaxSessionRequests        int
+	MaxSessionDuration        time.Duration
+	QuotaPreemptUsedRatio     float64
+	QuotaHardStopUsedRatio    float64
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -682,13 +684,14 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cfg.QuotaHardStopUsedRatio = 0.99
 	}
 	return &SessionAffinitySelector{
-		fallback:               cfg.Fallback,
-		cache:                  NewSessionCacheWithBounds(cfg.TTL, cfg.MaxEntries, cfg.MaxSessionRequests, cfg.MaxSessionDuration),
-		failoverCache:          NewSessionCacheWithBounds(cfg.TTL, cfg.MaxEntries, cfg.MaxSessionRequests, cfg.MaxSessionDuration),
-		highCacheMode:          cfg.HighCacheMode,
-		cacheAffinityEnabled:   cfg.CacheAffinityEnabled,
-		quotaPreemptUsedRatio:  cfg.QuotaPreemptUsedRatio,
-		quotaHardStopUsedRatio: cfg.QuotaHardStopUsedRatio,
+		fallback:                  cfg.Fallback,
+		cache:                     NewSessionCacheWithBounds(cfg.TTL, cfg.MaxEntries, cfg.MaxSessionRequests, cfg.MaxSessionDuration),
+		failoverCache:             NewSessionCacheWithBounds(cfg.TTL, cfg.MaxEntries, cfg.MaxSessionRequests, cfg.MaxSessionDuration),
+		highCacheMode:             cfg.HighCacheMode,
+		cacheAffinityEnabled:      cfg.CacheAffinityEnabled,
+		expiryDrainIgnoreAffinity: cfg.ExpiryDrainIgnoreAffinity,
+		quotaPreemptUsedRatio:     cfg.QuotaPreemptUsedRatio,
+		quotaHardStopUsedRatio:    cfg.QuotaHardStopUsedRatio,
 	}
 }
 
@@ -775,31 +778,33 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					clearFailover()
 					break
 				}
-				drainAuths := expiryDrainFailoverAuths(fallbackAuths, auth, model, now)
-				if len(drainAuths) > 0 {
-					if s.failoverCache != nil {
-						if failoverAuthID, okFailover := s.failoverCache.GetAndRefresh(cacheKey); okFailover {
-							for _, drainAuth := range drainAuths {
-								if drainAuth.ID != failoverAuthID {
-									continue
+				if s.expiryDrainIgnoreAffinity {
+					drainAuths := expiryDrainFailoverAuths(fallbackAuths, auth, model, now)
+					if len(drainAuths) > 0 {
+						if s.failoverCache != nil {
+							if failoverAuthID, okFailover := s.failoverCache.GetAndRefresh(cacheKey); okFailover {
+								for _, drainAuth := range drainAuths {
+									if drainAuth.ID != failoverAuthID {
+										continue
+									}
+									bindFailover(drainAuth.ID)
+									if s.cacheAffinityEnabled {
+										cacheaffinity.RecordRouteFailover()
+									}
+									entry.Infof("session-affinity: warm binding temporarily draining expiring auth | session=%s primary=%s drain=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, drainAuth.ID, provider, model)
+									return drainAuth, nil
 								}
-								bindFailover(drainAuth.ID)
-								if s.cacheAffinityEnabled {
-									cacheaffinity.RecordRouteFailover()
-								}
-								entry.Infof("session-affinity: warm binding temporarily draining expiring auth | session=%s primary=%s drain=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, drainAuth.ID, provider, model)
-								return drainAuth, nil
+								s.failoverCache.Invalidate(cacheKey)
 							}
-							s.failoverCache.Invalidate(cacheKey)
 						}
-					}
-					if drainAuth, errDrain := s.fallback.Pick(ctx, provider, model, opts, drainAuths); errDrain == nil && drainAuth != nil {
-						bindFailover(drainAuth.ID)
-						if s.cacheAffinityEnabled {
-							cacheaffinity.RecordRouteFailover()
+						if drainAuth, errDrain := s.fallback.Pick(ctx, provider, model, opts, drainAuths); errDrain == nil && drainAuth != nil {
+							bindFailover(drainAuth.ID)
+							if s.cacheAffinityEnabled {
+								cacheaffinity.RecordRouteFailover()
+							}
+							entry.Infof("session-affinity: warm binding entered final expiry drain | session=%s primary=%s drain=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, drainAuth.ID, provider, model)
+							return drainAuth, nil
 						}
-						entry.Infof("session-affinity: warm binding entered final expiry drain | session=%s primary=%s drain=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, drainAuth.ID, provider, model)
-						return drainAuth, nil
 					}
 				}
 				bind(auth.ID)

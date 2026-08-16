@@ -537,7 +537,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			continue
 		}
 		view := bucket.view(false, groups)
-		expiringEntries = append(expiringEntries, expiringScheduledEntries(view.flat, predicate, now)...)
+		expiringEntries = appendExpiringScheduledEntries(expiringEntries, view.flat, predicate, now)
 	}
 	if len(expiringEntries) > 0 {
 		expiringEntries = narrowScheduledExpiryLane(expiringEntries)
@@ -1486,22 +1486,29 @@ func (v *readyView) pickExpiring(predicate func(*scheduledAuth) bool, strategy s
 	if v == nil || len(v.expiryFlat) == 0 {
 		return nil
 	}
+	priorityCutoff := now.Add(authExpiryPriorityWindow)
 	isEligible := func(entry *scheduledAuth) bool {
-		if entry == nil || entry.expiresAt.IsZero() || !entry.expiresAt.After(now) || entry.expiresAt.After(now.Add(authExpiryPriorityWindow)) {
+		if entry == nil || entry.expiresAt.IsZero() || !entry.expiresAt.After(now) || entry.expiresAt.After(priorityCutoff) {
 			return false
 		}
 		return predicate == nil || predicate(entry)
 	}
-	var laneCutoff time.Time
+	eligibleCount := 0
+	var boundaryExpiry time.Time
 	for _, entry := range v.expiryFlat {
-		if isEligible(entry) {
-			laneCutoff = entry.expiresAt.Add(authExpiryCohortWindow)
+		if !isEligible(entry) {
+			continue
+		}
+		eligibleCount++
+		boundaryExpiry = entry.expiresAt
+		if eligibleCount >= authExpiryPriorityMinCandidates {
 			break
 		}
 	}
-	if laneCutoff.IsZero() {
+	if boundaryExpiry.IsZero() {
 		return nil
 	}
+	laneCutoff := boundaryExpiry.Add(authExpiryCohortWindow)
 	isExpiring := func(entry *scheduledAuth) bool {
 		return isEligible(entry) && !entry.expiresAt.After(laneCutoff)
 	}

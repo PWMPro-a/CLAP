@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -149,7 +150,7 @@ func TestSessionAffinityKeepsEstablishedBindingAgainstExpiryLane(t *testing.T) {
 	}
 }
 
-func TestSessionAffinityTemporarilyFailsOverDuringFinalExpiryDrain(t *testing.T) {
+func TestSessionAffinityPreservesWarmBindingDuringFinalExpiryDrainByDefault(t *testing.T) {
 	now := time.Now().UTC()
 	bound := authWithSupplyLeaseExpiry("bound", now.Add(50*time.Minute), now.Add(10*24*time.Hour))
 	drain := authWithSupplyLeaseExpiry("drain", now.Add(4*time.Minute), now.Add(10*24*time.Hour))
@@ -157,6 +158,34 @@ func TestSessionAffinityTemporarilyFailsOverDuringFinalExpiryDrain(t *testing.T)
 		Fallback:             &RoundRobinSelector{},
 		TTL:                  time.Hour,
 		CacheAffinityEnabled: true,
+	})
+	defer selector.Stop()
+
+	cacheKey := sessionAffinityCacheKey("codex", "derived:stable-session", "gpt-5")
+	selector.cache.Set(cacheKey, bound.ID)
+	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.DerivedSessionIDMetadataKey: "stable-session",
+	}}, []*Auth{bound, drain})
+	if errPick != nil {
+		t.Fatalf("final expiry affinity pick: %v", errPick)
+	}
+	if got == nil || got.ID != bound.ID {
+		t.Fatalf("final expiry affinity picked %v, want warm binding %s", got, bound.ID)
+	}
+	if _, ok := selector.failoverCache.Get(cacheKey); ok {
+		t.Fatal("default final expiry drain created a temporary affinity binding")
+	}
+}
+
+func TestSessionAffinityTemporarilyFailsOverDuringConfiguredFinalExpiryDrain(t *testing.T) {
+	now := time.Now().UTC()
+	bound := authWithSupplyLeaseExpiry("bound", now.Add(50*time.Minute), now.Add(10*24*time.Hour))
+	drain := authWithSupplyLeaseExpiry("drain", now.Add(4*time.Minute), now.Add(10*24*time.Hour))
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:                  &RoundRobinSelector{},
+		TTL:                       time.Hour,
+		CacheAffinityEnabled:      true,
+		ExpiryDrainIgnoreAffinity: true,
 	})
 	defer selector.Stop()
 
@@ -294,20 +323,21 @@ func TestSchedulerPrefersNearExpiryWithoutPerRequestSorting(t *testing.T) {
 	}
 }
 
-func TestSchedulerUsesSupplierLeaseAndStaysOnOldestCohort(t *testing.T) {
+func TestSchedulerUsesSupplierLeaseAcrossEarliestHealthyCandidates(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
 	oldest := authWithSupplyLeaseExpiry("oldest", now.Add(20*time.Minute), tokenExpiry)
 	next := authWithSupplyLeaseExpiry("next", now.Add(23*time.Minute), tokenExpiry)
 	scheduler := newSchedulerForTest(&RoundRobinSelector{}, next, oldest)
 
-	for i := 0; i < 4; i++ {
+	want := []string{oldest.ID, next.ID, oldest.ID, next.ID}
+	for i, wantID := range want {
 		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {
 			t.Fatalf("scheduler pick %d: %v", i, errPick)
 		}
-		if got == nil || got.ID != oldest.ID {
-			t.Fatalf("scheduler pick %d = %v, want oldest supplier cohort", i, got)
+		if got == nil || got.ID != wantID {
+			t.Fatalf("scheduler pick %d = %v, want %s", i, got, wantID)
 		}
 	}
 
@@ -317,6 +347,59 @@ func TestSchedulerUsesSupplierLeaseAndStaysOnOldestCohort(t *testing.T) {
 	}
 	if got == nil || got.ID != next.ID {
 		t.Fatalf("retry scheduler pick = %v, want next after oldest was tried", got)
+	}
+}
+
+func TestSchedulerExpiryLaneKeepsMinimumCandidatesAndBoundaryCohort(t *testing.T) {
+	now := time.Now().UTC()
+	tokenExpiry := now.Add(10 * 24 * time.Hour)
+	auths := make([]*Auth, 0, 10)
+	for i := 0; i < 10; i++ {
+		expiresAt := now.Add(time.Duration(20+i*2) * time.Minute)
+		if i == 8 {
+			expiresAt = now.Add(34*time.Minute + 30*time.Second)
+		}
+		auths = append(auths, authWithSupplyLeaseExpiry(string(rune('a'+i)), expiresAt, tokenExpiry))
+	}
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, auths...)
+
+	seen := make(map[string]int)
+	for i := 0; i < 18; i++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("scheduler pick %d: %v", i, errPick)
+		}
+		seen[got.ID]++
+	}
+	for i := 0; i < 9; i++ {
+		id := string(rune('a' + i))
+		if seen[id] == 0 {
+			t.Fatalf("expiry lane did not schedule candidate %s: %#v", id, seen)
+		}
+	}
+	if seen["j"] != 0 {
+		t.Fatalf("expiry lane scheduled later candidate j: %#v", seen)
+	}
+}
+
+func BenchmarkSchedulerExpiryLaneLargePool(b *testing.B) {
+	now := time.Now().UTC()
+	tokenExpiry := now.Add(10 * 24 * time.Hour)
+	auths := make([]*Auth, 0, 1000)
+	for i := 0; i < cap(auths); i++ {
+		auths = append(auths, authWithSupplyLeaseExpiry(
+			fmt.Sprintf("auth-%04d", i),
+			now.Add(time.Duration(1+i)*time.Minute),
+			tokenExpiry,
+		))
+	}
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, auths...)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil); errPick != nil {
+			b.Fatal(errPick)
+		}
 	}
 }
 

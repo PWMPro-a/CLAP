@@ -289,6 +289,10 @@ codex:
   cache-affinity:
     enabled: false
     shadow: true
+    # Keep this false to preserve warm-session affinity. When true, credentials
+    # in their final five minutes may temporarily receive warm sessions so the
+    # bounded expiry-drain concurrency can consume their remaining quota.
+    expiry-drain-ignore-affinity: false
     max-entries: 65536
     # Caps credential attempts for one logical Codex request when active.
     max-retry-credentials: 2

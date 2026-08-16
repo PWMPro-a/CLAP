@@ -196,13 +196,9 @@ func expiryDrainConcurrencyLimit(auth *Auth, model string, now time.Time, config
 	return boosted
 }
 
-// expiryDrainFailoverAuths returns the oldest final-window cohort that should
-// temporarily receive a warm session. Normal expiry preference applies only
-// to cold bindings so cache affinity stays intact. In the last five minutes,
-// however, preserving a later-bound credential can strand the entire balance
-// of an older supplier lease. The selector uses this list through its
-// failover cache, leaving the primary binding untouched and automatically
-// returning to it after the drain credential expires or is exhausted.
+// expiryDrainFailoverAuths returns the oldest final-window cohort for the
+// optional aggressive drain mode. The caller gates this path behind
+// expiry-drain-ignore-affinity, so normal operation keeps warm bindings intact.
 func expiryDrainFailoverAuths(auths []*Auth, cached *Auth, model string, now time.Time) []*Auth {
 	if len(auths) == 0 {
 		return nil
@@ -249,11 +245,10 @@ func expiryDrainFailoverAuths(auths []*Auth, cached *Auth, model string, now tim
 	return result
 }
 
-func expiringScheduledEntries(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time) []*scheduledAuth {
+func appendExpiringScheduledEntries(out, entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time) []*scheduledAuth {
 	if len(entries) == 0 {
-		return nil
+		return out
 	}
-	out := make([]*scheduledAuth, 0, len(entries))
 	cutoff := now.Add(authExpiryPriorityWindow)
 	for _, entry := range entries {
 		if entry == nil || entry.expiresAt.IsZero() || !entry.expiresAt.After(now) || entry.expiresAt.After(cutoff) {
@@ -264,9 +259,14 @@ func expiringScheduledEntries(entries []*scheduledAuth, predicate func(*schedule
 		}
 		out = append(out, entry)
 	}
-	return narrowScheduledExpiryLane(out)
+	return out
 }
 
+// narrowScheduledExpiryLane keeps the earliest healthy credentials in the
+// active cold-request lane and extends through the boundary supplier cohort.
+// This mirrors expiryPriorityAuths: expiry affects new allocation without
+// moving established affinity bindings, while avoiding a one-minute cohort
+// monopolizing all incoming sessions.
 func narrowScheduledExpiryLane(entries []*scheduledAuth) []*scheduledAuth {
 	if len(entries) <= 1 {
 		return entries
@@ -277,8 +277,12 @@ func narrowScheduledExpiryLane(entries []*scheduledAuth) []*scheduledAuth {
 		}
 		return entries[i].auth.ID < entries[j].auth.ID
 	})
-	cutoff := entries[0].expiresAt.Add(authExpiryCohortWindow)
-	end := 1
+	boundary := authExpiryPriorityMinCandidates
+	if boundary > len(entries) {
+		boundary = len(entries)
+	}
+	cutoff := entries[boundary-1].expiresAt.Add(authExpiryCohortWindow)
+	end := boundary
 	for end < len(entries) && !entries[end].expiresAt.After(cutoff) {
 		end++
 	}

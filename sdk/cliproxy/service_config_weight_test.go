@@ -51,6 +51,23 @@ func TestCacheAffinityBuildsSessionSelectorWithoutLegacyHighCacheMode(t *testing
 	defer selector.Stop()
 }
 
+func TestExpiryDrainIgnoreAffinityConfigFlowsIntoRoutingState(t *testing.T) {
+	state := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+			Enabled:                   true,
+			ExpiryDrainIgnoreAffinity: true,
+		}},
+	})
+	if !state.expiryDrainIgnoreAffinity {
+		t.Fatal("expiry drain ignore-affinity switch was not preserved")
+	}
+	selector, ok := newRoutingSelector(state).(*coreauth.SessionAffinitySelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", newRoutingSelector(state))
+	}
+	defer selector.Stop()
+}
+
 func TestServiceRejectsInvalidCredentialWeightConfigCommit(t *testing.T) {
 	originalCfg := &internalconfig.Config{}
 	service := &Service{cfg: originalCfg}

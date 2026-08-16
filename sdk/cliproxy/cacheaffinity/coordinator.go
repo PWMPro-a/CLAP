@@ -176,15 +176,16 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, cfg *in
 
 // RuntimeSettings contains normalized hot-path settings.
 type RuntimeSettings struct {
-	Enabled                bool          `json:"enabled"`
-	Shadow                 bool          `json:"shadow"`
-	MaxEntries             int           `json:"max_entries"`
-	MaxRetryCredentials    int           `json:"max_retry_credentials"`
-	WebsocketPoolSlots     int           `json:"websocket_pool_slots"`
-	MaxSessionRequests     int           `json:"max_session_requests"`
-	MaxSessionDuration     time.Duration `json:"max_session_duration"`
-	QuotaPreemptUsedRatio  float64       `json:"quota_preempt_used_ratio"`
-	QuotaHardStopUsedRatio float64       `json:"quota_hard_stop_used_ratio"`
+	Enabled                   bool          `json:"enabled"`
+	Shadow                    bool          `json:"shadow"`
+	ExpiryDrainIgnoreAffinity bool          `json:"expiry_drain_ignore_affinity"`
+	MaxEntries                int           `json:"max_entries"`
+	MaxRetryCredentials       int           `json:"max_retry_credentials"`
+	WebsocketPoolSlots        int           `json:"websocket_pool_slots"`
+	MaxSessionRequests        int           `json:"max_session_requests"`
+	MaxSessionDuration        time.Duration `json:"max_session_duration"`
+	QuotaPreemptUsedRatio     float64       `json:"quota_preempt_used_ratio"`
+	QuotaHardStopUsedRatio    float64       `json:"quota_hard_stop_used_ratio"`
 }
 
 // Settings normalizes optional configuration without mutating the config tree.
@@ -194,14 +195,15 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 	}
 	raw := cfg.Codex.CacheAffinity
 	settings := RuntimeSettings{
-		Enabled:                raw.Enabled,
-		Shadow:                 raw.Shadow,
-		MaxEntries:             raw.MaxEntries,
-		MaxRetryCredentials:    raw.MaxRetryCredentials,
-		WebsocketPoolSlots:     raw.WebsocketPoolSlots,
-		MaxSessionRequests:     raw.MaxSessionRequests,
-		QuotaPreemptUsedRatio:  raw.QuotaPreemptUsedRatio,
-		QuotaHardStopUsedRatio: raw.QuotaHardStopUsedRatio,
+		Enabled:                   raw.Enabled,
+		Shadow:                    raw.Shadow,
+		ExpiryDrainIgnoreAffinity: raw.ExpiryDrainIgnoreAffinity,
+		MaxEntries:                raw.MaxEntries,
+		MaxRetryCredentials:       raw.MaxRetryCredentials,
+		WebsocketPoolSlots:        raw.WebsocketPoolSlots,
+		MaxSessionRequests:        raw.MaxSessionRequests,
+		QuotaPreemptUsedRatio:     raw.QuotaPreemptUsedRatio,
+		QuotaHardStopUsedRatio:    raw.QuotaHardStopUsedRatio,
 	}
 	if settings.MaxEntries <= 0 {
 		settings.MaxEntries = defaultMaxEntries
