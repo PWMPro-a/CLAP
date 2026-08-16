@@ -301,6 +301,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	opts = m.withCodexTailBurstRequestMetadata(ctx, providers, req, opts)
+	maxRetryCredentials = codexTailBurstFallbackRetryBudget(maxRetryCredentials, opts)
 	routeModel := authSelectionModelFromOptions(opts, req.Model)
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
@@ -368,6 +369,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
+			if tailBurst {
+				opts = withCodexTailBurstFallback(opts)
+			}
 			continue
 		}
 		var authErr error
@@ -442,6 +446,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
+			if tailBurst {
+				opts = withCodexTailBurstFallback(opts)
+			}
 			if homeMode {
 				homeAuthCount++
 			}
@@ -615,6 +622,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	opts = m.withCodexTailBurstRequestMetadata(ctx, providers, req, opts)
+	maxRetryCredentials = codexTailBurstFallbackRetryBudget(maxRetryCredentials, opts)
 	routeModel := authSelectionModelFromOptions(opts, req.Model)
 	responseAlias := requestedModelAliasFromOptions(opts, routeModel)
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
@@ -757,6 +765,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			releaseRuntimeSlot(releaseRuntime)
 			lastErr = errPrepare
+			if tailBurst {
+				opts = withCodexTailBurstFallback(opts)
+			}
 			if selection != nil {
 				if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "prepare_failed"); errEnd != nil {
 					return nil, errEnd
@@ -796,6 +807,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, errStream
 			}
 			lastErr = errStream
+			if tailBurst {
+				opts = withCodexTailBurstFallback(opts)
+			}
 			if homeMode {
 				homeAuthCount++
 			}

@@ -45,28 +45,21 @@ func TestExpiryPriorityAuthsKeepsClosestExpiryLane(t *testing.T) {
 	}
 }
 
-func TestExpiryPriorityAuthsKeepsMinimumCandidatesAndBoundaryCohort(t *testing.T) {
+func TestExpiryPriorityAuthsKeepsEarliestSupplierCohort(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
-	auths := make([]*Auth, 0, 10)
-	for i := 0; i < 10; i++ {
-		expiresAt := now.Add(time.Duration(20+i*2) * time.Minute)
-		if i == 8 {
-			// The ninth candidate belongs to the eighth candidate's batch and
-			// must not be split off at the minimum-size boundary.
-			expiresAt = now.Add(34*time.Minute + 30*time.Second)
-		}
-		auths = append(auths, authWithSupplyLeaseExpiry(string(rune('a'+i)), expiresAt, tokenExpiry))
+	auths := []*Auth{
+		authWithSupplyLeaseExpiry("a", now.Add(20*time.Minute), tokenExpiry),
+		authWithSupplyLeaseExpiry("b", now.Add(20*time.Minute+30*time.Second), tokenExpiry),
+		authWithSupplyLeaseExpiry("c", now.Add(22*time.Minute), tokenExpiry),
 	}
 
 	got := expiryPriorityAuths(auths, now)
-	if len(got) != 9 {
-		t.Fatalf("expiry priority candidates = %d, want 9", len(got))
+	if len(got) != 2 {
+		t.Fatalf("expiry priority candidates = %d, want 2", len(got))
 	}
-	for i := 0; i < 9; i++ {
-		if got[i].ID != string(rune('a'+i)) {
-			t.Fatalf("expiry priority candidate %d = %s, want %s", i, got[i].ID, string(rune('a'+i)))
-		}
+	if got[0].ID != "a" || got[1].ID != "b" {
+		t.Fatalf("expiry priority candidates = [%s %s], want [a b]", got[0].ID, got[1].ID)
 	}
 }
 
@@ -327,14 +320,14 @@ func TestSchedulerPrefersNearExpiryWithoutPerRequestSorting(t *testing.T) {
 	}
 }
 
-func TestSchedulerUsesSupplierLeaseAcrossEarliestHealthyCandidates(t *testing.T) {
+func TestSchedulerUsesOldestSupplierCohortUntilItIsUnavailable(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
 	oldest := authWithSupplyLeaseExpiry("oldest", now.Add(20*time.Minute), tokenExpiry)
 	next := authWithSupplyLeaseExpiry("next", now.Add(23*time.Minute), tokenExpiry)
 	scheduler := newSchedulerForTest(&RoundRobinSelector{}, next, oldest)
 
-	want := []string{oldest.ID, next.ID, oldest.ID, next.ID}
+	want := []string{oldest.ID, oldest.ID, oldest.ID, oldest.ID}
 	for i, wantID := range want {
 		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {
@@ -354,7 +347,37 @@ func TestSchedulerUsesSupplierLeaseAcrossEarliestHealthyCandidates(t *testing.T)
 	}
 }
 
-func TestSchedulerExpiryLaneKeepsMinimumCandidatesAndBoundaryCohort(t *testing.T) {
+func TestSchedulerSpillsToNextSupplierCohortAfterBaseLimit(t *testing.T) {
+	now := time.Now().UTC()
+	tokenExpiry := now.Add(10 * 24 * time.Hour)
+	oldest := authWithSupplyLeaseExpiry("oldest", now.Add(20*time.Minute), tokenExpiry)
+	next := authWithSupplyLeaseExpiry("next", now.Add(23*time.Minute), tokenExpiry)
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, next, oldest)
+
+	releases := make([]func(), 0, authExpiryPriorityDefaultConcurrency)
+	for i := 0; i < authExpiryPriorityDefaultConcurrency; i++ {
+		release, acquired, reason, _ := oldest.acquireRuntimeSlotForModel(now, "", false)
+		if !acquired {
+			t.Fatalf("oldest slot %d not acquired: %s", i+1, reason)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("scheduler spill pick: %v", errPick)
+	}
+	if got == nil || got.ID != next.ID {
+		t.Fatalf("scheduler spill pick = %v, want %s", got, next.ID)
+	}
+}
+
+func TestSchedulerExpiryLaneKeepsOnlyEarliestCohort(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
 	auths := make([]*Auth, 0, 10)
@@ -368,21 +391,21 @@ func TestSchedulerExpiryLaneKeepsMinimumCandidatesAndBoundaryCohort(t *testing.T
 	scheduler := newSchedulerForTest(&RoundRobinSelector{}, auths...)
 
 	seen := make(map[string]int)
-	for i := 0; i < 18; i++ {
+	for i := 0; i < 8; i++ {
 		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {
 			t.Fatalf("scheduler pick %d: %v", i, errPick)
 		}
 		seen[got.ID]++
 	}
-	for i := 0; i < 9; i++ {
-		id := string(rune('a' + i))
-		if seen[id] == 0 {
-			t.Fatalf("expiry lane did not schedule candidate %s: %#v", id, seen)
-		}
+	if seen["a"] != 8 {
+		t.Fatalf("expiry lane did not stay on earliest candidate: %#v", seen)
 	}
-	if seen["j"] != 0 {
-		t.Fatalf("expiry lane scheduled later candidate j: %#v", seen)
+	for i := 1; i < 10; i++ {
+		id := string(rune('a' + i))
+		if seen[id] != 0 {
+			t.Fatalf("expiry lane scheduled later candidate %s: %#v", id, seen)
+		}
 	}
 }
 

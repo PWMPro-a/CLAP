@@ -192,11 +192,14 @@ type CodexCacheAffinityConfig struct {
 // CodexTailBurstConfig controls the bounded drain mode for Codex credentials
 // that are close to exhausting a tracked usage window.
 type CodexTailBurstConfig struct {
-	Enabled          bool                               `yaml:"enabled" json:"enabled"`
-	TriggerUsedRatio float64                            `yaml:"trigger-used-ratio" json:"trigger-used-ratio"`
-	SnapshotTTL      string                             `yaml:"snapshot-ttl" json:"snapshot-ttl"`
-	QuotaCollector   CodexTailBurstQuotaCollectorConfig `yaml:"quota-collector" json:"quota-collector"`
-	ToolInjection    CodexTailBurstToolInjectionConfig  `yaml:"tool-injection" json:"tool-injection"`
+	Enabled               bool                               `yaml:"enabled" json:"enabled"`
+	TriggerUsedRatio      float64                            `yaml:"trigger-used-ratio" json:"trigger-used-ratio"`
+	TriggerRemainingRatio float64                            `yaml:"trigger-remaining-ratio" json:"trigger-remaining-ratio"`
+	SnapshotTTL           string                             `yaml:"snapshot-ttl" json:"snapshot-ttl"`
+	ExpiryWindow          string                             `yaml:"expiry-window" json:"expiry-window"`
+	MaxConcurrency        int                                `yaml:"max-concurrency" json:"max-concurrency"`
+	QuotaCollector        CodexTailBurstQuotaCollectorConfig `yaml:"quota-collector" json:"quota-collector"`
+	ToolInjection         CodexTailBurstToolInjectionConfig  `yaml:"tool-injection" json:"tool-injection"`
 }
 
 // CodexTailBurstQuotaCollectorConfig controls the asynchronous OAuth usage collector.

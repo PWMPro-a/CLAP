@@ -1565,7 +1565,11 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	opts = m.withAccountGroupPolicyFromContext(ctx, opts)
 	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
-		if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
+		if codexTailBurstFallbackRequested(opts) {
+			if auth, executor, ok := m.pickCodexTailBurstFallbackAuth(ctx, model, opts, tried); ok {
+				return auth, executor, nil
+			}
+		} else if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
 			return auth, executor, nil
 		}
 	}
@@ -1723,7 +1727,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts = m.withAccountGroupPolicyFromContext(ctx, opts)
 	if hasCodexProvider(providers) {
-		if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
+		if codexTailBurstFallbackRequested(opts) {
+			if auth, executor, ok := m.pickCodexTailBurstFallbackAuth(ctx, model, opts, tried); ok {
+				return auth, executor, "codex", nil
+			}
+		} else if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
 			return auth, executor, "codex", nil
 		}
 	}

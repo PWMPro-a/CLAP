@@ -14,9 +14,11 @@ func newTailBurstConfig() *internalconfig.Config {
 	return &internalconfig.Config{
 		Codex: internalconfig.CodexConfig{
 			TailBurst: internalconfig.CodexTailBurstConfig{
-				Enabled:          true,
-				TriggerUsedRatio: 0.98,
-				SnapshotTTL:      "90s",
+				Enabled:               true,
+				TriggerRemainingRatio: 0.02,
+				SnapshotTTL:           "90s",
+				ExpiryWindow:          "10m",
+				MaxConcurrency:        32,
 			},
 		},
 	}
@@ -31,7 +33,7 @@ func updateTailBurstSnapshot(t *testing.T, manager *Manager, authID string) {
 	}
 }
 
-func TestCodexTailBurstLimitsAccountToOneInFlightRequest(t *testing.T) {
+func TestCodexTailBurstAllowsConfiguredConcurrentRequests(t *testing.T) {
 	executor := &runtimeLimitTestExecutor{
 		blockAuth: "tail-auth",
 		started:   make(chan struct{}),
@@ -63,8 +65,8 @@ func TestCodexTailBurstLimitsAccountToOneInFlightRequest(t *testing.T) {
 	if errExecute != nil {
 		t.Fatalf("second Execute: %v", errExecute)
 	}
-	if got := string(second.Payload); got != "healthy-auth" {
-		t.Fatalf("second payload = %q, want healthy-auth", got)
+	if got := string(second.Payload); got != "tail-auth" {
+		t.Fatalf("second payload = %q, want tail-auth", got)
 	}
 
 	close(executor.release)
@@ -75,7 +77,7 @@ func TestCodexTailBurstLimitsAccountToOneInFlightRequest(t *testing.T) {
 	}
 }
 
-func TestCodexTailBurstKeepsExistingToolRequestsOnNormalScheduling(t *testing.T) {
+func TestCodexTailBurstIncludesExistingToolRequests(t *testing.T) {
 	executor := &runtimeLimitTestExecutor{
 		blockAuth: "tail-auth",
 		started:   make(chan struct{}),
@@ -108,8 +110,8 @@ func TestCodexTailBurstKeepsExistingToolRequestsOnNormalScheduling(t *testing.T)
 	if errExecute != nil {
 		t.Fatalf("tool Execute: %v", errExecute)
 	}
-	if got := string(second.Payload); got != "healthy-auth" {
-		t.Fatalf("tool request payload = %q, want healthy-auth", got)
+	if got := string(second.Payload); got != "tail-auth" {
+		t.Fatalf("tool request payload = %q, want tail-auth", got)
 	}
 
 	close(executor.release)
@@ -157,7 +159,7 @@ func (e *codexTailBurstStreamTestExecutor) HttpRequest(context.Context, *Auth, *
 	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "http request not implemented"}
 }
 
-func TestCodexTailBurstLimitsAccountToOneInFlightStream(t *testing.T) {
+func TestCodexTailBurstAllowsConfiguredConcurrentStreams(t *testing.T) {
 	executor := &codexTailBurstStreamTestExecutor{runtimeLimitTestExecutor: runtimeLimitTestExecutor{
 		blockAuth: "tail-auth",
 		started:   make(chan struct{}),
@@ -198,8 +200,8 @@ func TestCodexTailBurstLimitsAccountToOneInFlightStream(t *testing.T) {
 		}
 		payload = append(payload, chunk.Payload...)
 	}
-	if string(payload) != "healthy-auth" {
-		t.Fatalf("second stream payload = %q, want healthy-auth", payload)
+	if string(payload) != "tail-auth" {
+		t.Fatalf("second stream payload = %q, want tail-auth", payload)
 	}
 
 	close(executor.release)
@@ -207,6 +209,83 @@ func TestCodexTailBurstLimitsAccountToOneInFlightStream(t *testing.T) {
 	case <-firstDone:
 	case <-time.After(time.Second):
 		t.Fatal("first tail stream did not finish")
+	}
+}
+
+func TestCodexTailBurstActivatesDuringSupplierExpiryWindowWithoutQuotaSnapshot(t *testing.T) {
+	now := time.Now()
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(newTailBurstConfig())
+	for _, auth := range []*Auth{
+		{ID: "expiring", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"supply_lease_expires_at_ms": now.Add(9 * time.Minute).UnixMilli()}},
+		{ID: "later", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"supply_lease_expires_at_ms": now.Add(11 * time.Minute).UnixMilli()}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s): %v", auth.ID, errRegister)
+		}
+	}
+
+	manager.mu.RLock()
+	expiring := manager.auths["expiring"].Clone()
+	later := manager.auths["later"].Clone()
+	manager.mu.RUnlock()
+	if !manager.codexTailBurstActive(expiring, "gpt-5-codex", now) {
+		t.Fatal("supplier credential inside the final 10 minutes did not enter tail burst")
+	}
+	if manager.codexTailBurstActive(later, "gpt-5-codex", now) {
+		t.Fatal("supplier credential outside the final 10 minutes entered tail burst early")
+	}
+
+	opts := manager.withCodexTailBurstRequestMetadata(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"input":"hello"}`),
+	}, cliproxyexecutor.Options{})
+	if !codexTailBurstRequested(opts) {
+		t.Fatal("expiry candidate index did not activate request-time tail routing")
+	}
+}
+
+func TestCodexTailBurstFailureFallsBackToHighestRecentSuccessRate(t *testing.T) {
+	now := time.Now()
+	executor := &runtimeLimitTestExecutor{firstErrors: map[string]error{
+		"expiring": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"},
+	}}
+	manager := newRuntimeLimitManager(t, executor,
+		&Auth{ID: "expiring", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"supply_lease_expires_at_ms": now.Add(5 * time.Minute).UnixMilli()}},
+		&Auth{ID: "healthy-high", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "healthy-low", Provider: "codex", Status: StatusActive},
+	)
+	manager.SetConfig(newTailBurstConfig())
+	manager.SetRetryConfig(0, 0, 1)
+
+	manager.mu.Lock()
+	for i := 0; i < 20; i++ {
+		manager.auths["healthy-high"].recordRecentRequest(now, true)
+	}
+	manager.auths["healthy-high"].recordRecentRequest(now, false)
+	for i := 0; i < 2; i++ {
+		manager.auths["healthy-low"].recordRecentRequest(now, true)
+	}
+	for i := 0; i < 4; i++ {
+		manager.auths["healthy-low"].recordRecentRequest(now, false)
+	}
+	manager.mu.Unlock()
+
+	response, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Payload: []byte(`{"input":"hello"}`),
+	}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute: %v", errExecute)
+	}
+	if got := string(response.Payload); got != "healthy-high" {
+		t.Fatalf("fallback payload = %q, want healthy-high", got)
+	}
+
+	executor.mu.Lock()
+	calls := append([]string(nil), executor.calls...)
+	executor.mu.Unlock()
+	if len(calls) != 2 || calls[0] != "expiring" || calls[1] != "healthy-high" {
+		t.Fatalf("execution order = %v, want [expiring healthy-high]", calls)
 	}
 }
 

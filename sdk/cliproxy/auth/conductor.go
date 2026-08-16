@@ -157,8 +157,9 @@ type Manager struct {
 
 	// codexTailBurstCandidates is an immutable request-time index maintained by
 	// asynchronous quota/config updates.
-	codexTailBurstCandidates atomic.Value
-	codexTailBurstSequence   atomic.Uint64
+	codexTailBurstCandidates       atomic.Value
+	codexTailBurstExpiryCandidates atomic.Value
+	codexTailBurstSequence         atomic.Uint64
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
@@ -197,6 +198,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.codexTailBurstCandidates.Store(codexTailBurstCandidateIndex{})
+	manager.codexTailBurstExpiryCandidates.Store([]codexTailBurstExpiryCandidate{})
 	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: &internalconfig.Config{}})
 	manager.apiKeyGroupPolicies.Store(&apiKeyGroupPolicySnapshot{byHash: map[string]accountGroupSelection{}})
 	defaultInFlightConfig, errInFlightConfig := HomeInFlightPublisherConfigFromConfig(internalconfig.DefaultCredentialInFlightConfig())

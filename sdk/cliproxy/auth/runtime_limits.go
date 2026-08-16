@@ -183,6 +183,9 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.
 	if cfg.maxConcurrency > tailBurstLimit {
 		tailBurstLimit = cfg.maxConcurrency
 	}
+	if auth.tailBurstMaxConcurrency > tailBurstLimit {
+		tailBurstLimit = auth.tailBurstMaxConcurrency
+	}
 	if drainLimit := expiryDrainConcurrencyLimit(auth, model, now, 1); drainLimit > tailBurstLimit {
 		tailBurstLimit = drainLimit
 	}
@@ -299,6 +302,9 @@ func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst
 	tailBurstLimit := 1
 	if cfg.maxConcurrency > tailBurstLimit {
 		tailBurstLimit = cfg.maxConcurrency
+	}
+	if a.tailBurstMaxConcurrency > tailBurstLimit {
+		tailBurstLimit = a.tailBurstMaxConcurrency
 	}
 	if drainLimit := expiryDrainConcurrencyLimit(a, model, now, 1); drainLimit > tailBurstLimit {
 		tailBurstLimit = drainLimit

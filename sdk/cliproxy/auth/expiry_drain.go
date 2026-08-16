@@ -13,11 +13,11 @@ const (
 	// authExpiryCohortWindow keeps one supplier batch moving together while
 	// preserving batch boundaries when the active lane is widened for capacity.
 	authExpiryCohortWindow = time.Minute
-	// authExpiryPriorityMinCandidates keeps the near-expiry lane large enough to
-	// absorb normal concurrent traffic. A one-account supplier batch otherwise
-	// attracts every cold session until it saturates, forcing established hot
-	// sessions onto another account and losing their upstream prompt cache.
-	authExpiryPriorityMinCandidates = 8
+	// authExpiryPriorityMinCandidates starts from the single earliest supplier
+	// cohort. Normal runtime concurrency caps make the lane spill into the next
+	// cohort only after the oldest one is full, so healthy capacity is not wasted
+	// while established affinity bindings remain untouched.
+	authExpiryPriorityMinCandidates = 1
 	// authExpiryDrainWindow is the final window in which an account may use a
 	// bounded concurrency boost to consume remaining quota before expiry.
 	authExpiryDrainWindow = 5 * time.Minute
@@ -118,9 +118,9 @@ func authExpiryDrainActive(auth *Auth, model string, now time.Time) bool {
 }
 
 // expiryPriorityAuths narrows a ready candidate set to the near-expiry lane.
-// The lane includes at least authExpiryPriorityMinCandidates and then extends
-// through the boundary candidate's supplier cohort. This preserves expiry
-// preference without concentrating all cold sessions on a tiny batch.
+// The lane starts with the earliest candidate and extends through its supplier
+// cohort. Runtime concurrency limits naturally spill cold requests into the
+// next cohort after the oldest batch fills.
 // The caller has already applied provider/model availability and priority
 // rules. Returning the original slice when no lane exists preserves the hot
 // request path's existing allocation and ordering behavior.

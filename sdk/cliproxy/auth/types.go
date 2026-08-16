@@ -106,6 +106,11 @@ type Auth struct {
 	// quotaPreemptFallback is set only on a request-local clone selected by the
 	// all-pool quota fallback. It never mutates or persists the registered auth.
 	quotaPreemptFallback bool `json:"-"`
+
+	// tailBurstMaxConcurrency is set only on a request-local clone selected by
+	// Codex tail-burst routing. It lets the runtime limiter apply the configured
+	// burst ceiling without persisting global configuration into auth metadata.
+	tailBurstMaxConcurrency int `json:"-"`
 }
 
 // RuntimeAuthView is a minimal read-only projection for callers that only need

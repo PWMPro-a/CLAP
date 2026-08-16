@@ -307,13 +307,20 @@ codex:
     # Existing warm sessions leave a credential at or above this ratio. Set
     # this to 1.0 when bounded tail-burst draining is enabled.
     quota-hard-stop-used-ratio: 0.99
-  # Temporarily prioritize a credential after an external quota collector reports
-  # that the current model window is almost exhausted. Tail draining is bounded
-  # to one in-flight request per credential.
+  # Temporarily prioritize a credential when its collected quota is almost
+  # exhausted or its supplier lease enters the final expiry window. A failed
+  # burst credential is retried on the healthiest recent credential.
   tail-burst:
     enabled: false
-    trigger-used-ratio: 0.98
+    # Enter the burst lane when collected remaining quota is at or below 2%.
+    trigger-remaining-ratio: 0.02
     snapshot-ttl: "90s"
+    # Supplier-leased credentials enter the burst lane during their final 10m.
+    # A passed supplier timestamp stays urgent until upstream health rejects it.
+    expiry-window: "10m"
+    # Per-credential request ceiling while the burst lane is active. An auth's
+    # explicitly configured higher max_concurrency value is still preserved.
+    max-concurrency: 32
     # The OAuth usage endpoint is polled independently of model requests.
     # It never waits for, buffers, or shares an upstream Responses WebSocket.
     quota-collector:

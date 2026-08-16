@@ -10,14 +10,16 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/tidwall/gjson"
 )
 
 const (
-	defaultCodexTailBurstTriggerRatio = 0.98
-	defaultCodexTailBurstSnapshotTTL  = 90 * time.Second
+	defaultCodexTailBurstRemainingRatio = 0.02
+	defaultCodexTailBurstSnapshotTTL    = 90 * time.Second
+	defaultCodexTailBurstExpiryWindow   = 10 * time.Minute
+	defaultCodexTailBurstConcurrency    = 32
 
 	codexTailBurstRequestedMetadataKey = "__cliproxy_codex_tail_burst_requested"
+	codexTailBurstFallbackMetadataKey  = "__cliproxy_codex_tail_burst_fallback"
 )
 
 // CodexQuotaSnapshot is an externally sampled usage-window snapshot for a
@@ -45,16 +47,25 @@ type CodexQuotaSnapshotUpdate struct {
 type codexQuotaSnapshotStore map[string]CodexQuotaSnapshot
 type codexTailBurstCandidateIndex map[string][]string
 
+type codexTailBurstExpiryCandidate struct {
+	authID    string
+	expiresAt time.Time
+}
+
 type codexTailBurstSettings struct {
-	enabled      bool
-	triggerRatio float64
-	snapshotTTL  time.Duration
+	enabled        bool
+	triggerRatio   float64
+	snapshotTTL    time.Duration
+	expiryWindow   time.Duration
+	maxConcurrency int
 }
 
 func (m *Manager) codexTailBurstSettings() codexTailBurstSettings {
 	settings := codexTailBurstSettings{
-		triggerRatio: defaultCodexTailBurstTriggerRatio,
-		snapshotTTL:  defaultCodexTailBurstSnapshotTTL,
+		triggerRatio:   1 - defaultCodexTailBurstRemainingRatio,
+		snapshotTTL:    defaultCodexTailBurstSnapshotTTL,
+		expiryWindow:   defaultCodexTailBurstExpiryWindow,
+		maxConcurrency: defaultCodexTailBurstConcurrency,
 	}
 	if m == nil {
 		return settings
@@ -65,11 +76,21 @@ func (m *Manager) codexTailBurstSettings() codexTailBurstSettings {
 	}
 	tailCfg := cfg.Codex.TailBurst
 	settings.enabled = tailCfg.Enabled
-	if tailCfg.TriggerUsedRatio > 0 && tailCfg.TriggerUsedRatio < 1 {
+	if tailCfg.TriggerRemainingRatio > 0 && tailCfg.TriggerRemainingRatio < 1 {
+		settings.triggerRatio = 1 - tailCfg.TriggerRemainingRatio
+	} else if tailCfg.TriggerUsedRatio > 0 && tailCfg.TriggerUsedRatio < 1 {
+		// Keep existing configurations compatible while the management UI writes
+		// the clearer remaining-quota threshold going forward.
 		settings.triggerRatio = tailCfg.TriggerUsedRatio
 	}
 	if parsed, errParse := time.ParseDuration(strings.TrimSpace(tailCfg.SnapshotTTL)); errParse == nil && parsed > 0 {
 		settings.snapshotTTL = parsed
+	}
+	if parsed, errParse := time.ParseDuration(strings.TrimSpace(tailCfg.ExpiryWindow)); errParse == nil && parsed > 0 {
+		settings.expiryWindow = parsed
+	}
+	if tailCfg.MaxConcurrency > 0 {
+		settings.maxConcurrency = tailCfg.MaxConcurrency
 	}
 	return settings
 }
@@ -335,6 +356,9 @@ func (m *Manager) codexTailBurstActive(auth *Auth, model string, now time.Time) 
 	if !settings.enabled || !codexTailBurstEnabledForAuth(auth) {
 		return false
 	}
+	if expiresAt, okExpiry := authSupplyLeaseExpirationTime(auth); okExpiry && !expiresAt.After(now.Add(settings.expiryWindow)) {
+		return true
+	}
 	snapshot, ok := auth.codexQuotaSnapshot(model, now)
 	// The usage endpoint reports rounded percentages. Keep a sampled 100% in
 	// the bounded tail lane until the upstream returns an actual quota error;
@@ -348,12 +372,16 @@ func (m *Manager) refreshCodexTailBurstCandidates() {
 	}
 	settings := m.codexTailBurstSettings()
 	index := make(codexTailBurstCandidateIndex)
+	expiryCandidates := make([]codexTailBurstExpiryCandidate, 0)
 	if settings.enabled {
 		now := time.Now()
 		m.mu.RLock()
 		for _, auth := range m.auths {
-			if auth == nil || !strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex") || !codexTailBurstEnabledForAuth(auth) {
+			if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex") || !codexTailBurstEnabledForAuth(auth) {
 				continue
+			}
+			if expiresAt, okExpiry := authSupplyLeaseExpirationTime(auth); okExpiry {
+				expiryCandidates = append(expiryCandidates, codexTailBurstExpiryCandidate{authID: auth.ID, expiresAt: expiresAt})
 			}
 			for model, snapshot := range auth.codexQuotaSnapshots(now) {
 				if snapshot.UsedRatio < settings.triggerRatio || authQuotaExceeded(auth, model) {
@@ -367,8 +395,25 @@ func (m *Manager) refreshCodexTailBurstCandidates() {
 		for key := range index {
 			sort.Strings(index[key])
 		}
+		sort.Slice(expiryCandidates, func(i, j int) bool {
+			if !expiryCandidates[i].expiresAt.Equal(expiryCandidates[j].expiresAt) {
+				return expiryCandidates[i].expiresAt.Before(expiryCandidates[j].expiresAt)
+			}
+			return expiryCandidates[i].authID < expiryCandidates[j].authID
+		})
 	}
 	m.codexTailBurstCandidates.Store(index)
+	m.codexTailBurstExpiryCandidates.Store(expiryCandidates)
+}
+
+func activeCodexTailBurstExpiryCandidateCount(candidates []codexTailBurstExpiryCandidate, now time.Time, window time.Duration) int {
+	if len(candidates) == 0 || window <= 0 {
+		return 0
+	}
+	cutoff := now.Add(window)
+	return sort.Search(len(candidates), func(i int) bool {
+		return candidates[i].expiresAt.After(cutoff)
+	})
 }
 
 func hasCodexProvider(providers []string) bool {
@@ -387,35 +432,21 @@ func codexTailBurstRequestEligible(ctx context.Context, req cliproxyexecutor.Req
 	if requestPath := strings.ToLower(stringMetadataValue(opts.Metadata, cliproxyexecutor.RequestPathMetadataKey)); strings.Contains(requestPath, "/images/") {
 		return false
 	}
-	body := req.Payload
-	if len(body) == 0 {
-		body = opts.OriginalRequest
-	}
-	if !gjson.ValidBytes(body) {
-		return false
-	}
-	root := gjson.ParseBytes(body)
-	if root.Get("previous_response_id").Exists() || root.Get("tool_choice").Exists() {
-		return false
-	}
-	if tools := root.Get("tools"); tools.IsArray() && len(tools.Array()) > 0 {
-		return false
-	}
-	input := root.Get("input")
-	if !input.IsArray() {
-		return true
-	}
-	for _, item := range input.Array() {
-		switch item.Get("type").String() {
-		case "additional_tools", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output":
-			return false
-		}
-	}
+	// Existing tools, tool results and previous_response_id requests are safe to
+	// route unchanged. The old body-shape gate excluded most real Codex traffic,
+	// which made the switch appear enabled while requests stayed on the normal
+	// scheduler. Tool injection remains independently conditional and does not
+	// alter requests that already carry declarations.
+	_ = req
 	return true
 }
 
 func (m *Manager) withCodexTailBurstRequestMetadata(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Options {
-	if m == nil || !hasCodexProvider(providers) || !m.codexTailBurstSettings().enabled {
+	if m == nil || !hasCodexProvider(providers) {
+		return opts
+	}
+	settings := m.codexTailBurstSettings()
+	if !settings.enabled {
 		return opts
 	}
 	// Avoid parsing every request body when no credential is in its final quota
@@ -423,7 +454,8 @@ func (m *Manager) withCodexTailBurstRequestMetadata(ctx context.Context, provide
 	// so this is a lock-free constant-time fast path for normal traffic.
 	index, _ := m.codexTailBurstCandidates.Load().(codexTailBurstCandidateIndex)
 	model := normalizeCodexTailBurstModel(authSelectionModelFromOptions(opts, req.Model))
-	if len(index[model]) == 0 && (model == "*" || len(index["*"]) == 0) {
+	expiryCandidates, _ := m.codexTailBurstExpiryCandidates.Load().([]codexTailBurstExpiryCandidate)
+	if len(index[model]) == 0 && (model == "*" || len(index["*"]) == 0) && activeCodexTailBurstExpiryCandidateCount(expiryCandidates, time.Now(), settings.expiryWindow) == 0 {
 		return opts
 	}
 	if !codexTailBurstRequestEligible(ctx, req, opts) {
@@ -446,6 +478,33 @@ func codexTailBurstRequested(opts cliproxyexecutor.Options) bool {
 	return requested
 }
 
+func withCodexTailBurstFallback(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	metadata := cloneSchedulerAnyMap(opts.Metadata)
+	if metadata == nil {
+		metadata = make(map[string]any, 1)
+	}
+	metadata[codexTailBurstFallbackMetadataKey] = true
+	opts.Metadata = metadata
+	return opts
+}
+
+func codexTailBurstFallbackRequested(opts cliproxyexecutor.Options) bool {
+	if len(opts.Metadata) == 0 {
+		return false
+	}
+	requested, _ := opts.Metadata[codexTailBurstFallbackMetadataKey].(bool)
+	return requested
+}
+
+func codexTailBurstFallbackRetryBudget(configured int, opts cliproxyexecutor.Options) int {
+	if !codexTailBurstRequested(opts) || configured <= 0 || configured >= 2 {
+		return configured
+	}
+	// A burst credential consumes the first attempt. Always preserve one extra
+	// credential attempt so its failure can be hidden by a healthy fallback.
+	return 2
+}
+
 func withCodexTailBurstSelected(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
 	metadata := cloneSchedulerAnyMap(opts.Metadata)
 	if metadata == nil {
@@ -460,19 +519,38 @@ func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts
 	if m == nil || m.HomeEnabled() || !codexTailBurstRequested(opts) || pinnedAuthIDFromMetadata(opts.Metadata) != "" || disallowFreeAuthFromMetadata(opts.Metadata) {
 		return nil, nil, false
 	}
+	settings := m.codexTailBurstSettings()
 	index, _ := m.codexTailBurstCandidates.Load().(codexTailBurstCandidateIndex)
-	if len(index) == 0 {
-		return nil, nil, false
-	}
 	key := normalizeCodexTailBurstModel(model)
-	candidates := index[key]
-	if len(candidates) == 0 && key != "*" {
-		candidates = index["*"]
+	candidateIDs := make([]string, 0, len(index[key])+len(index["*"]))
+	seen := make(map[string]struct{}, len(index[key])+len(index["*"]))
+	appendCandidate := func(authID string) {
+		if authID == "" {
+			return
+		}
+		if _, exists := seen[authID]; exists {
+			return
+		}
+		seen[authID] = struct{}{}
+		candidateIDs = append(candidateIDs, authID)
 	}
-	if len(candidates) == 0 {
+	expiryCandidates, _ := m.codexTailBurstExpiryCandidates.Load().([]codexTailBurstExpiryCandidate)
+	expiryCount := activeCodexTailBurstExpiryCandidateCount(expiryCandidates, time.Now(), settings.expiryWindow)
+	for i := 0; i < expiryCount; i++ {
+		appendCandidate(expiryCandidates[i].authID)
+	}
+	for _, authID := range index[key] {
+		appendCandidate(authID)
+	}
+	if key != "*" {
+		for _, authID := range index["*"] {
+			appendCandidate(authID)
+		}
+	}
+	if len(candidateIDs) == 0 {
 		return nil, nil, false
 	}
-	start := int(m.codexTailBurstSequence.Add(1)-1) % len(candidates)
+	start := int(m.codexTailBurstSequence.Add(1)-1) % len(candidateIDs)
 	now := time.Now()
 	registryRef := registry.GetGlobalRegistry()
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -481,8 +559,8 @@ func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts
 	if !okExecutor || executor == nil {
 		return nil, nil, false
 	}
-	for offset := 0; offset < len(candidates); offset++ {
-		authID := candidates[(start+offset)%len(candidates)]
+	for offset := 0; offset < len(candidateIDs); offset++ {
+		authID := candidateIDs[(start+offset)%len(candidateIDs)]
 		if _, alreadyTried := tried[authID]; alreadyTried {
 			continue
 		}
@@ -500,10 +578,123 @@ func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts
 		if auth == nil || auth.Disabled || !eligibility.allows(auth) || !m.authSupportsRouteModel(registryRef, auth, model) || !m.codexTailBurstActive(auth, model, now) {
 			continue
 		}
+		auth.tailBurstMaxConcurrency = settings.maxConcurrency
 		if blocked, _, _ := isAuthBlockedForModelWithTailBurst(auth, model, now, true); blocked {
 			continue
 		}
 		return auth.Clone(), executor, true
 	}
 	return nil, nil, false
+}
+
+type codexTailBurstHealthScore struct {
+	auth               *Auth
+	successRate        float64
+	recentSamples      int64
+	recentSuccesses    int64
+	currentConcurrency int
+	tailBurstActive    bool
+}
+
+func recentCodexHealthScore(auth *Auth, now time.Time) (successRate float64, samples, successes int64) {
+	const (
+		windowBuckets = 6
+		priorSuccess  = 8.0
+		priorFailure  = 2.0
+	)
+	if auth == nil {
+		return priorSuccess / (priorSuccess + priorFailure), 0, 0
+	}
+	currentBucketID := recentRequestBucketID(now)
+	weightedSuccess := 0.0
+	weightedFailure := 0.0
+	for age := 0; age < windowBuckets; age++ {
+		bucketID := currentBucketID - int64(age)
+		bucket := auth.recentRequests.buckets[recentRequestBucketIndex(bucketID)]
+		if bucket.bucketID != bucketID {
+			continue
+		}
+		weight := float64(windowBuckets - age)
+		weightedSuccess += float64(bucket.success) * weight
+		weightedFailure += float64(bucket.failed) * weight
+		successes += bucket.success
+		samples += bucket.success + bucket.failed
+	}
+	successRate = (weightedSuccess + priorSuccess) / (weightedSuccess + weightedFailure + priorSuccess + priorFailure)
+	return successRate, samples, successes
+}
+
+func (m *Manager) pickCodexTailBurstFallbackAuth(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, bool) {
+	if m == nil || m.HomeEnabled() || !codexTailBurstFallbackRequested(opts) || pinnedAuthIDFromMetadata(opts.Metadata) != "" || disallowFreeAuthFromMetadata(opts.Metadata) {
+		return nil, nil, false
+	}
+	executor, okExecutor := m.Executor("codex")
+	if !okExecutor || executor == nil {
+		return nil, nil, false
+	}
+
+	var candidates []*Auth
+	if m.newCandidateMode() && m.scheduler != nil {
+		candidates = m.scheduler.snapshotCandidates([]string{"codex"}, model)
+	} else {
+		m.mu.RLock()
+		candidates = make([]*Auth, 0, len(m.auths))
+		for _, auth := range m.auths {
+			if auth != nil && strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex") {
+				candidates = append(candidates, auth.Clone())
+			}
+		}
+		m.mu.RUnlock()
+	}
+
+	now := time.Now()
+	registryRef := registry.GetGlobalRegistry()
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	scores := make([]codexTailBurstHealthScore, 0, len(candidates))
+	for _, auth := range candidates {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !eligibility.allows(auth) {
+			continue
+		}
+		if _, alreadyTried := tried[auth.ID]; alreadyTried {
+			continue
+		}
+		if !m.authSupportsRouteModel(registryRef, auth, model) || authQuotaExceeded(auth, model) {
+			continue
+		}
+		if blocked, _, _ := isAuthBlockedForModel(auth, model, now); blocked {
+			continue
+		}
+		successRate, samples, successes := recentCodexHealthScore(auth, now)
+		scores = append(scores, codexTailBurstHealthScore{
+			auth:               auth,
+			successRate:        successRate,
+			recentSamples:      samples,
+			recentSuccesses:    successes,
+			currentConcurrency: auth.RuntimeLimitSnapshot(now).CurrentConcurrency,
+			tailBurstActive:    m.codexTailBurstActive(auth, model, now),
+		})
+	}
+	if len(scores) == 0 {
+		return nil, nil, false
+	}
+	sort.SliceStable(scores, func(i, j int) bool {
+		left, right := scores[i], scores[j]
+		if left.tailBurstActive != right.tailBurstActive {
+			return !left.tailBurstActive
+		}
+		if left.successRate != right.successRate {
+			return left.successRate > right.successRate
+		}
+		if left.recentSamples != right.recentSamples {
+			return left.recentSamples > right.recentSamples
+		}
+		if left.recentSuccesses != right.recentSuccesses {
+			return left.recentSuccesses > right.recentSuccesses
+		}
+		if left.currentConcurrency != right.currentConcurrency {
+			return left.currentConcurrency < right.currentConcurrency
+		}
+		return left.auth.ID < right.auth.ID
+	})
+	return scores[0].auth.Clone(), executor, true
 }
