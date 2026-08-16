@@ -248,6 +248,7 @@ func TestSessionAffinityTemporarilySpillsPastBusyExpiryCohort(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
 	bound := authWithSupplyLeaseExpiry("bound", now.Add(20*time.Minute), tokenExpiry)
+	bound.Metadata["max_concurrency"] = 2
 	next := authWithSupplyLeaseExpiry("next", now.Add(23*time.Minute), tokenExpiry)
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback:             &RoundRobinSelector{},
@@ -256,8 +257,9 @@ func TestSessionAffinityTemporarilySpillsPastBusyExpiryCohort(t *testing.T) {
 	})
 	defer selector.Stop()
 
-	releases := make([]func(), 0, authExpiryPriorityDefaultConcurrency)
-	for i := 0; i < authExpiryPriorityDefaultConcurrency; i++ {
+	const configuredConcurrency = 2
+	releases := make([]func(), 0, configuredConcurrency)
+	for i := 0; i < configuredConcurrency; i++ {
 		release, acquired, reason, _ := bound.acquireRuntimeSlotForModel(now, "gpt-5", false)
 		if !acquired {
 			t.Fatalf("bound slot %d not acquired: %s", i+1, reason)
@@ -351,11 +353,13 @@ func TestSchedulerSpillsToNextSupplierCohortAfterBaseLimit(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
 	oldest := authWithSupplyLeaseExpiry("oldest", now.Add(20*time.Minute), tokenExpiry)
+	oldest.Metadata["max_concurrency"] = 2
 	next := authWithSupplyLeaseExpiry("next", now.Add(23*time.Minute), tokenExpiry)
 	scheduler := newSchedulerForTest(&RoundRobinSelector{}, next, oldest)
 
-	releases := make([]func(), 0, authExpiryPriorityDefaultConcurrency)
-	for i := 0; i < authExpiryPriorityDefaultConcurrency; i++ {
+	const configuredConcurrency = 2
+	releases := make([]func(), 0, configuredConcurrency)
+	for i := 0; i < configuredConcurrency; i++ {
 		release, acquired, reason, _ := oldest.acquireRuntimeSlotForModel(now, "", false)
 		if !acquired {
 			t.Fatalf("oldest slot %d not acquired: %s", i+1, reason)
@@ -514,17 +518,18 @@ func TestExpiryDrainConcurrencyBoostIsBoundedAndModelAware(t *testing.T) {
 	}
 }
 
-func TestExpiryPriorityDefaultConcurrencySpillsIntoNextCohort(t *testing.T) {
+func TestExpiryPriorityUnconfiguredConcurrencyRemainsUnlimited(t *testing.T) {
 	now := time.Now().UTC()
 	tokenExpiry := now.Add(10 * 24 * time.Hour)
 	oldest := authWithSupplyLeaseExpiry("oldest", now.Add(20*time.Minute), tokenExpiry)
 	next := authWithSupplyLeaseExpiry("next", now.Add(23*time.Minute), tokenExpiry)
 
-	if got := oldest.runtimeLimitConfigForModel("gpt-5", now).maxConcurrency; got != authExpiryPriorityDefaultConcurrency {
-		t.Fatalf("oldest default max concurrency = %d, want %d", got, authExpiryPriorityDefaultConcurrency)
+	if got := oldest.runtimeLimitConfigForModel("gpt-5", now).maxConcurrency; got != 0 {
+		t.Fatalf("oldest unconfigured max concurrency = %d, want 0", got)
 	}
-	releases := make([]func(), 0, authExpiryPriorityDefaultConcurrency)
-	for i := 0; i < authExpiryPriorityDefaultConcurrency; i++ {
+	const concurrentRequests = 16
+	releases := make([]func(), 0, concurrentRequests)
+	for i := 0; i < concurrentRequests; i++ {
 		release, acquired, reason, _ := oldest.acquireRuntimeSlotForModel(now, "gpt-5", false)
 		if !acquired {
 			t.Fatalf("oldest slot %d not acquired: %s", i+1, reason)
@@ -536,21 +541,17 @@ func TestExpiryPriorityDefaultConcurrencySpillsIntoNextCohort(t *testing.T) {
 			release()
 		}
 	}()
-	if _, acquired, reason, _ := oldest.acquireRuntimeSlotForModel(now, "gpt-5", false); acquired || reason != "concurrency_limit" {
-		t.Fatalf("oldest overflow acquired=%t reason=%q, want false/concurrency_limit", acquired, reason)
-	}
-
 	selector := &RoundRobinSelector{}
 	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", cliproxyexecutor.Options{}, []*Auth{oldest, next})
 	if errPick != nil {
-		t.Fatalf("next-cohort pick: %v", errPick)
+		t.Fatalf("unlimited oldest-cohort pick: %v", errPick)
 	}
-	if got == nil || got.ID != next.ID {
-		t.Fatalf("next-cohort pick = %v, want %s", got, next.ID)
+	if got == nil || got.ID != oldest.ID {
+		t.Fatalf("unlimited oldest-cohort pick = %v, want %s", got, oldest.ID)
 	}
 }
 
-func TestExpiryPriorityDefaultConcurrencyKeepsFarUnconfiguredAuthUnlimited(t *testing.T) {
+func TestExpiryPriorityKeepsFarUnconfiguredAuthUnlimited(t *testing.T) {
 	now := time.Now().UTC()
 	far := authWithExpiry("far", now.Add(48*time.Hour))
 	if got := far.runtimeLimitConfigForModel("gpt-5", now).maxConcurrency; got != 0 {
@@ -558,16 +559,15 @@ func TestExpiryPriorityDefaultConcurrencyKeepsFarUnconfiguredAuthUnlimited(t *te
 	}
 }
 
-func TestExpiryDrainDefaultConcurrencyUsesRemainingQuota(t *testing.T) {
+func TestExpiryDrainKeepsUnconfiguredConcurrencyUnlimited(t *testing.T) {
 	now := time.Now().UTC()
 	for _, tc := range []struct {
 		name      string
 		usedRatio float64
-		want      int
 	}{
-		{name: "large remainder", usedRatio: 0.20, want: authExpiryDrainUrgentConcurrency},
-		{name: "medium remainder", usedRatio: 0.60, want: authExpiryDrainNormalConcurrency},
-		{name: "small remainder", usedRatio: 0.90, want: authExpiryDrainMinConcurrency},
+		{name: "large remainder", usedRatio: 0.20},
+		{name: "medium remainder", usedRatio: 0.60},
+		{name: "small remainder", usedRatio: 0.90},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			auth := authWithExpiry("drain", now.Add(4*time.Minute))
@@ -578,10 +578,34 @@ func TestExpiryDrainDefaultConcurrencyUsesRemainingQuota(t *testing.T) {
 					ExpiresAt: now.Add(time.Minute),
 				},
 			})
-			if got := auth.runtimeLimitConfigForModel("gpt-5", now).maxConcurrency; got != tc.want {
-				t.Fatalf("drain max concurrency = %d, want %d", got, tc.want)
+			if got := auth.runtimeLimitConfigForModel("gpt-5", now).maxConcurrency; got != 0 {
+				t.Fatalf("unconfigured drain max concurrency = %d, want 0", got)
 			}
 		})
+	}
+}
+
+func TestExpiryTailBurstUsesConfiguredConcurrencyWithoutDefaultEightCap(t *testing.T) {
+	now := time.Now().UTC()
+	auth := authWithSupplyLeaseExpiry("tail-32", now.Add(8*time.Minute), now.Add(10*24*time.Hour))
+	auth.tailBurstMaxConcurrency = 32
+
+	releases := make([]func(), 0, 32)
+	for i := 0; i < 32; i++ {
+		release, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", true)
+		if !acquired {
+			t.Fatalf("tail burst slot %d not acquired: %s", i+1, reason)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+
+	if _, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", true); acquired || reason != "tail_burst_concurrency_limit" {
+		t.Fatalf("tail burst slot 33 acquired=%t reason=%q, want false/tail_burst_concurrency_limit", acquired, reason)
 	}
 }
 

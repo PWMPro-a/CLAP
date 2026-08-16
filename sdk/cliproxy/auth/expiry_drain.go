@@ -21,11 +21,6 @@ const (
 	// authExpiryDrainWindow is the final window in which an account may use a
 	// bounded concurrency boost to consume remaining quota before expiry.
 	authExpiryDrainWindow = 5 * time.Minute
-	// authExpiryPriorityDefaultConcurrency prevents an unconfigured near-expiry
-	// account from absorbing the whole request stream. Once the oldest cohort is
-	// full, normal availability filtering lets requests spill into the next
-	// expiry cohort instead of provoking upstream rate limits on one account.
-	authExpiryPriorityDefaultConcurrency = 8
 	// The final drain ceiling is selected from the remaining quota. Accounts
 	// with substantial unused quota may fan out further, while mostly-consumed
 	// accounts stay at the normal near-expiry limit to avoid needless 429s.
@@ -163,14 +158,15 @@ func expiryPriorityAuths(auths []*Auth, now time.Time) []*Auth {
 }
 
 func expiryPriorityConcurrencyLimit(auth *Auth, model string, now time.Time, configured int) int {
-	if configured < 0 {
-		configured = 0
+	// Near-expiry priority is a routing decision, not an implicit account cap.
+	// An unconfigured credential keeps its normal unlimited concurrency so the
+	// final expiry window can consume all available demand. Explicit account
+	// limits remain authoritative and may receive the bounded final-drain boost.
+	if configured <= 0 {
+		return 0
 	}
 	if _, ok := authExpiryRemaining(auth, now); !ok {
 		return configured
-	}
-	if configured == 0 {
-		configured = authExpiryPriorityDefaultConcurrency
 	}
 	return expiryDrainConcurrencyLimit(auth, model, now, configured)
 }
