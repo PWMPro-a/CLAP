@@ -13,10 +13,11 @@ import (
 )
 
 const (
-	defaultCodexTailBurstRemainingRatio = 0.02
-	defaultCodexTailBurstSnapshotTTL    = 90 * time.Second
-	defaultCodexTailBurstExpiryWindow   = 10 * time.Minute
-	defaultCodexTailBurstConcurrency    = 32
+	defaultCodexTailBurstRemainingRatio    = 0.02
+	defaultCodexTailBurstSnapshotTTL       = 90 * time.Second
+	defaultCodexTailBurstExpiryWindow      = 10 * time.Minute
+	defaultCodexTailBurstNormalConcurrency = 8
+	defaultCodexTailBurstConcurrency       = 32
 
 	codexTailBurstRequestedMetadataKey = "__cliproxy_codex_tail_burst_requested"
 	codexTailBurstFallbackMetadataKey  = "__cliproxy_codex_tail_burst_fallback"
@@ -53,19 +54,21 @@ type codexTailBurstExpiryCandidate struct {
 }
 
 type codexTailBurstSettings struct {
-	enabled        bool
-	triggerRatio   float64
-	snapshotTTL    time.Duration
-	expiryWindow   time.Duration
-	maxConcurrency int
+	enabled              bool
+	triggerRatio         float64
+	snapshotTTL          time.Duration
+	expiryWindow         time.Duration
+	normalMaxConcurrency int
+	maxConcurrency       int
 }
 
 func (m *Manager) codexTailBurstSettings() codexTailBurstSettings {
 	settings := codexTailBurstSettings{
-		triggerRatio:   1 - defaultCodexTailBurstRemainingRatio,
-		snapshotTTL:    defaultCodexTailBurstSnapshotTTL,
-		expiryWindow:   defaultCodexTailBurstExpiryWindow,
-		maxConcurrency: defaultCodexTailBurstConcurrency,
+		triggerRatio:         1 - defaultCodexTailBurstRemainingRatio,
+		snapshotTTL:          defaultCodexTailBurstSnapshotTTL,
+		expiryWindow:         defaultCodexTailBurstExpiryWindow,
+		normalMaxConcurrency: defaultCodexTailBurstNormalConcurrency,
+		maxConcurrency:       defaultCodexTailBurstConcurrency,
 	}
 	if m == nil {
 		return settings
@@ -88,6 +91,9 @@ func (m *Manager) codexTailBurstSettings() codexTailBurstSettings {
 	}
 	if parsed, errParse := time.ParseDuration(strings.TrimSpace(tailCfg.ExpiryWindow)); errParse == nil && parsed > 0 {
 		settings.expiryWindow = parsed
+	}
+	if tailCfg.NormalMaxConcurrency > 0 {
+		settings.normalMaxConcurrency = tailCfg.NormalMaxConcurrency
 	}
 	if tailCfg.MaxConcurrency > 0 {
 		settings.maxConcurrency = tailCfg.MaxConcurrency
@@ -373,25 +379,35 @@ func (m *Manager) refreshCodexTailBurstCandidates() {
 	settings := m.codexTailBurstSettings()
 	index := make(codexTailBurstCandidateIndex)
 	expiryCandidates := make([]codexTailBurstExpiryCandidate, 0)
-	if settings.enabled {
-		now := time.Now()
-		m.mu.RLock()
-		for _, auth := range m.auths {
-			if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex") || !codexTailBurstEnabledForAuth(auth) {
+	now := time.Now()
+	m.mu.RLock()
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		isCodex := strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex")
+		authTailBurstEnabled := isCodex && codexTailBurstEnabledForAuth(auth)
+		normalLimit := 0
+		if settings.enabled && authTailBurstEnabled {
+			normalLimit = settings.normalMaxConcurrency
+		}
+		auth.setCodexTailBurstNormalMaxConcurrency(normalLimit)
+		if !settings.enabled || !authTailBurstEnabled || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if expiresAt, okExpiry := authSupplyLeaseExpirationTime(auth); okExpiry {
+			expiryCandidates = append(expiryCandidates, codexTailBurstExpiryCandidate{authID: auth.ID, expiresAt: expiresAt})
+		}
+		for model, snapshot := range auth.codexQuotaSnapshots(now) {
+			if snapshot.UsedRatio < settings.triggerRatio || authQuotaExceeded(auth, model) {
 				continue
 			}
-			if expiresAt, okExpiry := authSupplyLeaseExpirationTime(auth); okExpiry {
-				expiryCandidates = append(expiryCandidates, codexTailBurstExpiryCandidate{authID: auth.ID, expiresAt: expiresAt})
-			}
-			for model, snapshot := range auth.codexQuotaSnapshots(now) {
-				if snapshot.UsedRatio < settings.triggerRatio || authQuotaExceeded(auth, model) {
-					continue
-				}
-				key := normalizeCodexTailBurstModel(model)
-				index[key] = append(index[key], auth.ID)
-			}
+			key := normalizeCodexTailBurstModel(model)
+			index[key] = append(index[key], auth.ID)
 		}
-		m.mu.RUnlock()
+	}
+	m.mu.RUnlock()
+	if settings.enabled {
 		for key := range index {
 			sort.Strings(index[key])
 		}

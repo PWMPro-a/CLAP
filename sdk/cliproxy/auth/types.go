@@ -111,6 +111,11 @@ type Auth struct {
 	// Codex tail-burst routing. It lets the runtime limiter apply the configured
 	// burst ceiling without persisting global configuration into auth metadata.
 	tailBurstMaxConcurrency int `json:"-"`
+
+	// tailBurstNormalConcurrencyAffinityBypass is set only on a request-local
+	// clone selected from an established affinity binding. It bypasses the new
+	// normal-operation cap without bypassing the credential's own hard limit.
+	tailBurstNormalConcurrencyAffinityBypass bool `json:"-"`
 }
 
 // RuntimeAuthView is a minimal read-only projection for callers that only need

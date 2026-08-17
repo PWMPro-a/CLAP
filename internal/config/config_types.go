@@ -197,6 +197,7 @@ type CodexTailBurstConfig struct {
 	TriggerRemainingRatio float64                            `yaml:"trigger-remaining-ratio" json:"trigger-remaining-ratio"`
 	SnapshotTTL           string                             `yaml:"snapshot-ttl" json:"snapshot-ttl"`
 	ExpiryWindow          string                             `yaml:"expiry-window" json:"expiry-window"`
+	NormalMaxConcurrency  int                                `yaml:"normal-max-concurrency" json:"normal-max-concurrency"`
 	MaxConcurrency        int                                `yaml:"max-concurrency" json:"max-concurrency"`
 	QuotaCollector        CodexTailBurstQuotaCollectorConfig `yaml:"quota-collector" json:"quota-collector"`
 	ToolInjection         CodexTailBurstToolInjectionConfig  `yaml:"tool-injection" json:"tool-injection"`

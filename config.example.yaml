@@ -318,6 +318,10 @@ codex:
     # Supplier-leased credentials enter the burst lane during their final 10m.
     # A passed supplier timestamp stays urgent until upstream health rejects it.
     expiry-window: "10m"
+    # Per-credential ceiling for cold/new scheduling during normal operation.
+    # Existing affinity bindings bypass this soft ceiling, while credential hard
+    # limits remain. The burst lane uses max-concurrency below instead.
+    normal-max-concurrency: 8
     # Per-credential request ceiling while the burst lane is active. An auth's
     # explicitly configured higher max_concurrency value is still preserved.
     max-concurrency: 32

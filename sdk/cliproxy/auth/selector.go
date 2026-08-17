@@ -692,6 +692,37 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	}
 }
 
+// affinityBoundAuthWithNormalConcurrencyBypass keeps an established warm
+// binding on its credential when only the tail-burst normal-operation cap is
+// saturated. Credential hard limits and every other availability gate remain.
+func affinityBoundAuthWithNormalConcurrencyBypass(auths, available []*Auth, provider, model, authID string, now time.Time) *Auth {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil
+	}
+	for _, auth := range available {
+		if auth == nil || auth.ID != authID {
+			continue
+		}
+		candidate := auth.Clone()
+		candidate.tailBurstNormalConcurrencyAffinityBypass = true
+		return candidate
+	}
+	for _, auth := range auths {
+		if auth == nil || auth.ID != authID {
+			continue
+		}
+		candidate := auth.Clone()
+		candidate.tailBurstNormalConcurrencyAffinityBypass = true
+		bypassAvailable, errAvailable := getAvailableAuthsAcrossPriorities([]*Auth{candidate}, provider, model, now)
+		if errAvailable != nil || len(bypassAvailable) == 0 {
+			return nil
+		}
+		return bypassAvailable[0]
+	}
+	return nil
+}
+
 // Pick selects an auth with session affinity when possible.
 // Explicit Claude Code, Codex, OpenCode, pi, and request-body session signals
 // precede execution metadata, stable derived identity, and the legacy hash fallback.
@@ -722,21 +753,33 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	}
 
-	// A single availability pass serves both lookups: the bound credential is validated against
-	// every priority tier, while the fallback selector keeps seeing only the highest tier.
-	available, err := getAvailableAuthsAcrossPriorities(availabilityCandidates, provider, model, now)
-	if err != nil {
-		return nil, err
-	}
-	fallbackAvailable := s.cacheAffinityNewSessionAuths(available, model, now)
-	fallbackAuths := highestPriorityAuths(fallbackAvailable)
-	fallbackAuths = expiryPriorityAuths(fallbackAuths, now)
-
 	cacheKey := sessionAffinityCacheKey(provider, primaryID, model)
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = sessionAffinityCacheKey(provider, fallbackID, model)
 	}
+	cachedAuthID, primaryCacheHit := s.cache.GetAndRefresh(cacheKey)
+	fallbackCachedAuthID, fallbackCacheHit := "", false
+	if !primaryCacheHit && fallbackKey != "" {
+		fallbackCachedAuthID, fallbackCacheHit = s.cache.GetAndRefresh(fallbackKey)
+	}
+	warmAuthID := cachedAuthID
+	if !primaryCacheHit && fallbackCacheHit {
+		warmAuthID = fallbackCachedAuthID
+	}
+
+	// Cold/new bindings obey the normal-operation cap. A valid warm binding is
+	// checked separately with only that soft cap bypassed, so it can keep its
+	// credential even when every account is at the cold-request ceiling.
+	available, errAvailable := getAvailableAuthsAcrossPriorities(availabilityCandidates, provider, model, now)
+	boundAuth := affinityBoundAuthWithNormalConcurrencyBypass(availabilityCandidates, available, provider, model, warmAuthID, now)
+	if errAvailable != nil && boundAuth == nil {
+		return nil, errAvailable
+	}
+	fallbackAvailable := s.cacheAffinityNewSessionAuths(available, model, now)
+	fallbackAuths := highestPriorityAuths(fallbackAvailable)
+	fallbackAuths = expiryPriorityAuths(fallbackAuths, now)
+
 	bind := func(authID string) {
 		if fallbackKey != "" {
 			s.cache.SetAliases(authID, cacheKey, fallbackKey)
@@ -764,17 +807,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				if s.cacheAffinityHardStopped(auth, model, now) {
-					break
-				}
-				if auth.consumeStickyBypass(cacheKey, now) {
-					s.cache.Invalidate(cacheKey)
-					clearFailover()
-					break
-				}
+	if primaryCacheHit {
+		if auth := boundAuth; auth != nil && auth.ID == cachedAuthID {
+			hardStopped := s.cacheAffinityHardStopped(auth, model, now)
+			stickyBypass := false
+			if !hardStopped {
+				stickyBypass = auth.consumeStickyBypass(cacheKey, now)
+			}
+			if !hardStopped && !stickyBypass {
 				if s.expiryDrainIgnoreAffinity {
 					drainAuths := expiryDrainFailoverAuths(fallbackAuths, auth, model, now)
 					if len(drainAuths) > 0 {
@@ -811,6 +851,10 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
+			}
+			if stickyBypass {
+				s.cache.Invalidate(cacheKey)
+				clearFailover()
 			}
 		}
 		temporaryFailover := s.shouldUseTemporaryFailover(availabilityCandidates, cachedAuthID, model, now)
@@ -853,19 +897,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return auth, nil
 	}
 
-	if fallbackKey != "" {
-		if cachedAuthID, ok := s.cache.GetAndRefresh(fallbackKey); ok {
-			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					bind(auth.ID)
-					clearFailover()
-					if s.cacheAffinityEnabled {
-						cacheaffinity.RecordRouteHit()
-					}
-					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
-					return auth, nil
-				}
+	if fallbackCacheHit {
+		if auth := boundAuth; auth != nil && auth.ID == fallbackCachedAuthID {
+			bind(auth.ID)
+			clearFailover()
+			if s.cacheAffinityEnabled {
+				cacheaffinity.RecordRouteHit()
 			}
+			entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
+			return auth, nil
 		}
 	}
 

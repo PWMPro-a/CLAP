@@ -49,6 +49,10 @@ type authRuntimeLimits struct {
 	// codexQuotaSnapshots is replaced atomically by the asynchronous quota
 	// collector. Request-time reads remain lock-free.
 	codexQuotaSnapshots atomic.Value
+
+	// codexTailBurstNormalMaxConcurrency is updated on config/auth lifecycle
+	// events. It caps normal traffic while leaving the tail-burst lane independent.
+	codexTailBurstNormalMaxConcurrency atomic.Int64
 }
 
 type runtimeStickyBypassSessionContextKey struct{}
@@ -115,6 +119,33 @@ func (a *Auth) runtimeLimitConfigForModel(model string, now time.Time) runtimeLi
 	cfg := a.runtimeLimitConfig()
 	cfg.maxConcurrency = expiryPriorityConcurrencyLimit(a, model, now, cfg.maxConcurrency)
 	return cfg
+}
+
+func (a *Auth) setCodexTailBurstNormalMaxConcurrency(limit int) {
+	if a == nil {
+		return
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	a.ensureRuntimeLimits().codexTailBurstNormalMaxConcurrency.Store(int64(limit))
+}
+
+func codexTailBurstNormalConcurrencyLimit(state *authRuntimeLimits, configuredLimit int, affinityBypass bool) int {
+	if affinityBypass {
+		return configuredLimit
+	}
+	if state == nil {
+		return configuredLimit
+	}
+	normalLimit := int(state.codexTailBurstNormalMaxConcurrency.Load())
+	if normalLimit <= 0 {
+		return configuredLimit
+	}
+	if configuredLimit <= 0 || normalLimit < configuredLimit {
+		return normalLimit
+	}
+	return configuredLimit
 }
 
 type runtimeLimitConfig struct {
@@ -193,7 +224,8 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.
 		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
 	}
-	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
+	normalLimit := codexTailBurstNormalConcurrencyLimit(state, cfg.maxConcurrency, auth.tailBurstNormalConcurrencyAffinityBypass)
+	if !tailBurst && normalLimit > 0 && state.currentConcurrency >= normalLimit {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
 	}
@@ -313,7 +345,8 @@ func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst
 		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
 		return nil, false, "tail_burst_concurrency_limit", time.Time{}
 	}
-	if !tailBurst && cfg.maxConcurrency > 0 && state.currentConcurrency >= cfg.maxConcurrency {
+	normalLimit := codexTailBurstNormalConcurrencyLimit(state, cfg.maxConcurrency, a.tailBurstNormalConcurrencyAffinityBypass)
+	if !tailBurst && normalLimit > 0 && state.currentConcurrency >= normalLimit {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return nil, false, "concurrency_limit", time.Time{}
 	}

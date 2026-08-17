@@ -486,12 +486,10 @@ func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, pr
 	}
 
 	// The plugin scheduler should still see only the highest available priority tier.
-	priorityAuths, err = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
-	if err != nil {
-		return nil, nil, err
-	}
+	priorityAuths, _ = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
 	// Session affinity also needs the temporarily blocked bound credential so it can
-	// distinguish short overload/runtime misses from permanent rebinding events.
+	// distinguish short overload/runtime misses from permanent rebinding events. The
+	// selector performs the final warm-binding-aware availability check itself.
 	selectorAuths = m.cloneAuthsForSessionAffinitySelector(auths, routeModel)
 	return authSubsetByID(selectorAuths, priorityAuths), selectorAuths, nil
 }

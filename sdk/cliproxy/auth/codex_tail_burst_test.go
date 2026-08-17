@@ -33,6 +33,107 @@ func updateTailBurstSnapshot(t *testing.T, manager *Manager, authID string) {
 	}
 }
 
+func tailBurstAuthForTest(t *testing.T, manager *Manager, authID string) *Auth {
+	t.Helper()
+	manager.mu.RLock()
+	auth := manager.auths[authID]
+	if auth != nil {
+		auth = auth.Clone()
+	}
+	manager.mu.RUnlock()
+	if auth == nil {
+		t.Fatalf("auth %q was not found", authID)
+	}
+	return auth
+}
+
+func TestCodexTailBurstNormalConcurrencyCapIsIndependent(t *testing.T) {
+	now := time.Now().UTC()
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "normal-cap", Provider: "codex", Status: StatusActive},
+	)
+	cfg := newTailBurstConfig()
+	cfg.Codex.TailBurst.MaxConcurrency = 300
+	manager.SetConfig(cfg)
+
+	auth := tailBurstAuthForTest(t, manager, "normal-cap")
+	settings := manager.codexTailBurstSettings()
+	if settings.normalMaxConcurrency != 8 {
+		t.Fatalf("normal max concurrency = %d, want default 8", settings.normalMaxConcurrency)
+	}
+	auth.tailBurstMaxConcurrency = settings.maxConcurrency
+
+	releases := make([]func(), 0, 300)
+	for i := 0; i < 8; i++ {
+		release, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false)
+		if !acquired {
+			t.Fatalf("normal slot %d not acquired: %s", i+1, reason)
+		}
+		releases = append(releases, release)
+	}
+	if _, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false); acquired || reason != "concurrency_limit" {
+		t.Fatalf("normal slot 9 acquired=%t reason=%q, want false/concurrency_limit", acquired, reason)
+	}
+
+	for i := 8; i < 300; i++ {
+		release, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", true)
+		if !acquired {
+			t.Fatalf("tail-burst slot %d not acquired: %s", i+1, reason)
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
+
+	if _, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", true); acquired || reason != "tail_burst_concurrency_limit" {
+		t.Fatalf("tail-burst slot 301 acquired=%t reason=%q, want false/tail_burst_concurrency_limit", acquired, reason)
+	}
+}
+
+func TestCodexTailBurstNormalConcurrencyCapHotReloads(t *testing.T) {
+	now := time.Now().UTC()
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "hot-reload-cap", Provider: "codex", Status: StatusActive},
+	)
+	cfg := newTailBurstConfig()
+	cfg.Codex.TailBurst.NormalMaxConcurrency = 2
+	manager.SetConfig(cfg)
+	auth := tailBurstAuthForTest(t, manager, "hot-reload-cap")
+
+	firstRelease, firstAcquired, firstReason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false)
+	if !firstAcquired {
+		t.Fatalf("first normal slot not acquired: %s", firstReason)
+	}
+	defer firstRelease()
+	secondRelease, secondAcquired, secondReason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false)
+	if !secondAcquired {
+		t.Fatalf("second normal slot not acquired: %s", secondReason)
+	}
+	defer secondRelease()
+	if _, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false); acquired || reason != "concurrency_limit" {
+		t.Fatalf("third slot before reload acquired=%t reason=%q, want false/concurrency_limit", acquired, reason)
+	}
+
+	cfg.Codex.TailBurst.NormalMaxConcurrency = 3
+	manager.SetConfig(cfg)
+	thirdRelease, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false)
+	if !acquired {
+		t.Fatalf("third slot after reload not acquired: %s", reason)
+	}
+	defer thirdRelease()
+
+	cfg.Codex.TailBurst.Enabled = false
+	manager.SetConfig(cfg)
+	fourthRelease, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false)
+	if !acquired {
+		t.Fatalf("fourth slot after disabling tail burst not acquired: %s", reason)
+	}
+	defer fourthRelease()
+}
+
 func TestCodexTailBurstAllowsConfiguredConcurrentRequests(t *testing.T) {
 	executor := &runtimeLimitTestExecutor{
 		blockAuth: "tail-auth",
