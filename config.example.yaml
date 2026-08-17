@@ -296,8 +296,8 @@ codex:
     max-entries: 65536
     # Caps credential attempts for one logical Codex request when active.
     max-retry-credentials: 2
-    # Hard per-credential request ceiling. Warm affinity bypasses only the
-    # tail-burst soft cap and still obeys this limit.
+    # Per-credential cap for cold requests and new affinity bindings.
+    # Established warm bindings bypass it to preserve cache locality.
     max-concurrency: 8
     # Bounded hot websocket slots per auth/egress/model/session pool.
     websocket-pool-slots: 8

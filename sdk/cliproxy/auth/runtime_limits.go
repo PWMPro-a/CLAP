@@ -54,8 +54,8 @@ type authRuntimeLimits struct {
 	// events. It caps normal traffic while leaving the tail-burst lane independent.
 	codexTailBurstNormalMaxConcurrency atomic.Int64
 
-	// codexCacheAffinityMaxConcurrency is a hard credential ceiling. Unlike the
-	// tail-burst normal-operation cap, warm affinity bindings never bypass it.
+	// codexCacheAffinityMaxConcurrency caps cold requests and new affinity
+	// bindings. Established warm bindings bypass it to preserve cache locality.
 	codexCacheAffinityMaxConcurrency atomic.Int64
 }
 
@@ -121,17 +121,7 @@ func (a *Auth) runtimeLimitConfig() runtimeLimitConfig {
 
 func (a *Auth) runtimeLimitConfigForModel(model string, now time.Time) runtimeLimitConfig {
 	cfg := a.runtimeLimitConfig()
-	hardLimit := 0
-	if a != nil {
-		hardLimit = int(a.ensureRuntimeLimits().codexCacheAffinityMaxConcurrency.Load())
-		if hardLimit > 0 && (cfg.maxConcurrency <= 0 || hardLimit < cfg.maxConcurrency) {
-			cfg.maxConcurrency = hardLimit
-		}
-	}
 	cfg.maxConcurrency = expiryPriorityConcurrencyLimit(a, model, now, cfg.maxConcurrency)
-	if hardLimit > 0 && cfg.maxConcurrency > hardLimit {
-		cfg.maxConcurrency = hardLimit
-	}
 	return cfg
 }
 
@@ -155,19 +145,20 @@ func (a *Auth) setCodexTailBurstNormalMaxConcurrency(limit int) {
 	a.ensureRuntimeLimits().codexTailBurstNormalMaxConcurrency.Store(int64(limit))
 }
 
-func codexTailBurstNormalConcurrencyLimit(state *authRuntimeLimits, configuredLimit int, affinityBypass bool) int {
+func codexNormalConcurrencyLimit(state *authRuntimeLimits, configuredLimit int, affinityBypass bool) int {
 	if affinityBypass {
 		return configuredLimit
 	}
 	if state == nil {
 		return configuredLimit
 	}
-	normalLimit := int(state.codexTailBurstNormalMaxConcurrency.Load())
-	if normalLimit <= 0 {
-		return configuredLimit
-	}
-	if configuredLimit <= 0 || normalLimit < configuredLimit {
-		return normalLimit
+	for _, normalLimit := range []int{
+		int(state.codexTailBurstNormalMaxConcurrency.Load()),
+		int(state.codexCacheAffinityMaxConcurrency.Load()),
+	} {
+		if normalLimit > 0 && (configuredLimit <= 0 || normalLimit < configuredLimit) {
+			configuredLimit = normalLimit
+		}
 	}
 	return configuredLimit
 }
@@ -244,14 +235,11 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.
 	if drainLimit := expiryDrainConcurrencyLimit(auth, model, now, 1); drainLimit > tailBurstLimit {
 		tailBurstLimit = drainLimit
 	}
-	if hardLimit := int(state.codexCacheAffinityMaxConcurrency.Load()); hardLimit > 0 && tailBurstLimit > hardLimit {
-		tailBurstLimit = hardLimit
-	}
 	if tailBurst && state.currentConcurrency >= tailBurstLimit {
 		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
 	}
-	normalLimit := codexTailBurstNormalConcurrencyLimit(state, cfg.maxConcurrency, auth.tailBurstNormalConcurrencyAffinityBypass)
+	normalLimit := codexNormalConcurrencyLimit(state, cfg.maxConcurrency, auth.tailBurstNormalConcurrencyAffinityBypass)
 	if !tailBurst && normalLimit > 0 && state.currentConcurrency >= normalLimit {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
@@ -368,14 +356,11 @@ func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst
 	if drainLimit := expiryDrainConcurrencyLimit(a, model, now, 1); drainLimit > tailBurstLimit {
 		tailBurstLimit = drainLimit
 	}
-	if hardLimit := int(state.codexCacheAffinityMaxConcurrency.Load()); hardLimit > 0 && tailBurstLimit > hardLimit {
-		tailBurstLimit = hardLimit
-	}
 	if tailBurst && state.currentConcurrency >= tailBurstLimit {
 		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
 		return nil, false, "tail_burst_concurrency_limit", time.Time{}
 	}
-	normalLimit := codexTailBurstNormalConcurrencyLimit(state, cfg.maxConcurrency, a.tailBurstNormalConcurrencyAffinityBypass)
+	normalLimit := codexNormalConcurrencyLimit(state, cfg.maxConcurrency, a.tailBurstNormalConcurrencyAffinityBypass)
 	if !tailBurst && normalLimit > 0 && state.currentConcurrency >= normalLimit {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return nil, false, "concurrency_limit", time.Time{}

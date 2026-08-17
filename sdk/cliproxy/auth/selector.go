@@ -693,7 +693,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 }
 
 // affinityBoundAuthWithNormalConcurrencyBypass keeps an established warm
-// binding on its credential when only the tail-burst normal-operation cap is
+// binding on its credential when a cold/new-binding concurrency cap is
 // saturated. Credential hard limits and every other availability gate remain.
 func affinityBoundAuthWithNormalConcurrencyBypass(auths, available []*Auth, provider, model, authID string, now time.Time) *Auth {
 	authID = strings.TrimSpace(authID)

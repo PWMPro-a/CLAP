@@ -113,8 +113,8 @@ type Auth struct {
 	tailBurstMaxConcurrency int `json:"-"`
 
 	// tailBurstNormalConcurrencyAffinityBypass is set only on a request-local
-	// clone selected from an established affinity binding. It bypasses the new
-	// normal-operation cap without bypassing the credential's own hard limit.
+	// clone selected from an established affinity binding. It bypasses cold/new
+	// binding caps without bypassing the credential's own configured limits.
 	tailBurstNormalConcurrencyAffinityBypass bool `json:"-"`
 }
 

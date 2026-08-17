@@ -9,13 +9,13 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-func TestCacheAffinityHardConcurrencyCapsConcurrentFirstRequests(t *testing.T) {
+func TestCacheAffinityNewSessionConcurrencyCapsConcurrentFirstRequests(t *testing.T) {
 	const (
-		hardLimit = 8
-		requests  = 100
+		newSessionLimit = 8
+		requests        = 100
 	)
 	auth := &Auth{ID: "concurrent-first-requests", Provider: "codex", Status: StatusActive}
-	auth.setCodexCacheAffinityMaxConcurrency(hardLimit)
+	auth.setCodexCacheAffinityMaxConcurrency(newSessionLimit)
 	release := make(chan struct{})
 	results := make(chan bool, requests)
 	var wg sync.WaitGroup
@@ -39,11 +39,11 @@ func TestCacheAffinityHardConcurrencyCapsConcurrentFirstRequests(t *testing.T) {
 			acquired++
 		}
 	}
-	if acquired != hardLimit {
-		t.Fatalf("concurrent acquired slots = %d, want hard limit %d", acquired, hardLimit)
+	if acquired != newSessionLimit {
+		t.Fatalf("concurrent acquired slots = %d, want new-session limit %d", acquired, newSessionLimit)
 	}
-	if current := auth.RuntimeLimitSnapshot(time.Now()).CurrentConcurrency; current != hardLimit {
-		t.Fatalf("current concurrency = %d, want %d while requests are held", current, hardLimit)
+	if current := auth.RuntimeLimitSnapshot(time.Now()).CurrentConcurrency; current != newSessionLimit {
+		t.Fatalf("current concurrency = %d, want %d while requests are held", current, newSessionLimit)
 	}
 
 	close(release)
@@ -116,7 +116,7 @@ func TestSessionAffinityWarmBindingBypassesTailBurstNormalConcurrencyCap(t *test
 	}
 }
 
-func TestSessionAffinityWarmBindingObeysCacheAffinityHardConcurrencyCap(t *testing.T) {
+func TestSessionAffinityWarmBindingBypassesCacheAffinityNewSessionCap(t *testing.T) {
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback:             &RoundRobinSelector{},
 		TTL:                  time.Hour,
@@ -130,15 +130,67 @@ func TestSessionAffinityWarmBindingObeysCacheAffinityHardConcurrencyCap(t *testi
 
 	occupiedRelease, occupied, reason, _ := hot.acquireRuntimeSlotForModel(now, "gpt-5.6-sol", false)
 	if !occupied {
-		t.Fatalf("occupy hard slot: %s", reason)
+		t.Fatalf("occupy new-session slot: %s", reason)
 	}
 	defer occupiedRelease()
 
-	routeKey := "warm-hard-cap"
+	routeKey := "warm-soft-cap"
 	selector.cache.Set(sessionAffinityCacheKey("codex", "cache-affinity:"+routeKey, "gpt-5.6-sol"), hot.ID)
 	selected, errPick := selector.Pick(context.Background(), "codex", "gpt-5.6-sol", activeCacheAffinityOptions(routeKey), []*Auth{hot, cold})
-	if errPick != nil || selected == nil || selected.ID != cold.ID {
-		t.Fatalf("hard-cap pick = %v, %v; want cold", selected, errPick)
+	if errPick != nil || selected == nil || selected.ID != hot.ID {
+		t.Fatalf("warm soft-cap pick = %v, %v; want hot", selected, errPick)
+	}
+	warmRelease, acquired, reason, _ := selected.acquireRuntimeSlotForModel(now, "gpt-5.6-sol", false)
+	if !acquired {
+		t.Fatalf("warm affinity slot was blocked by new-session cap: %s", reason)
+	}
+	defer warmRelease()
+
+	newPick, errNew := selector.Pick(context.Background(), "codex", "gpt-5.6-sol", activeCacheAffinityOptions("cold-soft-cap"), []*Auth{hot, cold})
+	if errNew != nil || newPick == nil || newPick.ID != cold.ID {
+		t.Fatalf("cold soft-cap pick = %v, %v; want cold", newPick, errNew)
+	}
+}
+
+func TestManagerKeepsWarmAffinityAboveCacheAffinityNewSessionCap(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             &RoundRobinSelector{},
+		TTL:                  time.Hour,
+		CacheAffinityEnabled: true,
+	})
+	defer selector.Stop()
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "only-hot", Provider: "codex", Status: StatusActive},
+	)
+	manager.SetSelector(selector)
+	cfg := newTailBurstConfig()
+	cfg.Codex.TailBurst.Enabled = false
+	cfg.Codex.CacheAffinity.Enabled = true
+	cfg.Codex.CacheAffinity.MaxConcurrency = 1
+	manager.SetConfig(cfg)
+
+	hot := tailBurstAuthForTest(t, manager, "only-hot")
+	now := time.Now()
+	occupiedRelease, occupied, reason, _ := hot.acquireRuntimeSlotForModel(now, "gpt-5.6-sol", false)
+	if !occupied {
+		t.Fatalf("occupy new-session slot: %s", reason)
+	}
+	defer occupiedRelease()
+
+	opts := activeCacheAffinityOptions("manager-warm-soft-cap")
+	selector.cache.Set(sessionAffinityCacheKey("codex", "cache-affinity:manager-warm-soft-cap", ""), hot.ID)
+	selected, errSelect := manager.SelectAuth(context.Background(), "codex", "", opts)
+	if errSelect != nil || selected == nil || selected.ID != hot.ID {
+		t.Fatalf("manager warm selection = %v, %v; want only-hot", selected, errSelect)
+	}
+	warmRelease, acquired, reason, _ := selected.acquireRuntimeSlotForModel(now, "", false)
+	if !acquired {
+		t.Fatalf("manager warm affinity slot was blocked by new-session cap: %s", reason)
+	}
+	defer warmRelease()
+
+	if _, errCold := manager.SelectAuth(context.Background(), "codex", "", activeCacheAffinityOptions("manager-cold-soft-cap")); errCold == nil {
+		t.Fatal("cold manager selection exceeded the cache-affinity new-session cap")
 	}
 }
 
