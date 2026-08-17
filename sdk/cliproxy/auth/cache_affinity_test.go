@@ -2,11 +2,56 @@ package auth
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+func TestCacheAffinityHardConcurrencyCapsConcurrentFirstRequests(t *testing.T) {
+	const (
+		hardLimit = 8
+		requests  = 100
+	)
+	auth := &Auth{ID: "concurrent-first-requests", Provider: "codex", Status: StatusActive}
+	auth.setCodexCacheAffinityMaxConcurrency(hardLimit)
+	release := make(chan struct{})
+	results := make(chan bool, requests)
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			releaseSlot, acquired, _, _ := auth.acquireRuntimeSlotForModel(time.Now(), "gpt-5.6-sol", false)
+			results <- acquired
+			if !acquired {
+				return
+			}
+			<-release
+			releaseSlot()
+		}()
+	}
+
+	acquired := 0
+	for range requests {
+		if <-results {
+			acquired++
+		}
+	}
+	if acquired != hardLimit {
+		t.Fatalf("concurrent acquired slots = %d, want hard limit %d", acquired, hardLimit)
+	}
+	if current := auth.RuntimeLimitSnapshot(time.Now()).CurrentConcurrency; current != hardLimit {
+		t.Fatalf("current concurrency = %d, want %d while requests are held", current, hardLimit)
+	}
+
+	close(release)
+	wg.Wait()
+	if current := auth.RuntimeLimitSnapshot(time.Now()).CurrentConcurrency; current != 0 {
+		t.Fatalf("current concurrency after release = %d, want 0", current)
+	}
+}
 
 func TestSessionAffinityCacheCoordinatorPreemptsNewButKeepsWarmSession(t *testing.T) {
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
@@ -68,6 +113,32 @@ func TestSessionAffinityWarmBindingBypassesTailBurstNormalConcurrencyCap(t *test
 	newPick, errNew := selector.Pick(context.Background(), "codex", "gpt-5.6-sol", activeCacheAffinityOptions("cold-normal-cap"), []*Auth{hot, cold})
 	if errNew != nil || newPick == nil || newPick.ID != cold.ID {
 		t.Fatalf("cold pick = %v, %v; want cold", newPick, errNew)
+	}
+}
+
+func TestSessionAffinityWarmBindingObeysCacheAffinityHardConcurrencyCap(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             &RoundRobinSelector{},
+		TTL:                  time.Hour,
+		CacheAffinityEnabled: true,
+	})
+	defer selector.Stop()
+	now := time.Now()
+	hot := &Auth{ID: "hot", Provider: "codex", Status: StatusActive}
+	cold := &Auth{ID: "cold", Provider: "codex", Status: StatusActive}
+	hot.setCodexCacheAffinityMaxConcurrency(1)
+
+	occupiedRelease, occupied, reason, _ := hot.acquireRuntimeSlotForModel(now, "gpt-5.6-sol", false)
+	if !occupied {
+		t.Fatalf("occupy hard slot: %s", reason)
+	}
+	defer occupiedRelease()
+
+	routeKey := "warm-hard-cap"
+	selector.cache.Set(sessionAffinityCacheKey("codex", "cache-affinity:"+routeKey, "gpt-5.6-sol"), hot.ID)
+	selected, errPick := selector.Pick(context.Background(), "codex", "gpt-5.6-sol", activeCacheAffinityOptions(routeKey), []*Auth{hot, cold})
+	if errPick != nil || selected == nil || selected.ID != cold.ID {
+		t.Fatalf("hard-cap pick = %v, %v; want cold", selected, errPick)
 	}
 }
 

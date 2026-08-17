@@ -54,8 +54,9 @@ func (m *Manager) confirmCacheAffinityBinding(provider, model, authID string, me
 }
 
 type cacheAffinityRuntimeSettings struct {
-	active        bool
-	hardStopRatio float64
+	active         bool
+	hardStopRatio  float64
+	maxConcurrency int
 }
 
 func (m *Manager) cacheAffinitySettings() cacheAffinityRuntimeSettings {
@@ -65,8 +66,9 @@ func (m *Manager) cacheAffinitySettings() cacheAffinityRuntimeSettings {
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	settings := cacheaffinity.Settings(cfg)
 	return cacheAffinityRuntimeSettings{
-		active:        settings.Enabled && !settings.Shadow,
-		hardStopRatio: settings.QuotaHardStopUsedRatio,
+		active:         settings.Enabled && !settings.Shadow,
+		hardStopRatio:  settings.QuotaHardStopUsedRatio,
+		maxConcurrency: settings.MaxConcurrency,
 	}
 }
 

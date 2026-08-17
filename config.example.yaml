@@ -296,12 +296,15 @@ codex:
     max-entries: 65536
     # Caps credential attempts for one logical Codex request when active.
     max-retry-credentials: 2
+    # Hard per-credential request ceiling. Warm affinity bypasses only the
+    # tail-burst soft cap and still obeys this limit.
+    max-concurrency: 8
     # Bounded hot websocket slots per auth/egress/model/session pool.
     websocket-pool-slots: 8
     # Rebalance long-lived hot sessions after either bound is reached.
     # These local checks do not add network work to the SSE request path.
-    max-session-requests: 50
-    max-session-duration: "5m"
+    max-session-requests: 500
+    max-session-duration: "1h"
     # New sessions avoid credentials at or above this collected usage ratio.
     quota-preempt-used-ratio: 0.97
     # Existing warm sessions leave a credential at or above this ratio. Set

@@ -377,6 +377,7 @@ func (m *Manager) refreshCodexTailBurstCandidates() {
 		return
 	}
 	settings := m.codexTailBurstSettings()
+	cacheSettings := m.cacheAffinitySettings()
 	index := make(codexTailBurstCandidateIndex)
 	expiryCandidates := make([]codexTailBurstExpiryCandidate, 0)
 	now := time.Now()
@@ -386,6 +387,11 @@ func (m *Manager) refreshCodexTailBurstCandidates() {
 			continue
 		}
 		isCodex := strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex")
+		cacheAffinityLimit := 0
+		if isCodex && cacheSettings.active {
+			cacheAffinityLimit = cacheSettings.maxConcurrency
+		}
+		auth.setCodexCacheAffinityMaxConcurrency(cacheAffinityLimit)
 		authTailBurstEnabled := isCodex && codexTailBurstEnabledForAuth(auth)
 		normalLimit := 0
 		if settings.enabled && authTailBurstEnabled {

@@ -53,6 +53,10 @@ type authRuntimeLimits struct {
 	// codexTailBurstNormalMaxConcurrency is updated on config/auth lifecycle
 	// events. It caps normal traffic while leaving the tail-burst lane independent.
 	codexTailBurstNormalMaxConcurrency atomic.Int64
+
+	// codexCacheAffinityMaxConcurrency is a hard credential ceiling. Unlike the
+	// tail-burst normal-operation cap, warm affinity bindings never bypass it.
+	codexCacheAffinityMaxConcurrency atomic.Int64
 }
 
 type runtimeStickyBypassSessionContextKey struct{}
@@ -117,8 +121,28 @@ func (a *Auth) runtimeLimitConfig() runtimeLimitConfig {
 
 func (a *Auth) runtimeLimitConfigForModel(model string, now time.Time) runtimeLimitConfig {
 	cfg := a.runtimeLimitConfig()
+	hardLimit := 0
+	if a != nil {
+		hardLimit = int(a.ensureRuntimeLimits().codexCacheAffinityMaxConcurrency.Load())
+		if hardLimit > 0 && (cfg.maxConcurrency <= 0 || hardLimit < cfg.maxConcurrency) {
+			cfg.maxConcurrency = hardLimit
+		}
+	}
 	cfg.maxConcurrency = expiryPriorityConcurrencyLimit(a, model, now, cfg.maxConcurrency)
+	if hardLimit > 0 && cfg.maxConcurrency > hardLimit {
+		cfg.maxConcurrency = hardLimit
+	}
 	return cfg
+}
+
+func (a *Auth) setCodexCacheAffinityMaxConcurrency(limit int) {
+	if a == nil {
+		return
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	a.ensureRuntimeLimits().codexCacheAffinityMaxConcurrency.Store(int64(limit))
 }
 
 func (a *Auth) setCodexTailBurstNormalMaxConcurrency(limit int) {
@@ -219,6 +243,9 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.
 	}
 	if drainLimit := expiryDrainConcurrencyLimit(auth, model, now, 1); drainLimit > tailBurstLimit {
 		tailBurstLimit = drainLimit
+	}
+	if hardLimit := int(state.codexCacheAffinityMaxConcurrency.Load()); hardLimit > 0 && tailBurstLimit > hardLimit {
+		tailBurstLimit = hardLimit
 	}
 	if tailBurst && state.currentConcurrency >= tailBurstLimit {
 		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
@@ -340,6 +367,9 @@ func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst
 	}
 	if drainLimit := expiryDrainConcurrencyLimit(a, model, now, 1); drainLimit > tailBurstLimit {
 		tailBurstLimit = drainLimit
+	}
+	if hardLimit := int(state.codexCacheAffinityMaxConcurrency.Load()); hardLimit > 0 && tailBurstLimit > hardLimit {
+		tailBurstLimit = hardLimit
 	}
 	if tailBurst && state.currentConcurrency >= tailBurstLimit {
 		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)

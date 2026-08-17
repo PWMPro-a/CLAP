@@ -14,8 +14,9 @@ import (
 
 func TestCacheAffinityUsageLimitFreezeStopsConcurrentReselection(t *testing.T) {
 	const (
-		provider = "codex"
-		model    = "gpt-5.6-sol"
+		provider    = "codex"
+		model       = "gpt-5.6-sol"
+		concurrency = 64
 	)
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback:             &RoundRobinSelector{},
@@ -29,6 +30,7 @@ func TestCacheAffinityUsageLimitFreezeStopsConcurrentReselection(t *testing.T) {
 		CacheAffinity: internalconfig.CodexCacheAffinityConfig{
 			Enabled:             true,
 			MaxRetryCredentials: 2,
+			MaxConcurrency:      concurrency + 1,
 		},
 	}})
 
@@ -59,7 +61,6 @@ func TestCacheAffinityUsageLimitFreezeStopsConcurrentReselection(t *testing.T) {
 		t.Fatalf("available calls after priming = %d, want 1", got)
 	}
 
-	const concurrency = 64
 	var wg sync.WaitGroup
 	errCh := make(chan error, concurrency)
 	for i := 0; i < concurrency; i++ {

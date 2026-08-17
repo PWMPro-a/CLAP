@@ -22,8 +22,9 @@ import (
 
 const (
 	defaultMaxEntries         = 65536
-	defaultMaxSessionRequests = 50
-	defaultMaxSessionDuration = 5 * time.Minute
+	defaultMaxSessionRequests = 500
+	defaultMaxSessionDuration = time.Hour
+	defaultMaxConcurrency     = 8
 	shardCount                = 64
 	prefixInspectInterval     = 5 * time.Second
 )
@@ -181,6 +182,7 @@ type RuntimeSettings struct {
 	ExpiryDrainIgnoreAffinity bool          `json:"expiry_drain_ignore_affinity"`
 	MaxEntries                int           `json:"max_entries"`
 	MaxRetryCredentials       int           `json:"max_retry_credentials"`
+	MaxConcurrency            int           `json:"max_concurrency"`
 	WebsocketPoolSlots        int           `json:"websocket_pool_slots"`
 	MaxSessionRequests        int           `json:"max_session_requests"`
 	MaxSessionDuration        time.Duration `json:"max_session_duration"`
@@ -200,6 +202,7 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 		ExpiryDrainIgnoreAffinity: raw.ExpiryDrainIgnoreAffinity,
 		MaxEntries:                raw.MaxEntries,
 		MaxRetryCredentials:       raw.MaxRetryCredentials,
+		MaxConcurrency:            raw.MaxConcurrency,
 		WebsocketPoolSlots:        raw.WebsocketPoolSlots,
 		MaxSessionRequests:        raw.MaxSessionRequests,
 		QuotaPreemptUsedRatio:     raw.QuotaPreemptUsedRatio,
@@ -210,6 +213,9 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 	}
 	if settings.MaxRetryCredentials <= 0 {
 		settings.MaxRetryCredentials = 2
+	}
+	if settings.MaxConcurrency <= 0 {
+		settings.MaxConcurrency = defaultMaxConcurrency
 	}
 	if settings.WebsocketPoolSlots <= 0 {
 		settings.WebsocketPoolSlots = 8
