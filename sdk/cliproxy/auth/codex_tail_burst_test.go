@@ -47,6 +47,145 @@ func tailBurstAuthForTest(t *testing.T, manager *Manager, authID string) *Auth {
 	return auth
 }
 
+func tailBurstAffinityOptions(routeKey string) cliproxyexecutor.Options {
+	opts := activeCacheAffinityOptions(routeKey)
+	opts.Metadata[codexTailBurstRequestedMetadataKey] = true
+	return opts
+}
+
+func configureTailBurstAffinityManager(manager *Manager) (*SessionAffinitySelector, *internalconfig.Config) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:             &RoundRobinSelector{},
+		TTL:                  time.Hour,
+		CacheAffinityEnabled: true,
+	})
+	manager.SetSelector(selector)
+	cfg := newTailBurstConfig()
+	cfg.Codex.CacheAffinity = internalconfig.CodexCacheAffinityConfig{
+		Enabled:        true,
+		MaxConcurrency: 8,
+	}
+	manager.SetConfig(cfg)
+	return selector, cfg
+}
+
+func TestCodexTailBurstMigratesNormalWarmBindingIntoTailPool(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "warm-auth", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "tail-auth", Provider: "codex", Status: StatusActive},
+	)
+	selector, _ := configureTailBurstAffinityManager(manager)
+	defer selector.Stop()
+	updateTailBurstSnapshot(t, manager, "tail-auth")
+
+	warmOpts := tailBurstAffinityOptions("warm-route")
+	selector.BindAuthSession("codex", "", "cache-affinity:warm-route", "warm-auth")
+	warm, errWarm := manager.SelectAuth(context.Background(), "codex", "", warmOpts)
+	if errWarm != nil || warm == nil || warm.ID != "tail-auth" {
+		t.Fatalf("normal warm binding tail-burst selection = %v, %v; want tail-auth", warm, errWarm)
+	}
+
+	cold, errCold := manager.SelectAuth(context.Background(), "codex", "", tailBurstAffinityOptions("cold-route"))
+	if errCold != nil || cold == nil || cold.ID != "tail-auth" {
+		t.Fatalf("cold tail-burst selection = %v, %v; want tail-auth", cold, errCold)
+	}
+}
+
+func TestCodexTailBurstWarmTailCredentialKeepsBindingAndBurstCapacity(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "warm-tail", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"max_concurrency": 1}},
+		&Auth{ID: "other-tail", Provider: "codex", Status: StatusActive},
+	)
+	selector, cfg := configureTailBurstAffinityManager(manager)
+	defer selector.Stop()
+	cfg.Codex.TailBurst.MaxConcurrency = 300
+	manager.SetConfig(cfg)
+	for _, authID := range []string{"warm-tail", "other-tail"} {
+		if _, accepted, errUpdate := manager.UpdateCodexQuotaSnapshot(authID, "", CodexQuotaSnapshot{UsedRatio: 0.985}); errUpdate != nil || !accepted {
+			t.Fatalf("UpdateCodexQuotaSnapshot(%s) accepted=%t err=%v", authID, accepted, errUpdate)
+		}
+	}
+
+	actual := tailBurstAuthForTest(t, manager, "warm-tail")
+	occupiedRelease, occupied, reason, _ := actual.acquireRuntimeSlotForModel(time.Now(), "", false)
+	if !occupied {
+		t.Fatalf("occupy warm credential normal slot: %s", reason)
+	}
+	defer occupiedRelease()
+
+	selector.BindAuthSession("codex", "", "cache-affinity:warm-tail-route", "warm-tail")
+	selected, errSelected := manager.SelectAuth(context.Background(), "codex", "", tailBurstAffinityOptions("warm-tail-route"))
+	if errSelected != nil || selected == nil || selected.ID != "warm-tail" {
+		t.Fatalf("warm tail credential selection = %v, %v; want warm-tail", selected, errSelected)
+	}
+	burstRelease, acquired, reason, _ := selected.acquireRuntimeSlotForModel(time.Now(), "", true)
+	if !acquired {
+		t.Fatalf("warm tail credential did not receive burst capacity: %s", reason)
+	}
+	burstRelease()
+}
+
+func TestCodexTailBurstReleasesUnavailableWarmBinding(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "disabled-warm", Provider: "codex", Status: StatusDisabled, Disabled: true},
+		&Auth{ID: "tail-auth", Provider: "codex", Status: StatusActive},
+	)
+	selector, _ := configureTailBurstAffinityManager(manager)
+	defer selector.Stop()
+	updateTailBurstSnapshot(t, manager, "tail-auth")
+	selector.BindAuthSession("codex", "", "cache-affinity:disabled-route", "disabled-warm")
+
+	selected, errSelected := manager.SelectAuth(context.Background(), "codex", "", tailBurstAffinityOptions("disabled-route"))
+	if errSelected != nil || selected == nil || selected.ID != "tail-auth" {
+		t.Fatalf("disabled warm binding selection = %v, %v; want tail-auth", selected, errSelected)
+	}
+}
+
+func TestCodexTailBurstRetryMayLeaveTriedWarmBinding(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "warm-auth", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "tail-auth", Provider: "codex", Status: StatusActive},
+	)
+	selector, _ := configureTailBurstAffinityManager(manager)
+	defer selector.Stop()
+	updateTailBurstSnapshot(t, manager, "tail-auth")
+	opts := tailBurstAffinityOptions("retry-route")
+	selector.BindAuthSession("codex", "", "cache-affinity:retry-route", "warm-auth")
+
+	selected, _, errSelected := manager.pickNext(context.Background(), "codex", "", opts, map[string]struct{}{"warm-auth": {}})
+	if errSelected != nil || selected == nil || selected.ID != "tail-auth" {
+		t.Fatalf("retry tail-burst selection = %v, %v; want tail-auth", selected, errSelected)
+	}
+}
+
+func TestCodexTailBurstFirstSuccessBecomesWarmBinding(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "tail-a", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "tail-b", Provider: "codex", Status: StatusActive},
+	)
+	selector, _ := configureTailBurstAffinityManager(manager)
+	defer selector.Stop()
+	for _, authID := range []string{"tail-a", "tail-b"} {
+		if _, accepted, errUpdate := manager.UpdateCodexQuotaSnapshot(authID, "", CodexQuotaSnapshot{UsedRatio: 0.985}); errUpdate != nil || !accepted {
+			t.Fatalf("UpdateCodexQuotaSnapshot(%s) accepted=%t err=%v", authID, accepted, errUpdate)
+		}
+	}
+
+	opts := tailBurstAffinityOptions("first-success-route")
+	req := cliproxyexecutor.Request{Payload: []byte(`{"input":"hello"}`)}
+	first, errFirst := manager.executeMixedOnce(context.Background(), []string{"codex"}, req, opts, 2)
+	if errFirst != nil {
+		t.Fatalf("first tail-burst request: %v", errFirst)
+	}
+	second, errSecond := manager.executeMixedOnce(context.Background(), []string{"codex"}, req, opts, 2)
+	if errSecond != nil {
+		t.Fatalf("second tail-burst request: %v", errSecond)
+	}
+	if string(first.Payload) == "" || string(second.Payload) != string(first.Payload) {
+		t.Fatalf("tail-burst affinity payloads first=%q second=%q; want identical non-empty auth IDs", first.Payload, second.Payload)
+	}
+}
+
 func TestCodexTailBurstNormalConcurrencyCapIsIndependent(t *testing.T) {
 	now := time.Now().UTC()
 	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
@@ -258,6 +397,39 @@ func (e *codexTailBurstStreamTestExecutor) ExecuteStream(ctx context.Context, au
 
 func (e *codexTailBurstStreamTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, &Error{HTTPStatus: http.StatusNotImplemented, Message: "http request not implemented"}
+}
+
+func TestCodexTailBurstStreamingMigratesNormalWarmBinding(t *testing.T) {
+	executor := &codexTailBurstStreamTestExecutor{}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	for _, auth := range []*Auth{
+		{ID: "warm-stream", Provider: "codex", Status: StatusActive},
+		{ID: "tail-stream", Provider: "codex", Status: StatusActive},
+	} {
+		if _, errRegister := manager.Register(WithSkipPersist(context.Background()), auth); errRegister != nil {
+			t.Fatalf("Register(%s): %v", auth.ID, errRegister)
+		}
+	}
+	selector, _ := configureTailBurstAffinityManager(manager)
+	defer selector.Stop()
+	updateTailBurstSnapshot(t, manager, "tail-stream")
+	selector.BindAuthSession("codex", "", "cache-affinity:warm-stream-route", "warm-stream")
+
+	result, errStream := manager.executeStreamMixedOnce(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Payload: []byte(`{"input":"hello"}`)}, tailBurstAffinityOptions("warm-stream-route"), 2)
+	if errStream != nil {
+		t.Fatalf("warm ExecuteStream: %v", errStream)
+	}
+	var payload []byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("warm stream chunk: %v", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != "tail-stream" {
+		t.Fatalf("warm stream payload = %q, want tail-stream", payload)
+	}
 }
 
 func TestCodexTailBurstAllowsConfiguredConcurrentStreams(t *testing.T) {

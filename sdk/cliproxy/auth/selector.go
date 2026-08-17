@@ -1079,6 +1079,31 @@ func (s *SessionAffinitySelector) BindAuthSession(provider, model, sessionID, au
 	}
 }
 
+// BoundAuthSession returns an existing session binding without creating a new
+// one. The lookup mirrors Pick's primary/fallback alias order so callers that
+// run before the selector can preserve a warm route without changing cold
+// request distribution.
+func (s *SessionAffinitySelector) BoundAuthSession(provider, model string, opts cliproxyexecutor.Options) (string, bool) {
+	if s == nil || s.cache == nil {
+		return "", false
+	}
+	primaryID, fallbackID := s.extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if primaryID == "" {
+		return "", false
+	}
+	if authID, ok := s.cache.GetAndRefresh(sessionAffinityCacheKey(provider, primaryID, model)); ok && strings.TrimSpace(authID) != "" {
+		return strings.TrimSpace(authID), true
+	}
+	if fallbackID == "" || fallbackID == primaryID {
+		return "", false
+	}
+	authID, ok := s.cache.GetAndRefresh(sessionAffinityCacheKey(provider, fallbackID, model))
+	if !ok || strings.TrimSpace(authID) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(authID), true
+}
+
 func runtimeStickyBypassSessionKey(provider, model string, opts cliproxyexecutor.Options) string {
 	primary, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	return sessionAffinityCacheKey(provider, primary, model)

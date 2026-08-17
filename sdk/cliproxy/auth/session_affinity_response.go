@@ -5,11 +5,16 @@ import (
 	"context"
 	"strings"
 
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
 
 type sessionAffinityBinder interface {
 	BindAuthSession(provider, model, sessionID, authID string)
+}
+
+type sessionAffinityLookup interface {
+	BoundAuthSession(provider, model string, opts cliproxyexecutor.Options) (string, bool)
 }
 
 func (m *Manager) bindSessionAffinityFromResponsePayload(_ context.Context, provider, model, authID string, payload []byte) {
