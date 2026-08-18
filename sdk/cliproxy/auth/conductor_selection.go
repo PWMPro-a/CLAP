@@ -1562,20 +1562,24 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	opts = m.withAccountGroupPolicyFromContext(ctx, opts)
+	tailBurstFallback := false
+	tailBurstFallbackOpts := opts
 	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
 		if codexTailBurstFallbackRequested(opts) {
-			if auth, executor, ok := m.pickCodexTailBurstFallbackAuth(ctx, model, opts, tried); ok {
-				return auth, executor, nil
-			}
+			tailBurstFallback = true
 		} else if codexTailBurstRequested(opts) {
 			if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
 				return auth, executor, nil
 			}
-			fallbackOpts := withCodexTailBurstFallback(opts)
-			if auth, executor, ok := m.pickCodexTailBurstFallbackAuth(ctx, model, fallbackOpts, tried); ok {
-				return auth, executor, nil
-			}
+			tailBurstFallback = true
+			tailBurstFallbackOpts = withCodexTailBurstFallback(opts)
 		}
+	}
+	tryTailBurstFallback := func() (*Auth, ProviderExecutor, bool) {
+		if !tailBurstFallback {
+			return nil, nil, false
+		}
+		return m.pickCodexTailBurstFallbackAuth(ctx, model, tailBurstFallbackOpts, tried)
 	}
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
@@ -1583,7 +1587,14 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 
 	if !m.newCandidateMode() && !accountGroupPolicyActive(opts.Metadata) {
-		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+		auth, executor, errPick := m.pickNextLegacy(ctx, provider, model, opts, tried)
+		if errPick == nil {
+			return auth, executor, nil
+		}
+		if fallbackAuth, fallbackExecutor, ok := tryTailBurstFallback(); ok {
+			return fallbackAuth, fallbackExecutor, nil
+		}
+		return nil, nil, errPick
 	}
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
@@ -1591,6 +1602,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	selected, errPick := m.pickNextIndexed(ctx, provider, []string{provider}, model, opts, tried)
 	if errPick != nil {
+		if fallbackAuth, fallbackExecutor, ok := tryTailBurstFallback(); ok {
+			return fallbackAuth, fallbackExecutor, nil
+		}
 		restrictionErr := m.indexedCodexClientRestrictionError(ctx, []string{provider}, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
 		if restrictionErr != nil {
 			return nil, nil, restrictionErr
@@ -1598,6 +1612,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return nil, nil, errPick
 	}
 	if selected == nil {
+		if fallbackAuth, fallbackExecutor, ok := tryTailBurstFallback(); ok {
+			return fallbackAuth, fallbackExecutor, nil
+		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	authCopy := selected.Clone()
@@ -1730,27 +1747,39 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts = m.withAccountGroupPolicyFromContext(ctx, opts)
+	tailBurstFallback := false
+	tailBurstFallbackOpts := opts
 	if hasCodexProvider(providers) {
 		if codexTailBurstFallbackRequested(opts) {
-			if auth, executor, ok := m.pickCodexTailBurstFallbackAuth(ctx, model, opts, tried); ok {
-				return auth, executor, "codex", nil
-			}
+			tailBurstFallback = true
 		} else if codexTailBurstRequested(opts) {
 			if auth, executor, ok := m.pickCodexTailBurstAuth(ctx, model, opts, tried); ok {
 				return auth, executor, "codex", nil
 			}
-			fallbackOpts := withCodexTailBurstFallback(opts)
-			if auth, executor, ok := m.pickCodexTailBurstFallbackAuth(ctx, model, fallbackOpts, tried); ok {
-				return auth, executor, "codex", nil
-			}
+			tailBurstFallback = true
+			tailBurstFallbackOpts = withCodexTailBurstFallback(opts)
 		}
+	}
+	tryTailBurstFallback := func() (*Auth, ProviderExecutor, string, bool) {
+		if !tailBurstFallback {
+			return nil, nil, "", false
+		}
+		auth, executor, ok := m.pickCodexTailBurstFallbackAuth(ctx, model, tailBurstFallbackOpts, tried)
+		return auth, executor, "codex", ok
 	}
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
 	if !m.newCandidateMode() && !accountGroupPolicyActive(opts.Metadata) {
-		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+		auth, executor, providerKey, errPick := m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+		if errPick == nil {
+			return auth, executor, providerKey, nil
+		}
+		if fallbackAuth, fallbackExecutor, fallbackProvider, ok := tryTailBurstFallback(); ok {
+			return fallbackAuth, fallbackExecutor, fallbackProvider, nil
+		}
+		return nil, nil, "", errPick
 	}
 
 	eligibleProviders := make([]string, 0, len(providers))
@@ -1774,6 +1803,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	selected, providerKey, errPick := m.pickNextMixedIndexed(ctx, eligibleProviders, model, opts, tried)
 	if errPick != nil {
+		if fallbackAuth, fallbackExecutor, fallbackProvider, ok := tryTailBurstFallback(); ok {
+			return fallbackAuth, fallbackExecutor, fallbackProvider, nil
+		}
 		restrictionErr := m.indexedCodexClientRestrictionError(ctx, eligibleProviders, model, opts, tried, pinnedAuthIDFromMetadata(opts.Metadata))
 		if restrictionErr != nil {
 			return nil, nil, "", restrictionErr
@@ -1781,6 +1813,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return nil, nil, "", errPick
 	}
 	if selected == nil {
+		if fallbackAuth, fallbackExecutor, fallbackProvider, ok := tryTailBurstFallback(); ok {
+			return fallbackAuth, fallbackExecutor, fallbackProvider, nil
+		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	executor, okExecutor := m.Executor(providerKey)

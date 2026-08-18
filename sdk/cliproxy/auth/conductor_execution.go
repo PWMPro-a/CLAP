@@ -345,7 +345,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		execCtx = contextWithRuntimeStickyBypassSession(execCtx, stickyKey)
 
-		tailBurst := codexTailBurstRequested(opts) && auth.tailBurstFallbackMaxConcurrency <= 0 && m.codexTailBurstActive(auth, routeModel, time.Now())
+		tailBurst := codexTailBurstRequested(opts) && auth.tailBurstMaxConcurrency > 0 && auth.tailBurstFallbackMaxConcurrency <= 0 && m.codexTailBurstActive(auth, routeModel, time.Now())
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAliasForTailBurst(auth, routeModel, tailBurst)
 		if len(models) == 0 {
 			continue
@@ -717,7 +717,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			stickyKey = highCacheRuntimeStickyBypassSessionKey(provider, routeModel, opts)
 		}
 		execCtx = contextWithRuntimeStickyBypassSession(execCtx, stickyKey)
-		tailBurst := selection == nil && codexTailBurstRequested(opts) && auth.tailBurstFallbackMaxConcurrency <= 0 && m.codexTailBurstActive(auth, routeModel, time.Now())
+		tailBurst := selection == nil && codexTailBurstRequested(opts) && auth.tailBurstMaxConcurrency > 0 && auth.tailBurstFallbackMaxConcurrency <= 0 && m.codexTailBurstActive(auth, routeModel, time.Now())
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAliasForTailBurst(auth, routeModel, tailBurst)
 		if selection != nil && aliasResult.ForceMapping && responseAlias != "" {
 			aliasResult.OriginalAlias = responseAlias

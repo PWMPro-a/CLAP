@@ -65,6 +65,13 @@ func occupyNormalConcurrencyForTest(t *testing.T, manager *Manager, authID strin
 	})
 }
 
+func freezeQuotaPreemptForTest(t *testing.T, manager *Manager, authID string) {
+	t.Helper()
+	auth := tailBurstAuthForTest(t, manager, authID)
+	now := time.Now()
+	auth.updateQuotaPreempt(now, now.Add(time.Hour), true)
+}
+
 func tailBurstAffinityOptions(routeKey string) cliproxyexecutor.Options {
 	opts := activeCacheAffinityOptions(routeKey)
 	opts.Metadata[codexTailBurstRequestedMetadataKey] = true
@@ -130,6 +137,7 @@ func TestCodexTailBurstWarmTailCredentialKeepsBindingAndBurstCapacity(t *testing
 		t.Fatalf("occupy warm credential normal slot: %s", reason)
 	}
 	defer occupiedRelease()
+	actual.updateQuotaPreempt(time.Now(), time.Now().Add(time.Hour), true)
 
 	selector.BindAuthSession("codex", "", "cache-affinity:warm-tail-route", "warm-tail")
 	selected, errSelected := manager.SelectAuth(context.Background(), "codex", "", tailBurstAffinityOptions("warm-tail-route"))
@@ -284,6 +292,39 @@ func TestCodexTailBurstFallbackConcurrencyCapIsIndependent(t *testing.T) {
 
 	if _, acquired, reason, _ := fallbackAuth.acquireRuntimeSlotForModel(now, "gpt-5", false); acquired || reason != "tail_burst_fallback_concurrency_limit" {
 		t.Fatalf("fallback slot %d acquired=%t reason=%q, want false/tail_burst_fallback_concurrency_limit", defaultCodexTailBurstFallbackConcurrency+1, acquired, reason)
+	}
+}
+
+func TestCodexTailBurstFallbackPreservesHardRuntimeFreezes(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name   string
+		freeze func(*Auth)
+	}{
+		{
+			name: "usage limit",
+			freeze: func(auth *Auth) {
+				retryAfter := time.Hour
+				auth.freezeUsageLimit(now, &retryAfter)
+			},
+		},
+		{
+			name: "upstream rate limit",
+			freeze: func(auth *Auth) {
+				retryAfter := time.Hour
+				auth.freezeUpstreamRateLimit(now, &retryAfter)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			auth := &Auth{ID: "hard-freeze", Provider: "codex", Status: StatusActive}
+			auth.tailBurstFallbackMaxConcurrency = defaultCodexTailBurstFallbackConcurrency
+			test.freeze(auth)
+			if blocked, _, _ := isAuthBlockedForModel(auth, "gpt-5", now); !blocked {
+				t.Fatal("tail-burst fallback crossed a hard runtime freeze")
+			}
+		})
 	}
 }
 
@@ -603,7 +644,7 @@ func TestCodexTailBurstActivatesDuringSupplierExpiryWindowWithoutQuotaSnapshot(t
 	}
 }
 
-func TestCodexTailBurstFailureFallsBackToHighestRecentSuccessRate(t *testing.T) {
+func TestCodexTailBurstFailureUsesNormalCapacityBeforeBurstFallback(t *testing.T) {
 	now := time.Now()
 	executor := &runtimeLimitTestExecutor{firstErrors: map[string]error{
 		"expiring": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"},
@@ -616,6 +657,54 @@ func TestCodexTailBurstFailureFallsBackToHighestRecentSuccessRate(t *testing.T) 
 	manager.SetConfig(newTailBurstConfig())
 	manager.SetRetryConfig(0, 0, 1)
 	occupyNormalConcurrencyForTest(t, manager, "healthy-high", defaultCodexTailBurstNormalConcurrency)
+	freezeQuotaPreemptForTest(t, manager, "healthy-high")
+
+	manager.mu.Lock()
+	for i := 0; i < 20; i++ {
+		manager.auths["healthy-high"].recordRecentRequest(now, true)
+	}
+	manager.auths["healthy-high"].recordRecentRequest(now, false)
+	for i := 0; i < 2; i++ {
+		manager.auths["healthy-low"].recordRecentRequest(now, true)
+	}
+	for i := 0; i < 4; i++ {
+		manager.auths["healthy-low"].recordRecentRequest(now, false)
+	}
+	manager.mu.Unlock()
+
+	response, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Payload: []byte(`{"input":"hello"}`),
+	}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute: %v", errExecute)
+	}
+	if got := string(response.Payload); got != "healthy-low" {
+		t.Fatalf("normal-capacity payload = %q, want healthy-low", got)
+	}
+
+	executor.mu.Lock()
+	calls := append([]string(nil), executor.calls...)
+	executor.mu.Unlock()
+	if len(calls) != 2 || calls[0] != "expiring" || calls[1] != "healthy-low" {
+		t.Fatalf("execution order = %v, want [expiring healthy-low]", calls)
+	}
+}
+
+func TestCodexTailBurstFailureRanksBurstFallbackAfterNormalPoolSaturates(t *testing.T) {
+	now := time.Now()
+	executor := &runtimeLimitTestExecutor{firstErrors: map[string]error{
+		"expiring": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"},
+	}}
+	manager := newRuntimeLimitManager(t, executor,
+		&Auth{ID: "expiring", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"supply_lease_expires_at_ms": now.Add(5 * time.Minute).UnixMilli()}},
+		&Auth{ID: "healthy-high", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "healthy-low", Provider: "codex", Status: StatusActive},
+	)
+	manager.SetConfig(newTailBurstConfig())
+	manager.SetRetryConfig(0, 0, 1)
+	occupyNormalConcurrencyForTest(t, manager, "healthy-high", defaultCodexTailBurstNormalConcurrency)
+	occupyNormalConcurrencyForTest(t, manager, "healthy-low", defaultCodexTailBurstNormalConcurrency)
+	freezeQuotaPreemptForTest(t, manager, "healthy-high")
 
 	manager.mu.Lock()
 	for i := 0; i < 20; i++ {
@@ -637,7 +726,7 @@ func TestCodexTailBurstFailureFallsBackToHighestRecentSuccessRate(t *testing.T) 
 		t.Fatalf("Execute: %v", errExecute)
 	}
 	if got := string(response.Payload); got != "healthy-high" {
-		t.Fatalf("fallback payload = %q, want healthy-high", got)
+		t.Fatalf("burst-fallback payload = %q, want healthy-high", got)
 	}
 
 	executor.mu.Lock()
@@ -663,6 +752,7 @@ func TestCodexTailBurstFrozenCandidateFallsBackAboveNormalConcurrencyCap(t *test
 		t.Fatal("tail credential was not frozen")
 	}
 	occupyNormalConcurrencyForTest(t, manager, "healthy", defaultCodexTailBurstNormalConcurrency)
+	freezeQuotaPreemptForTest(t, manager, "healthy")
 
 	response, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
 		Payload: []byte(`{"input":"hello"}`),
@@ -704,6 +794,7 @@ func TestCodexTailBurstStream429FallsBackAboveNormalConcurrencyCap(t *testing.T)
 	manager.SetRetryConfig(0, 0, 1)
 	updateTailBurstSnapshot(t, manager, "tail-stream")
 	occupyNormalConcurrencyForTest(t, manager, "healthy-stream", defaultCodexTailBurstNormalConcurrency)
+	freezeQuotaPreemptForTest(t, manager, "healthy-stream")
 
 	result, errStream := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
 		Payload: []byte(`{"input":"hello"}`),
@@ -732,6 +823,27 @@ func TestCodexTailBurstStream429FallsBackAboveNormalConcurrencyCap(t *testing.T)
 	}
 	if !tailSelected || fallbackSelected {
 		t.Fatalf("tail-burst tool metadata tail=%t fallback=%t, want true/false", tailSelected, fallbackSelected)
+	}
+}
+
+func TestCodexTailBurstDrainsQuotaPreemptedCredential(t *testing.T) {
+	executor := &runtimeLimitTestExecutor{}
+	manager := newRuntimeLimitManager(t, executor,
+		&Auth{ID: "tail-preempted", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "healthy", Provider: "codex", Status: StatusActive},
+	)
+	manager.SetConfig(newTailBurstConfig())
+	updateTailBurstSnapshot(t, manager, "tail-preempted")
+	freezeQuotaPreemptForTest(t, manager, "tail-preempted")
+
+	response, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Payload: []byte(`{"input":"hello"}`),
+	}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute: %v", errExecute)
+	}
+	if got := string(response.Payload); got != "tail-preempted" {
+		t.Fatalf("tail-burst payload = %q, want tail-preempted", got)
 	}
 }
 

@@ -217,9 +217,11 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.
 
 	state.compactRuntimeWindowLocked(now, cfg)
 	if frozenUntil, reason := state.activeFreezeLocked(now); frozenUntil.After(now) {
-		if auth.quotaPreemptFallback && state.onlyQuotaPreemptFreezeLocked(now) && state.quotaPreemptFallbackInFlight == 0 {
-			// Continue through concurrency and rate checks. The request-local
-			// fallback flag only bypasses the collector's quota-preempt freeze.
+		if runtimeQuotaPreemptFreezeBypassed(auth, state, now, tailBurst) {
+			// Continue through concurrency and rate checks. Tail-burst lanes may
+			// drain a soft-preempted credential until upstream gives an
+			// authoritative quota response. The generic quota fallback remains
+			// limited to one in-flight request per credential.
 		} else {
 			state.recordSkipLocked(reason, frozenUntil, now)
 			return true, blockReasonCooldown, frozenUntil
@@ -330,8 +332,8 @@ func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst
 	state.compactRuntimeWindowLocked(now, cfg)
 	quotaPreemptFallback := false
 	if frozenUntil, reason := state.activeFreezeLocked(now); frozenUntil.After(now) {
-		if a.quotaPreemptFallback && state.onlyQuotaPreemptFreezeLocked(now) && state.quotaPreemptFallbackInFlight == 0 {
-			quotaPreemptFallback = true
+		if runtimeQuotaPreemptFreezeBypassed(a, state, now, tailBurst) {
+			quotaPreemptFallback = a.quotaPreemptFallback && !tailBurst && a.tailBurstFallbackMaxConcurrency <= 0
 		} else {
 			state.recordSkipLocked(reason, frozenUntil, now)
 			return nil, false, "frozen", frozenUntil
@@ -384,6 +386,16 @@ func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst
 			state.mu.Unlock()
 		})
 	}, true, "", time.Time{}
+}
+
+func runtimeQuotaPreemptFreezeBypassed(auth *Auth, state *authRuntimeLimits, now time.Time, tailBurst bool) bool {
+	if auth == nil || state == nil || !state.onlyQuotaPreemptFreezeLocked(now) {
+		return false
+	}
+	if tailBurst || auth.tailBurstFallbackMaxConcurrency > 0 {
+		return true
+	}
+	return auth.quotaPreemptFallback && state.quotaPreemptFallbackInFlight == 0
 }
 
 func codexBurstConcurrencyLimit(auth *Auth, cfg runtimeLimitConfig, model string, now time.Time, tailBurst bool) (limit int, reason string, active bool) {
@@ -641,6 +653,19 @@ func runtimeAuthHasPersistentQuotaFreeze(auth *Auth, now time.Time) bool {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	return state.usageLimitFreezeUntil.After(now) || state.quotaPreemptFreezeUntil.After(now)
+}
+
+func runtimeAuthHasUsageLimitFreeze(auth *Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	state := auth.ensureRuntimeLimits()
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.usageLimitFreezeUntil.After(now)
 }
 
 func (state *authRuntimeLimits) pruneStickyBypassSessionsLocked(now time.Time) {

@@ -586,7 +586,7 @@ func (m *Manager) codexTailBurstWarmAffinityAuth(ctx context.Context, model stri
 	}
 
 	now := time.Now()
-	if IsAuthLifecycleBlocking(auth) || authQuotaExceeded(auth, model) || runtimeAuthHasPersistentQuotaFreeze(auth, now) {
+	if IsAuthLifecycleBlocking(auth) || authQuotaExceeded(auth, model) || runtimeAuthHasUsageLimitFreeze(auth, now) {
 		return nil, false
 	}
 	cacheSettings := m.cacheAffinitySettings()
