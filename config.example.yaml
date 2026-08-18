@@ -325,6 +325,9 @@ codex:
     # Existing affinity bindings bypass this soft ceiling, while credential hard
     # limits remain. The burst lane uses max-concurrency below instead.
     normal-max-concurrency: 8
+    # Healthy fallback credentials may temporarily exceed the normal cold/new
+    # scheduling ceiling after a burst credential is unavailable or rejected.
+    fallback-max-concurrency: 32
     # Per-credential request ceiling while the burst lane is active. An auth's
     # explicitly configured higher max_concurrency value is still preserved.
     max-concurrency: 32

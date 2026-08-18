@@ -225,22 +225,13 @@ func runtimeAuthBlockedForModelWithTailBurst(auth *Auth, model string, now time.
 			return true, blockReasonCooldown, frozenUntil
 		}
 	}
-	tailBurstLimit := 1
-	if cfg.maxConcurrency > tailBurstLimit {
-		tailBurstLimit = cfg.maxConcurrency
-	}
-	if auth.tailBurstMaxConcurrency > tailBurstLimit {
-		tailBurstLimit = auth.tailBurstMaxConcurrency
-	}
-	if drainLimit := expiryDrainConcurrencyLimit(auth, model, now, 1); drainLimit > tailBurstLimit {
-		tailBurstLimit = drainLimit
-	}
-	if tailBurst && state.currentConcurrency >= tailBurstLimit {
-		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
+	burstLimit, burstReason, burstLane := codexBurstConcurrencyLimit(auth, cfg, model, now, tailBurst)
+	if burstLane && state.currentConcurrency >= burstLimit {
+		state.recordSkipLocked(burstReason, time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
 	}
 	normalLimit := codexNormalConcurrencyLimit(state, cfg.maxConcurrency, auth.tailBurstNormalConcurrencyAffinityBypass)
-	if !tailBurst && normalLimit > 0 && state.currentConcurrency >= normalLimit {
+	if !burstLane && normalLimit > 0 && state.currentConcurrency >= normalLimit {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return true, blockReasonOther, time.Time{}
 	}
@@ -346,22 +337,13 @@ func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst
 			return nil, false, "frozen", frozenUntil
 		}
 	}
-	tailBurstLimit := 1
-	if cfg.maxConcurrency > tailBurstLimit {
-		tailBurstLimit = cfg.maxConcurrency
-	}
-	if a.tailBurstMaxConcurrency > tailBurstLimit {
-		tailBurstLimit = a.tailBurstMaxConcurrency
-	}
-	if drainLimit := expiryDrainConcurrencyLimit(a, model, now, 1); drainLimit > tailBurstLimit {
-		tailBurstLimit = drainLimit
-	}
-	if tailBurst && state.currentConcurrency >= tailBurstLimit {
-		state.recordSkipLocked("tail_burst_concurrency_limit", time.Time{}, now)
-		return nil, false, "tail_burst_concurrency_limit", time.Time{}
+	burstLimit, burstReason, burstLane := codexBurstConcurrencyLimit(a, cfg, model, now, tailBurst)
+	if burstLane && state.currentConcurrency >= burstLimit {
+		state.recordSkipLocked(burstReason, time.Time{}, now)
+		return nil, false, burstReason, time.Time{}
 	}
 	normalLimit := codexNormalConcurrencyLimit(state, cfg.maxConcurrency, a.tailBurstNormalConcurrencyAffinityBypass)
-	if !tailBurst && normalLimit > 0 && state.currentConcurrency >= normalLimit {
+	if !burstLane && normalLimit > 0 && state.currentConcurrency >= normalLimit {
 		state.recordSkipLocked("concurrency_limit", time.Time{}, now)
 		return nil, false, "concurrency_limit", time.Time{}
 	}
@@ -402,6 +384,36 @@ func (a *Auth) acquireRuntimeSlotForModel(now time.Time, model string, tailBurst
 			state.mu.Unlock()
 		})
 	}, true, "", time.Time{}
+}
+
+func codexBurstConcurrencyLimit(auth *Auth, cfg runtimeLimitConfig, model string, now time.Time, tailBurst bool) (limit int, reason string, active bool) {
+	if auth == nil {
+		return 0, "", false
+	}
+	limit = 1
+	reason = "tail_burst_concurrency_limit"
+	if cfg.maxConcurrency > limit {
+		limit = cfg.maxConcurrency
+	}
+	if auth.tailBurstFallbackMaxConcurrency > 0 {
+		active = true
+		reason = "tail_burst_fallback_concurrency_limit"
+		if auth.tailBurstFallbackMaxConcurrency > limit {
+			limit = auth.tailBurstFallbackMaxConcurrency
+		}
+	} else if tailBurst {
+		active = true
+		if auth.tailBurstMaxConcurrency > limit {
+			limit = auth.tailBurstMaxConcurrency
+		}
+	}
+	if !active {
+		return 0, "", false
+	}
+	if drainLimit := expiryDrainConcurrencyLimit(auth, model, now, 1); drainLimit > limit {
+		limit = drainLimit
+	}
+	return limit, reason, true
 }
 
 func (state *authRuntimeLimits) compactRuntimeWindowLocked(now time.Time, cfg runtimeLimitConfig) {

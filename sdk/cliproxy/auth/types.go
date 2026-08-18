@@ -112,6 +112,11 @@ type Auth struct {
 	// burst ceiling without persisting global configuration into auth metadata.
 	tailBurstMaxConcurrency int `json:"-"`
 
+	// tailBurstFallbackMaxConcurrency is set only on a request-local clone
+	// selected after the tail-burst lane is unavailable. It bypasses normal cold
+	// scheduling caps without bypassing runtime freezes or model availability.
+	tailBurstFallbackMaxConcurrency int `json:"-"`
+
 	// tailBurstNormalConcurrencyAffinityBypass is set only on a request-local
 	// clone selected from an established affinity binding. It bypasses cold/new
 	// binding caps without bypassing the credential's own configured limits.

@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	defaultCodexTailBurstRemainingRatio    = 0.02
-	defaultCodexTailBurstSnapshotTTL       = 90 * time.Second
-	defaultCodexTailBurstExpiryWindow      = 10 * time.Minute
-	defaultCodexTailBurstNormalConcurrency = 8
-	defaultCodexTailBurstConcurrency       = 32
+	defaultCodexTailBurstRemainingRatio      = 0.02
+	defaultCodexTailBurstSnapshotTTL         = 90 * time.Second
+	defaultCodexTailBurstExpiryWindow        = 10 * time.Minute
+	defaultCodexTailBurstNormalConcurrency   = 8
+	defaultCodexTailBurstFallbackConcurrency = 32
+	defaultCodexTailBurstConcurrency         = 32
 
 	codexTailBurstRequestedMetadataKey = "__cliproxy_codex_tail_burst_requested"
 	codexTailBurstFallbackMetadataKey  = "__cliproxy_codex_tail_burst_fallback"
@@ -54,21 +55,23 @@ type codexTailBurstExpiryCandidate struct {
 }
 
 type codexTailBurstSettings struct {
-	enabled              bool
-	triggerRatio         float64
-	snapshotTTL          time.Duration
-	expiryWindow         time.Duration
-	normalMaxConcurrency int
-	maxConcurrency       int
+	enabled                bool
+	triggerRatio           float64
+	snapshotTTL            time.Duration
+	expiryWindow           time.Duration
+	normalMaxConcurrency   int
+	fallbackMaxConcurrency int
+	maxConcurrency         int
 }
 
 func (m *Manager) codexTailBurstSettings() codexTailBurstSettings {
 	settings := codexTailBurstSettings{
-		triggerRatio:         1 - defaultCodexTailBurstRemainingRatio,
-		snapshotTTL:          defaultCodexTailBurstSnapshotTTL,
-		expiryWindow:         defaultCodexTailBurstExpiryWindow,
-		normalMaxConcurrency: defaultCodexTailBurstNormalConcurrency,
-		maxConcurrency:       defaultCodexTailBurstConcurrency,
+		triggerRatio:           1 - defaultCodexTailBurstRemainingRatio,
+		snapshotTTL:            defaultCodexTailBurstSnapshotTTL,
+		expiryWindow:           defaultCodexTailBurstExpiryWindow,
+		normalMaxConcurrency:   defaultCodexTailBurstNormalConcurrency,
+		fallbackMaxConcurrency: defaultCodexTailBurstFallbackConcurrency,
+		maxConcurrency:         defaultCodexTailBurstConcurrency,
 	}
 	if m == nil {
 		return settings
@@ -94,6 +97,9 @@ func (m *Manager) codexTailBurstSettings() codexTailBurstSettings {
 	}
 	if tailCfg.NormalMaxConcurrency > 0 {
 		settings.normalMaxConcurrency = tailCfg.NormalMaxConcurrency
+	}
+	if tailCfg.FallbackMaxConcurrency > 0 {
+		settings.fallbackMaxConcurrency = tailCfg.FallbackMaxConcurrency
 	}
 	if tailCfg.MaxConcurrency > 0 {
 		settings.maxConcurrency = tailCfg.MaxConcurrency
@@ -739,6 +745,8 @@ func (m *Manager) pickCodexTailBurstFallbackAuth(ctx context.Context, model stri
 	}
 
 	now := time.Now()
+	settings := m.codexTailBurstSettings()
+	cacheSettings := m.cacheAffinitySettings()
 	registryRef := registry.GetGlobalRegistry()
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	scores := make([]codexTailBurstHealthScore, 0, len(candidates))
@@ -752,6 +760,12 @@ func (m *Manager) pickCodexTailBurstFallbackAuth(ctx context.Context, model stri
 		if !m.authSupportsRouteModel(registryRef, auth, model) || authQuotaExceeded(auth, model) {
 			continue
 		}
+		if cacheSettings.active {
+			if snapshot, okSnapshot := auth.codexQuotaSnapshot(model, now); okSnapshot && snapshot.UsedRatio >= cacheSettings.hardStopRatio {
+				continue
+			}
+		}
+		auth.tailBurstFallbackMaxConcurrency = settings.fallbackMaxConcurrency
 		if blocked, _, _ := isAuthBlockedForModel(auth, model, now); blocked {
 			continue
 		}
@@ -787,5 +801,7 @@ func (m *Manager) pickCodexTailBurstFallbackAuth(ctx context.Context, model stri
 		}
 		return left.auth.ID < right.auth.ID
 	})
-	return scores[0].auth.Clone(), executor, true
+	selected := scores[0].auth.Clone()
+	selected.tailBurstFallbackMaxConcurrency = settings.fallbackMaxConcurrency
+	return selected, executor, true
 }
