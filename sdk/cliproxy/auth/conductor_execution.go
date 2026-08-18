@@ -436,7 +436,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			m.bindSessionAffinityFromResponsePayload(execCtx, provider, routeModel, auth.ID, resp.Payload)
-			m.confirmCacheAffinityBinding(provider, routeModel, auth.ID, opts.Metadata)
+			m.confirmCacheAffinityBinding(provider, routeModel, auth.ID, execOpts.Metadata)
 			releaseRuntimeSlot(releaseRuntime)
 			return resp, nil
 		}
@@ -597,7 +597,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
 			rewriteForceMappedResponse(&resp, attemptAliasResult)
 			m.bindSessionAffinityFromResponsePayload(execCtx, provider, routeModel, auth.ID, resp.Payload)
-			m.confirmCacheAffinityBinding(provider, routeModel, auth.ID, opts.Metadata)
+			m.confirmCacheAffinityBinding(provider, routeModel, auth.ID, execOpts.Metadata)
 			releaseRuntimeSlot(releaseRuntime)
 			return resp, nil
 		}

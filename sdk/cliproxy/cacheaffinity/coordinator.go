@@ -25,6 +25,8 @@ const (
 	defaultMaxSessionRequests = 500
 	defaultMaxSessionDuration = time.Hour
 	defaultMaxConcurrency     = 8
+	defaultPrefixHeatTTL      = 10 * time.Minute
+	defaultPrefixHeatMinBytes = 4096
 	shardCount                = 64
 	prefixInspectInterval     = 5 * time.Second
 )
@@ -35,6 +37,7 @@ type Decision struct {
 	UpstreamKey   string `json:"upstream_key,omitempty"`
 	PoolKey       string `json:"pool_key,omitempty"`
 	PrefixFP      string `json:"prefix_fp,omitempty"`
+	PrefixHeatFP  string `json:"prefix_heat_fp,omitempty"`
 	Source        string `json:"source,omitempty"`
 	Active        bool   `json:"active"`
 	PrefixChanged bool   `json:"prefix_changed"`
@@ -61,6 +64,11 @@ type Stats struct {
 	RouteHits             uint64  `json:"route_hits"`
 	RouteMisses           uint64  `json:"route_misses"`
 	RouteFailovers        uint64  `json:"route_failovers"`
+	PrefixHeatRecords     uint64  `json:"prefix_heat_records"`
+	PrefixHeatLookups     uint64  `json:"prefix_heat_lookups"`
+	PrefixHeatMatches     uint64  `json:"prefix_heat_matches"`
+	PrefixHeatSelections  uint64  `json:"prefix_heat_selections"`
+	PrefixHeatShadow      uint64  `json:"prefix_heat_shadow"`
 	TrackedRoutes         int     `json:"tracked_routes"`
 	ResolveNanoseconds    uint64  `json:"resolve_nanoseconds"`
 	AverageResolveMicros  float64 `json:"average_resolve_micros"`
@@ -86,6 +94,11 @@ type counters struct {
 	routeHits             atomic.Uint64
 	routeMisses           atomic.Uint64
 	routeFailovers        atomic.Uint64
+	prefixHeatRecords     atomic.Uint64
+	prefixHeatLookups     atomic.Uint64
+	prefixHeatMatches     atomic.Uint64
+	prefixHeatSelections  atomic.Uint64
+	prefixHeatShadow      atomic.Uint64
 	resolveNanos          atomic.Uint64
 	trackedRoutes         atomic.Uint64
 }
@@ -158,19 +171,28 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, cfg *in
 		Source:  source,
 		Active:  !settings.Shadow,
 	}
+	if settings.PrefixHeatEnabled {
+		if !rootParsed {
+			root = util.ParseGJSONBytesNoCopy(payload)
+			rootParsed = true
+		}
+		decision.PrefixHeatFP = reusablePrefixFingerprint(modelFamily, root, settings.PrefixHeatMinBytes)
+	}
 	decision.PrefixFP, decision.PrefixChanged = inspectPrefixPayload(routeKey, modelFamily, payload, root, rootParsed, settings.MaxEntries)
 	publishCounters(decision, time.Since(started))
 
-	metadata := cloneMetadata(opts.Metadata, 4)
+	metadata := cloneMetadata(opts.Metadata, 5)
 	metadata[cliproxyexecutor.CacheAffinityRouteKeyMetadataKey] = decision.RouteKey
 	metadata[cliproxyexecutor.CacheAffinityUpstreamKeyMetadataKey] = decision.UpstreamKey
 	metadata[cliproxyexecutor.CacheAffinityPoolKeyMetadataKey] = decision.PoolKey
+	metadata[cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey] = decision.PrefixHeatFP
 	metadata[cliproxyexecutor.CacheAffinityActiveMetadataKey] = decision.Active
 	opts.Metadata = metadata
-	req.Metadata = cloneMetadata(req.Metadata, 4)
+	req.Metadata = cloneMetadata(req.Metadata, 5)
 	req.Metadata[cliproxyexecutor.CacheAffinityRouteKeyMetadataKey] = decision.RouteKey
 	req.Metadata[cliproxyexecutor.CacheAffinityUpstreamKeyMetadataKey] = decision.UpstreamKey
 	req.Metadata[cliproxyexecutor.CacheAffinityPoolKeyMetadataKey] = decision.PoolKey
+	req.Metadata[cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey] = decision.PrefixHeatFP
 	req.Metadata[cliproxyexecutor.CacheAffinityActiveMetadataKey] = decision.Active
 	return req, opts, decision
 }
@@ -186,6 +208,11 @@ type RuntimeSettings struct {
 	WebsocketPoolSlots        int           `json:"websocket_pool_slots"`
 	MaxSessionRequests        int           `json:"max_session_requests"`
 	MaxSessionDuration        time.Duration `json:"max_session_duration"`
+	PrefixHeatEnabled         bool          `json:"prefix_heat_enabled"`
+	PrefixHeatShadow          bool          `json:"prefix_heat_shadow"`
+	PrefixHeatTTL             time.Duration `json:"prefix_heat_ttl"`
+	PrefixHeatMaxEntries      int           `json:"prefix_heat_max_entries"`
+	PrefixHeatMinBytes        int           `json:"prefix_heat_min_bytes"`
 	QuotaPreemptUsedRatio     float64       `json:"quota_preempt_used_ratio"`
 	QuotaHardStopUsedRatio    float64       `json:"quota_hard_stop_used_ratio"`
 }
@@ -205,8 +232,15 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 		MaxConcurrency:            raw.MaxConcurrency,
 		WebsocketPoolSlots:        raw.WebsocketPoolSlots,
 		MaxSessionRequests:        raw.MaxSessionRequests,
+		PrefixHeatEnabled:         raw.PrefixHeatEnabled,
+		PrefixHeatMaxEntries:      raw.PrefixHeatMaxEntries,
+		PrefixHeatMinBytes:        raw.PrefixHeatMinBytes,
 		QuotaPreemptUsedRatio:     raw.QuotaPreemptUsedRatio,
 		QuotaHardStopUsedRatio:    raw.QuotaHardStopUsedRatio,
+	}
+	settings.PrefixHeatShadow = true
+	if raw.PrefixHeatShadow != nil {
+		settings.PrefixHeatShadow = *raw.PrefixHeatShadow
 	}
 	if settings.MaxEntries <= 0 {
 		settings.MaxEntries = defaultMaxEntries
@@ -224,6 +258,18 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 	}
 	if settings.MaxSessionRequests <= 0 {
 		settings.MaxSessionRequests = defaultMaxSessionRequests
+	}
+	if settings.PrefixHeatMaxEntries <= 0 {
+		settings.PrefixHeatMaxEntries = settings.MaxEntries
+	}
+	if settings.PrefixHeatMinBytes <= 0 {
+		settings.PrefixHeatMinBytes = defaultPrefixHeatMinBytes
+	}
+	settings.PrefixHeatTTL = defaultPrefixHeatTTL
+	if rawTTL := strings.TrimSpace(raw.PrefixHeatTTL); rawTTL != "" {
+		if parsed, errParse := time.ParseDuration(rawTTL); errParse == nil && parsed > 0 {
+			settings.PrefixHeatTTL = parsed
+		}
 	}
 	settings.MaxSessionDuration = defaultMaxSessionDuration
 	if rawDuration := strings.TrimSpace(raw.MaxSessionDuration); rawDuration != "" {
@@ -275,6 +321,11 @@ func Snapshot() Stats {
 		RouteHits:             global.counters.routeHits.Load(),
 		RouteMisses:           global.counters.routeMisses.Load(),
 		RouteFailovers:        global.counters.routeFailovers.Load(),
+		PrefixHeatRecords:     global.counters.prefixHeatRecords.Load(),
+		PrefixHeatLookups:     global.counters.prefixHeatLookups.Load(),
+		PrefixHeatMatches:     global.counters.prefixHeatMatches.Load(),
+		PrefixHeatSelections:  global.counters.prefixHeatSelections.Load(),
+		PrefixHeatShadow:      global.counters.prefixHeatShadow.Load(),
 		TrackedRoutes:         int(global.counters.trackedRoutes.Load()),
 		ResolveNanoseconds:    nanos,
 	}
@@ -319,6 +370,27 @@ func RecordRouteMiss() {
 // RecordRouteFailover records a temporary failover that preserves the primary binding.
 func RecordRouteFailover() {
 	global.counters.routeFailovers.Add(1)
+}
+
+// RecordPrefixHeatSuccess records a successful request that refreshed one prompt-prefix/account heat entry.
+func RecordPrefixHeatSuccess() {
+	global.counters.prefixHeatRecords.Add(1)
+}
+
+// RecordPrefixHeatLookup records whether a cold route found one or more hot candidates.
+func RecordPrefixHeatLookup(matched, shadow bool) {
+	global.counters.prefixHeatLookups.Add(1)
+	if matched {
+		global.counters.prefixHeatMatches.Add(1)
+	}
+	if matched && shadow {
+		global.counters.prefixHeatShadow.Add(1)
+	}
+}
+
+// RecordPrefixHeatSelection records an active cold-route selection narrowed to hot candidates.
+func RecordPrefixHeatSelection() {
+	global.counters.prefixHeatSelections.Add(1)
 }
 
 func resolveIdentityBeforeBody(headers http.Header, metadata map[string]any) (string, string, string) {
@@ -407,6 +479,42 @@ func prefixFingerprint(modelFamily string, root gjson.Result) string {
 			}
 			writeFingerprintField(hash, role, item.Get("content").Raw)
 		}
+	}
+	return hex.EncodeToString(hash.Sum(nil)[:12])
+}
+
+func reusablePrefixFingerprint(modelFamily string, root gjson.Result, minBytes int) string {
+	if minBytes <= 0 {
+		minBytes = defaultPrefixHeatMinBytes
+	}
+	hash := sha256.New()
+	writeFingerprintField(hash, "model", modelFamily)
+	prefixBytes := 0
+	writeReusableField := func(name, value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		writeFingerprintField(hash, name, value)
+		prefixBytes += len(value)
+	}
+	writeReusableField("instructions", root.Get("instructions").Raw)
+	writeReusableField("tools", root.Get("tools").Raw)
+	for _, collection := range []string{"input", "messages"} {
+		items := root.Get(collection)
+		if !items.IsArray() {
+			continue
+		}
+		items.ForEach(func(_, item gjson.Result) bool {
+			role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+			if role != "system" && role != "developer" {
+				return true
+			}
+			writeReusableField(role, item.Get("content").Raw)
+			return true
+		})
+	}
+	if prefixBytes < minBytes {
+		return ""
 	}
 	return hex.EncodeToString(hash.Sum(nil)[:12])
 }

@@ -46,11 +46,15 @@ func (m *Manager) confirmCacheAffinityBinding(provider, model, authID string, me
 	if routeKey == "" || strings.TrimSpace(authID) == "" {
 		return
 	}
-	binder, ok := m.Selector().(sessionAffinityBinder)
+	selector := m.Selector()
+	binder, ok := selector.(sessionAffinityBinder)
 	if !ok || binder == nil {
 		return
 	}
 	binder.BindAuthSession(provider, model, "cache-affinity:"+routeKey, authID)
+	if recorder, okRecorder := selector.(cacheAffinitySuccessRecorder); okRecorder && recorder != nil {
+		recorder.RecordCacheAffinitySuccess(authID, metadata)
+	}
 }
 
 type cacheAffinityRuntimeSettings struct {

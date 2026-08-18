@@ -36,6 +36,11 @@ type routingRuntimeState struct {
 	cacheAffinityMaxEntries   int
 	maxSessionRequests        int
 	maxSessionDuration        time.Duration
+	prefixHeatEnabled         bool
+	prefixHeatShadow          bool
+	prefixHeatTTL             time.Duration
+	prefixHeatMaxEntries      int
+	prefixHeatMinBytes        int
 	quotaPreemptUsedRatio     float64
 	quotaHardStopUsedRatio    float64
 }
@@ -64,6 +69,11 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state.cacheAffinityMaxEntries = cacheSettings.MaxEntries
 	state.maxSessionRequests = cacheSettings.MaxSessionRequests
 	state.maxSessionDuration = cacheSettings.MaxSessionDuration
+	state.prefixHeatEnabled = cacheSettings.PrefixHeatEnabled
+	state.prefixHeatShadow = cacheSettings.PrefixHeatShadow
+	state.prefixHeatTTL = cacheSettings.PrefixHeatTTL
+	state.prefixHeatMaxEntries = cacheSettings.PrefixHeatMaxEntries
+	state.prefixHeatMinBytes = cacheSettings.PrefixHeatMinBytes
 	state.quotaPreemptUsedRatio = cacheSettings.QuotaPreemptUsedRatio
 	state.quotaHardStopUsedRatio = cacheSettings.QuotaHardStopUsedRatio
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -94,6 +104,10 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 			MaxEntries:                state.cacheAffinityMaxEntries,
 			MaxSessionRequests:        state.maxSessionRequests,
 			MaxSessionDuration:        state.maxSessionDuration,
+			PrefixHeatEnabled:         state.prefixHeatEnabled,
+			PrefixHeatShadow:          state.prefixHeatShadow,
+			PrefixHeatTTL:             state.prefixHeatTTL,
+			PrefixHeatMaxEntries:      state.prefixHeatMaxEntries,
 			QuotaPreemptUsedRatio:     state.quotaPreemptUsedRatio,
 			QuotaHardStopUsedRatio:    state.quotaHardStopUsedRatio,
 		})
@@ -231,8 +245,19 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		return false
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
-	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
+	if s.appliedRoutingState == nil {
 		s.coreManager.SetSelector(newRoutingSelector(routingState))
+		s.appliedRoutingState = &routingState
+	} else if *s.appliedRoutingState != routingState {
+		if routingSelectorBaseState(*s.appliedRoutingState) == routingSelectorBaseState(routingState) {
+			if selector, ok := s.coreManager.Selector().(*coreauth.SessionAffinitySelector); ok && selector != nil {
+				selector.ConfigurePrefixHeat(routingState.prefixHeatEnabled, routingState.prefixHeatShadow, routingState.prefixHeatTTL, routingState.prefixHeatMaxEntries)
+			} else {
+				s.coreManager.SetSelector(newRoutingSelector(routingState))
+			}
+		} else {
+			s.coreManager.SetSelector(newRoutingSelector(routingState))
+		}
 		s.appliedRoutingState = &routingState
 	}
 	s.applyRetryConfig(commit.cfg)
@@ -242,6 +267,15 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 	}
 	s.coreManager.SetOAuthModelAlias(commit.cfg.OAuthModelAlias)
 	return true
+}
+
+func routingSelectorBaseState(state routingRuntimeState) routingRuntimeState {
+	state.prefixHeatEnabled = false
+	state.prefixHeatShadow = false
+	state.prefixHeatTTL = 0
+	state.prefixHeatMaxEntries = 0
+	state.prefixHeatMinBytes = 0
+	return state
 }
 
 func (s *Service) updateServerClientsContext(ctx context.Context, cfg *config.Config) bool {

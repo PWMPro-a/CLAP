@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -640,6 +641,9 @@ type SessionAffinitySelector struct {
 	highCacheMode             bool
 	cacheAffinityEnabled      bool
 	expiryDrainIgnoreAffinity bool
+	prefixHeatEnabled         atomic.Bool
+	prefixHeatShadow          atomic.Bool
+	prefixHeat                *prefixHeatTracker
 	quotaPreemptUsedRatio     float64
 	quotaHardStopUsedRatio    float64
 }
@@ -654,6 +658,10 @@ type SessionAffinityConfig struct {
 	MaxEntries                int
 	MaxSessionRequests        int
 	MaxSessionDuration        time.Duration
+	PrefixHeatEnabled         bool
+	PrefixHeatShadow          bool
+	PrefixHeatTTL             time.Duration
+	PrefixHeatMaxEntries      int
 	QuotaPreemptUsedRatio     float64
 	QuotaHardStopUsedRatio    float64
 }
@@ -680,16 +688,19 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.QuotaHardStopUsedRatio <= cfg.QuotaPreemptUsedRatio || cfg.QuotaHardStopUsedRatio > 1 {
 		cfg.QuotaHardStopUsedRatio = 0.99
 	}
-	return &SessionAffinitySelector{
+	selector := &SessionAffinitySelector{
 		fallback:                  cfg.Fallback,
 		cache:                     NewSessionCacheWithBounds(cfg.TTL, cfg.MaxEntries, cfg.MaxSessionRequests, cfg.MaxSessionDuration),
 		failoverCache:             NewSessionCacheWithBounds(cfg.TTL, cfg.MaxEntries, cfg.MaxSessionRequests, cfg.MaxSessionDuration),
 		highCacheMode:             cfg.HighCacheMode,
 		cacheAffinityEnabled:      cfg.CacheAffinityEnabled,
 		expiryDrainIgnoreAffinity: cfg.ExpiryDrainIgnoreAffinity,
+		prefixHeat:                newPrefixHeatTracker(cfg.PrefixHeatTTL, cfg.PrefixHeatMaxEntries),
 		quotaPreemptUsedRatio:     cfg.QuotaPreemptUsedRatio,
 		quotaHardStopUsedRatio:    cfg.QuotaHardStopUsedRatio,
 	}
+	selector.ConfigurePrefixHeat(cfg.PrefixHeatEnabled, cfg.PrefixHeatShadow, cfg.PrefixHeatTTL, cfg.PrefixHeatMaxEntries)
+	return selector
 }
 
 // affinityBoundAuthWithNormalConcurrencyBypass keeps an established warm
@@ -909,7 +920,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, err := s.pickPrefixHeatAuth(ctx, provider, model, opts, fallbackAuths, now)
 	if err != nil {
 		return nil, err
 	}
@@ -1062,6 +1073,9 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if s.failoverCache != nil {
 		s.failoverCache.InvalidateAuth(authID)
 	}
+	if s.prefixHeat != nil {
+		s.prefixHeat.InvalidateAuth(authID)
+	}
 }
 
 // BindAuthSession records an explicit session-to-auth binding for response-id continuity.
@@ -1077,6 +1091,39 @@ func (s *SessionAffinitySelector) BindAuthSession(provider, model, sessionID, au
 	if s.failoverCache != nil {
 		s.failoverCache.Invalidate(cacheKey)
 	}
+}
+
+// RecordCacheAffinitySuccess refreshes prompt-prefix heat only after a request
+// has completed successfully. It does not change an existing session binding.
+func (s *SessionAffinitySelector) RecordCacheAffinitySuccess(authID string, metadata map[string]any) {
+	if s == nil || !s.prefixHeatEnabled.Load() || s.prefixHeat == nil {
+		return
+	}
+	if tailBurst, _ := metadata[cliproxyexecutor.CodexTailBurstMetadataKey].(bool); tailBurst {
+		return
+	}
+	prefixFingerprint := cacheaffinity.MetadataValue(metadata, cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey)
+	if prefixFingerprint == "" || strings.TrimSpace(authID) == "" {
+		return
+	}
+	s.prefixHeat.Record(prefixFingerprint, strings.TrimSpace(authID), time.Now())
+	cacheaffinity.RecordPrefixHeatSuccess()
+}
+
+// ConfigurePrefixHeat updates cold-route prefix heat without rebuilding the
+// selector or discarding existing session and response affinity bindings.
+func (s *SessionAffinitySelector) ConfigurePrefixHeat(enabled, shadow bool, ttl time.Duration, maxEntries int) {
+	if s == nil {
+		return
+	}
+	s.prefixHeatEnabled.Store(false)
+	if s.prefixHeat == nil {
+		s.prefixHeat = newPrefixHeatTracker(ttl, maxEntries)
+	} else {
+		s.prefixHeat.UpdateConfig(ttl, maxEntries)
+	}
+	s.prefixHeatShadow.Store(shadow)
+	s.prefixHeatEnabled.Store(s.cacheAffinityEnabled && enabled)
 }
 
 // BoundAuthSession returns an existing session binding without creating a new

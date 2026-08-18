@@ -1,10 +1,13 @@
 package cliproxy
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	executor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
@@ -17,6 +20,54 @@ func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 	if _, ok := newRoutingSelector(state).(*coreauth.WeightedRoundRobinSelector); !ok {
 		t.Fatalf("selector type = %T, want *auth.WeightedRoundRobinSelector", newRoutingSelector(state))
 	}
+}
+
+func TestPrefixHeatHotReloadPreservesSessionAffinitySelector(t *testing.T) {
+	shadow := true
+	initialCfg := &internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:              true,
+		PrefixHeatEnabled:    true,
+		PrefixHeatShadow:     &shadow,
+		PrefixHeatTTL:        "10m",
+		PrefixHeatMaxEntries: 128,
+		PrefixHeatMinBytes:   4096,
+	}}}
+	initialState := normalizedRoutingRuntimeState(initialCfg)
+	selector, ok := newRoutingSelector(initialState).(*coreauth.SessionAffinitySelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", newRoutingSelector(initialState))
+	}
+	t.Cleanup(selector.Stop)
+	selector.BindAuthSession("codex", "gpt-5.6-sol", "cache-affinity:preserved-route", "preserved-auth")
+
+	manager := coreauth.NewManager(nil, selector, nil)
+	service := &Service{coreManager: manager, appliedRoutingState: &initialState}
+	shadow = false
+	updatedCfg := &internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:              true,
+		PrefixHeatEnabled:    true,
+		PrefixHeatShadow:     &shadow,
+		PrefixHeatTTL:        "20m",
+		PrefixHeatMaxEntries: 256,
+		PrefixHeatMinBytes:   8192,
+	}}}
+	if !service.applyManagerConfig(context.Background(), configCommit{cfg: updatedCfg}) {
+		t.Fatal("apply prefix heat config update failed")
+	}
+	if got := manager.Selector(); got != selector {
+		t.Fatalf("prefix-only config update replaced selector: got %T %p, want %p", got, got, selector)
+	}
+	authID, found := selector.BoundAuthSession("codex", "gpt-5.6-sol", coreauthOptionsForRoute("preserved-route"))
+	if !found || authID != "preserved-auth" {
+		t.Fatalf("preserved affinity binding = %q, %t; want preserved-auth, true", authID, found)
+	}
+}
+
+func coreauthOptionsForRoute(routeKey string) executor.Options {
+	return executor.Options{Metadata: map[string]any{
+		executor.CacheAffinityActiveMetadataKey:   true,
+		executor.CacheAffinityRouteKeyMetadataKey: routeKey,
+	}}
 }
 
 func TestHighCacheRoutingSelector(t *testing.T) {
@@ -60,6 +111,36 @@ func TestExpiryDrainIgnoreAffinityConfigFlowsIntoRoutingState(t *testing.T) {
 	})
 	if !state.expiryDrainIgnoreAffinity {
 		t.Fatal("expiry drain ignore-affinity switch was not preserved")
+	}
+	selector, ok := newRoutingSelector(state).(*coreauth.SessionAffinitySelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", newRoutingSelector(state))
+	}
+	defer selector.Stop()
+}
+
+func TestPrefixHeatConfigFlowsIntoRoutingState(t *testing.T) {
+	shadow := true
+	state := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+			Enabled:              true,
+			PrefixHeatEnabled:    true,
+			PrefixHeatShadow:     &shadow,
+			PrefixHeatTTL:        "17m",
+			PrefixHeatMaxEntries: 321,
+		}},
+	})
+	if !state.prefixHeatEnabled || !state.prefixHeatShadow {
+		t.Fatalf("prefix heat switches = enabled:%t shadow:%t, want true/true", state.prefixHeatEnabled, state.prefixHeatShadow)
+	}
+	if state.prefixHeatTTL != 17*time.Minute {
+		t.Fatalf("prefix heat TTL = %s, want 17m", state.prefixHeatTTL)
+	}
+	if state.prefixHeatMaxEntries != 321 {
+		t.Fatalf("prefix heat max entries = %d, want 321", state.prefixHeatMaxEntries)
+	}
+	if state.prefixHeatMinBytes != 4096 {
+		t.Fatalf("prefix heat minimum bytes = %d, want 4096", state.prefixHeatMinBytes)
 	}
 	selector, ok := newRoutingSelector(state).(*coreauth.SessionAffinitySelector)
 	if !ok {

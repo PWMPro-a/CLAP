@@ -76,6 +76,8 @@ const (
 	CacheAffinityUpstreamKeyMetadataKey = "__cliproxy_cache_affinity_upstream_key"
 	// CacheAffinityPoolKeyMetadataKey stores the websocket slot-affinity identity.
 	CacheAffinityPoolKeyMetadataKey = "__cliproxy_cache_affinity_pool_key"
+	// CacheAffinityPrefixFingerprintMetadataKey stores an exact irreversible fingerprint of an eligible reusable prompt prefix.
+	CacheAffinityPrefixFingerprintMetadataKey = "__cliproxy_cache_affinity_prefix_fingerprint"
 	// CacheAffinityActiveMetadataKey reports whether coordinator decisions are active rather than shadow-only.
 	CacheAffinityActiveMetadataKey = "__cliproxy_cache_affinity_active"
 )

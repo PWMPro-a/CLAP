@@ -17,7 +17,7 @@ func TestEnrichUsesDerivedConversationInsteadOfSharedCaller(t *testing.T) {
 	first := requestFixture("first-user", "derived-a")
 	second := requestFixture("second-user", "derived-b")
 
-	_, firstOpts, firstDecision := Enrich(first.req, first.opts, cfg)
+	firstReq, firstOpts, firstDecision := Enrich(first.req, first.opts, cfg)
 	_, _, secondDecision := Enrich(second.req, second.opts, cfg)
 	if firstDecision.RouteKey == "" || secondDecision.RouteKey == "" {
 		t.Fatal("route key is empty")
@@ -30,6 +30,122 @@ func TestEnrichUsesDerivedConversationInsteadOfSharedCaller(t *testing.T) {
 	}
 	if got := MetadataValue(firstOpts.Metadata, cliproxyexecutor.CacheAffinityRouteKeyMetadataKey); got != firstDecision.RouteKey {
 		t.Fatalf("metadata route key = %q, want %q", got, firstDecision.RouteKey)
+	}
+	if firstDecision.PrefixFP == "" {
+		t.Fatal("prefix fingerprint is empty")
+	}
+	if firstDecision.PrefixHeatFP != "" {
+		t.Fatalf("small reusable prefix fingerprint = %q, want empty", firstDecision.PrefixHeatFP)
+	}
+	if got := MetadataValue(firstOpts.Metadata, cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey); got != "" {
+		t.Fatalf("options reusable prefix fingerprint = %q, want empty", got)
+	}
+	if got := MetadataValue(firstReq.Metadata, cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey); got != "" {
+		t.Fatalf("request reusable prefix fingerprint = %q, want empty", got)
+	}
+}
+
+func TestSettingsNormalizesPrefixHeatConfiguration(t *testing.T) {
+	defaults := Settings(&internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:           true,
+		PrefixHeatEnabled: true,
+	}}})
+	if !defaults.PrefixHeatEnabled {
+		t.Fatal("prefix heat enabled setting was not preserved")
+	}
+	if defaults.PrefixHeatTTL != defaultPrefixHeatTTL {
+		t.Fatalf("default prefix heat TTL = %s, want %s", defaults.PrefixHeatTTL, defaultPrefixHeatTTL)
+	}
+	if defaults.PrefixHeatMaxEntries != defaults.MaxEntries {
+		t.Fatalf("default prefix heat max entries = %d, want max entries %d", defaults.PrefixHeatMaxEntries, defaults.MaxEntries)
+	}
+
+	shadow := true
+	custom := Settings(&internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:              true,
+		PrefixHeatEnabled:    true,
+		PrefixHeatShadow:     &shadow,
+		PrefixHeatTTL:        "25m",
+		PrefixHeatMaxEntries: 1234,
+		PrefixHeatMinBytes:   2048,
+	}}})
+	if !custom.PrefixHeatShadow {
+		t.Fatal("prefix heat shadow setting was not preserved")
+	}
+	if custom.PrefixHeatTTL != 25*time.Minute {
+		t.Fatalf("custom prefix heat TTL = %s, want 25m", custom.PrefixHeatTTL)
+	}
+	if custom.PrefixHeatMaxEntries != 1234 {
+		t.Fatalf("custom prefix heat max entries = %d, want 1234", custom.PrefixHeatMaxEntries)
+	}
+	if custom.PrefixHeatMinBytes != 2048 {
+		t.Fatalf("custom prefix heat minimum bytes = %d, want 2048", custom.PrefixHeatMinBytes)
+	}
+}
+
+func TestSettingsDefaultsPrefixHeatShadowOn(t *testing.T) {
+	settings := Settings(&internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:           true,
+		PrefixHeatEnabled: true,
+	}}})
+	if !settings.PrefixHeatShadow {
+		t.Fatal("omitted prefix heat shadow setting did not default on")
+	}
+	shadow := false
+	settings = Settings(&internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:           true,
+		PrefixHeatEnabled: true,
+		PrefixHeatShadow:  &shadow,
+	}}})
+	if settings.PrefixHeatShadow {
+		t.Fatal("explicit false prefix heat shadow setting was not preserved")
+	}
+}
+
+func TestEnrichPublishesOnlyExactEligibleReusablePrefix(t *testing.T) {
+	shortCfg := &internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:            true,
+		PrefixHeatEnabled:  true,
+		PrefixHeatMinBytes: 64,
+	}}}
+	short := requestFixture("hello", "derived-short-prefix")
+	short.req.Payload = []byte(`{"model":"gpt-5.6-sol","instructions":"tiny","input":"hello"}`)
+	short.opts.OriginalRequest = short.req.Payload
+	_, shortOpts, shortDecision := Enrich(short.req, short.opts, shortCfg)
+	if shortDecision.PrefixHeatFP != "" {
+		t.Fatalf("short prefix fingerprint = %q, want empty", shortDecision.PrefixHeatFP)
+	}
+	if got := MetadataValue(shortOpts.Metadata, cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey); got != "" {
+		t.Fatalf("short prefix metadata = %q, want empty", got)
+	}
+
+	largeCfg := &internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:            true,
+		PrefixHeatEnabled:  true,
+		PrefixHeatMinBytes: 64,
+	}}}
+	first := requestFixture("first", "derived-exact-prefix")
+	first.req.Payload = []byte(`{"model":"gpt-5.6-sol","instructions":"` + strings.Repeat("alpha", 32) + `","input":"first"}`)
+	first.opts.OriginalRequest = first.req.Payload
+	second := requestFixture("second", "derived-exact-prefix")
+	second.req.Payload = []byte(`{"model":"gpt-5.6-sol","instructions":"` + strings.Repeat("bravo", 32) + `","input":"second"}`)
+	second.opts.OriginalRequest = second.req.Payload
+	_, firstOpts, firstDecision := Enrich(first.req, first.opts, largeCfg)
+	_, secondOpts, secondDecision := Enrich(second.req, second.opts, largeCfg)
+	if firstDecision.PrefixHeatFP == "" || secondDecision.PrefixHeatFP == "" {
+		t.Fatalf("eligible prefix fingerprints = %q, %q; want non-empty", firstDecision.PrefixHeatFP, secondDecision.PrefixHeatFP)
+	}
+	if firstDecision.PrefixHeatFP == secondDecision.PrefixHeatFP {
+		t.Fatalf("changed exact prefix reused fingerprint %q", firstDecision.PrefixHeatFP)
+	}
+	if firstDecision.PrefixFP != secondDecision.PrefixFP {
+		t.Fatalf("diagnostic fingerprint was unexpectedly recomputed inside inspection interval: %q != %q", firstDecision.PrefixFP, secondDecision.PrefixFP)
+	}
+	if got := MetadataValue(firstOpts.Metadata, cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey); got != firstDecision.PrefixHeatFP {
+		t.Fatalf("first exact prefix metadata = %q, want %q", got, firstDecision.PrefixHeatFP)
+	}
+	if got := MetadataValue(secondOpts.Metadata, cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey); got != secondDecision.PrefixHeatFP {
+		t.Fatalf("second exact prefix metadata = %q, want %q", got, secondDecision.PrefixHeatFP)
 	}
 }
 

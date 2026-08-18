@@ -323,11 +323,20 @@ func (m *Manager) SetSelector(selector Selector) {
 		selector = &RoundRobinSelector{}
 	}
 	m.mu.Lock()
+	previous := m.selector
 	m.selector = selector
 	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
+	}
+	if previousAffinity, ok := previous.(*SessionAffinitySelector); ok && previousAffinity != nil {
+		currentAffinity, sameType := selector.(*SessionAffinitySelector)
+		if !sameType || previousAffinity != currentAffinity {
+			previousAffinity.Stop()
+		}
+	} else if stoppable, ok := previous.(StoppableSelector); ok && stoppable != nil {
+		stoppable.Stop()
 	}
 }
 

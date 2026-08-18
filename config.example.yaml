@@ -305,6 +305,16 @@ codex:
     # These local checks do not add network work to the SSE request path.
     max-session-requests: 500
     max-session-duration: "1h"
+    # Track successful prompt-prefix/account combinations and use them only for
+    # cold/new sessions after all group, priority, quota, expiry, and concurrency
+    # filters have run. Existing affinity bindings are never changed by this.
+    prefix-heat-enabled: false
+    # Shadow mode records matching hot candidates without changing selection.
+    prefix-heat-shadow: true
+    prefix-heat-ttl: "10m"
+    prefix-heat-max-entries: 65536
+    # Ignore prefixes below this approximate 1K-token cacheability threshold.
+    prefix-heat-min-bytes: 4096
     # New sessions avoid credentials at or above this collected usage ratio.
     quota-preempt-used-ratio: 0.97
     # Existing warm sessions leave a credential at or above this ratio. Set

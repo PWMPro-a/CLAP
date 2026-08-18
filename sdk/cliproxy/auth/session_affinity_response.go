@@ -17,6 +17,10 @@ type sessionAffinityLookup interface {
 	BoundAuthSession(provider, model string, opts cliproxyexecutor.Options) (string, bool)
 }
 
+type cacheAffinitySuccessRecorder interface {
+	RecordCacheAffinitySuccess(authID string, metadata map[string]any)
+}
+
 func (m *Manager) bindSessionAffinityFromResponsePayload(_ context.Context, provider, model, authID string, payload []byte) {
 	if m == nil || len(payload) == 0 || strings.TrimSpace(authID) == "" {
 		return
