@@ -65,6 +65,25 @@ func occupyNormalConcurrencyForTest(t *testing.T, manager *Manager, authID strin
 	})
 }
 
+func occupyTailBurstFallbackConcurrencyForTest(t *testing.T, manager *Manager, authID string, count int) {
+	t.Helper()
+	auth := tailBurstAuthForTest(t, manager, authID)
+	auth.tailBurstFallbackMaxConcurrency = defaultCodexTailBurstFallbackConcurrency
+	releases := make([]func(), 0, count)
+	for i := 0; i < count; i++ {
+		release, acquired, reason, _ := auth.acquireRuntimeSlotForModel(time.Now(), "", false)
+		if !acquired {
+			t.Fatalf("occupy fallback slot %d for %s: %s", i+1, authID, reason)
+		}
+		releases = append(releases, release)
+	}
+	t.Cleanup(func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	})
+}
+
 func freezeQuotaPreemptForTest(t *testing.T, manager *Manager, authID string) {
 	t.Helper()
 	auth := tailBurstAuthForTest(t, manager, authID)
@@ -690,7 +709,7 @@ func TestCodexTailBurstFailureUsesNormalCapacityBeforeBurstFallback(t *testing.T
 	}
 }
 
-func TestCodexTailBurstFailureRanksBurstFallbackAfterNormalPoolSaturates(t *testing.T) {
+func TestCodexTailBurstFailurePrefersLowerConcurrencyAfterNormalPoolSaturates(t *testing.T) {
 	now := time.Now()
 	executor := &runtimeLimitTestExecutor{firstErrors: map[string]error{
 		"expiring": &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"},
@@ -704,6 +723,7 @@ func TestCodexTailBurstFailureRanksBurstFallbackAfterNormalPoolSaturates(t *test
 	manager.SetRetryConfig(0, 0, 1)
 	occupyNormalConcurrencyForTest(t, manager, "healthy-high", defaultCodexTailBurstNormalConcurrency)
 	occupyNormalConcurrencyForTest(t, manager, "healthy-low", defaultCodexTailBurstNormalConcurrency)
+	occupyTailBurstFallbackConcurrencyForTest(t, manager, "healthy-high", 4)
 	freezeQuotaPreemptForTest(t, manager, "healthy-high")
 
 	manager.mu.Lock()
@@ -725,15 +745,15 @@ func TestCodexTailBurstFailureRanksBurstFallbackAfterNormalPoolSaturates(t *test
 	if errExecute != nil {
 		t.Fatalf("Execute: %v", errExecute)
 	}
-	if got := string(response.Payload); got != "healthy-high" {
-		t.Fatalf("burst-fallback payload = %q, want healthy-high", got)
+	if got := string(response.Payload); got != "healthy-low" {
+		t.Fatalf("burst-fallback payload = %q, want healthy-low", got)
 	}
 
 	executor.mu.Lock()
 	calls := append([]string(nil), executor.calls...)
 	executor.mu.Unlock()
-	if len(calls) != 2 || calls[0] != "expiring" || calls[1] != "healthy-high" {
-		t.Fatalf("execution order = %v, want [expiring healthy-high]", calls)
+	if len(calls) != 2 || calls[0] != "expiring" || calls[1] != "healthy-low" {
+		t.Fatalf("execution order = %v, want [expiring healthy-low]", calls)
 	}
 }
 

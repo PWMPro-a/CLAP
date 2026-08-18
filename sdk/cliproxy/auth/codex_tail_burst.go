@@ -787,6 +787,9 @@ func (m *Manager) pickCodexTailBurstFallbackAuth(ctx context.Context, model stri
 		if left.tailBurstActive != right.tailBurstActive {
 			return !left.tailBurstActive
 		}
+		if left.currentConcurrency != right.currentConcurrency {
+			return left.currentConcurrency < right.currentConcurrency
+		}
 		if left.successRate != right.successRate {
 			return left.successRate > right.successRate
 		}
@@ -795,9 +798,6 @@ func (m *Manager) pickCodexTailBurstFallbackAuth(ctx context.Context, model stri
 		}
 		if left.recentSuccesses != right.recentSuccesses {
 			return left.recentSuccesses > right.recentSuccesses
-		}
-		if left.currentConcurrency != right.currentConcurrency {
-			return left.currentConcurrency < right.currentConcurrency
 		}
 		return left.auth.ID < right.auth.ID
 	})
