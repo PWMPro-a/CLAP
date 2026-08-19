@@ -210,7 +210,11 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 
 	if provider != "" {
 		if exec, ok := m.Executor(provider); ok && exec != nil {
-			if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
+			if closer, okCloser := exec.(AuthExecutionSessionCloser); okCloser {
+				closer.CloseExecutionSessionsForAuthID(id, "auth_removed")
+			} else if closer, okCloser := exec.(ExecutionSessionCloser); okCloser {
+				// Preserve the legacy cleanup behavior for providers that have not
+				// adopted per-auth session ownership yet.
 				closer.CloseExecutionSession(CloseAllExecutionSessionsID)
 			}
 		}

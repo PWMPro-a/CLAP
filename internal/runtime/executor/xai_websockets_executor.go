@@ -1406,6 +1406,22 @@ func closeXAIWebsocketSession(sess *codexWebsocketSession, reason string) {
 	}
 }
 
+func closeXAIWebsocketSessionWhenIdle(sess *codexWebsocketSession, reason string) {
+	if sess == nil {
+		return
+	}
+	if sess.reqMu.TryLock() {
+		defer sess.reqMu.Unlock()
+		closeXAIWebsocketSession(sess, reason)
+		return
+	}
+	go func() {
+		sess.reqMu.Lock()
+		defer sess.reqMu.Unlock()
+		closeXAIWebsocketSession(sess, reason)
+	}()
+}
+
 func buildXAIWebsocketRequestBody(body []byte) []byte {
 	if len(body) == 0 {
 		return nil
@@ -1516,9 +1532,9 @@ func logXAIWebsocketDisconnected(sessionID string, authID string, wsURL string, 
 	log.Infof("xai websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
 }
 
-// CloseXAIWebsocketSessionsForAuthID closes all active xAI upstream websocket sessions
-// associated with the supplied auth ID.
-func CloseXAIWebsocketSessionsForAuthID(authID string, reason string) {
+// CloseExecutionSessionsForAuthID removes one auth's xAI websocket sessions
+// from reuse immediately and closes each connection after its active request drains.
+func (e *XAIWebsocketsExecutor) CloseExecutionSessionsForAuthID(authID string, reason string) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return
@@ -1528,9 +1544,16 @@ func CloseXAIWebsocketSessionsForAuthID(authID string, reason string) {
 		reason = "auth_removed"
 	}
 
-	store := globalXAIWebsocketSessionStore
+	store := e.store
+	if store == nil {
+		store = globalXAIWebsocketSessionStore
+	}
 	if store == nil {
 		return
+	}
+	idStore := e.idStore
+	if idStore == nil {
+		idStore = globalXAIWebsocketIDStates
 	}
 
 	type sessionItem struct {
@@ -1570,14 +1593,20 @@ func CloseXAIWebsocketSessionsForAuthID(authID string, reason string) {
 			continue
 		}
 		delete(store.sessions, matches[i].sessionID)
-		deleteXAIWebsocketIDState(globalXAIWebsocketIDStates, matches[i].sessionID)
+		deleteXAIWebsocketIDState(idStore, matches[i].sessionID)
 		toClose = append(toClose, current)
 	}
 	store.mu.Unlock()
 
 	for i := range toClose {
-		closeXAIWebsocketSession(toClose[i], reason)
+		closeXAIWebsocketSessionWhenIdle(toClose[i], reason)
 	}
+}
+
+// CloseXAIWebsocketSessionsForAuthID closes all active xAI upstream websocket sessions
+// associated with the supplied auth ID.
+func CloseXAIWebsocketSessionsForAuthID(authID string, reason string) {
+	(&XAIWebsocketsExecutor{store: globalXAIWebsocketSessionStore, idStore: globalXAIWebsocketIDStates}).CloseExecutionSessionsForAuthID(authID, reason)
 }
 
 // XAIAutoExecutor routes xAI stream requests to the websocket transport only
@@ -1655,6 +1684,13 @@ func (e *XAIAutoExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 	e.wsExec.CloseExecutionSession(sessionID)
+}
+
+func (e *XAIAutoExecutor) CloseExecutionSessionsForAuthID(authID string, reason string) {
+	if e == nil || e.wsExec == nil {
+		return
+	}
+	e.wsExec.CloseExecutionSessionsForAuthID(authID, reason)
 }
 
 func (e *XAIAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {

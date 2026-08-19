@@ -14,6 +14,8 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+const codexWebsocketSafeRequestBytes = 24 * 1024
+
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
 //
 // It preserves the existing CodexExecutor HTTP implementation as a fallback for endpoints
@@ -81,7 +83,7 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if codexWebsocketStreamEnabled(auth, opts) {
+	if codexWebsocketStreamEnabled(ctx, auth, req, opts) {
 		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
@@ -90,12 +92,28 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
 }
 
-func codexWebsocketStreamEnabled(auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) bool {
+func codexWebsocketStreamEnabled(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
 	if !codexWebsocketsEnabled(auth) || opts.Alt == "responses/compact" {
 		return false
 	}
 	// Multipart/direct image traffic remains on the dedicated HTTP adapter.
-	return !isCodexOpenAIImageRequest(opts)
+	if isCodexOpenAIImageRequest(opts) {
+		return false
+	}
+	// Large JSON messages are rejected by the upstream websocket endpoint with
+	// close code 1009. Plain HTTP/SSE callers can use the equivalent HTTP
+	// transport, while downstream websocket sessions keep their protocol and
+	// incremental-context guarantees.
+	if !cliproxyexecutor.DownstreamWebsocket(ctx) && !cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
+		requestBytes := len(req.Payload)
+		if len(opts.OriginalRequest) > requestBytes {
+			requestBytes = len(opts.OriginalRequest)
+		}
+		if requestBytes > codexWebsocketSafeRequestBytes {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *CodexAutoExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
@@ -124,6 +142,13 @@ func (e *CodexAutoExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 	e.wsExec.CloseExecutionSession(sessionID)
+}
+
+func (e *CodexAutoExecutor) CloseExecutionSessionsForAuthID(authID string, reason string) {
+	if e == nil || e.wsExec == nil {
+		return
+	}
+	e.wsExec.CloseExecutionSessionsForAuthID(authID, reason)
 }
 
 func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {

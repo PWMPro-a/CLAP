@@ -49,6 +49,12 @@ type ExecutionSessionCloser interface {
 	CloseExecutionSession(sessionID string)
 }
 
+// AuthExecutionSessionCloser allows executors to release runtime resources
+// owned by one auth without interrupting sessions that use other credentials.
+type AuthExecutionSessionCloser interface {
+	CloseExecutionSessionsForAuthID(authID string, reason string)
+}
+
 // Result captures execution outcome used to adjust auth state.
 type Result struct {
 	// AuthID references the auth that produced this result.

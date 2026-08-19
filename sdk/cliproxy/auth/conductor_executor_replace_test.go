@@ -14,6 +14,8 @@ type replaceAwareExecutor struct {
 
 	mu               sync.Mutex
 	closedSessionIDs []string
+	closedAuthIDs    []string
+	closedReasons    []string
 }
 
 func (e *replaceAwareExecutor) Identifier() string {
@@ -48,12 +50,27 @@ func (e *replaceAwareExecutor) CloseExecutionSession(sessionID string) {
 	e.closedSessionIDs = append(e.closedSessionIDs, sessionID)
 }
 
+func (e *replaceAwareExecutor) CloseExecutionSessionsForAuthID(authID string, reason string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.closedAuthIDs = append(e.closedAuthIDs, authID)
+	e.closedReasons = append(e.closedReasons, reason)
+}
+
 func (e *replaceAwareExecutor) ClosedSessionIDs() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]string, len(e.closedSessionIDs))
 	copy(out, e.closedSessionIDs)
 	return out
+}
+
+func (e *replaceAwareExecutor) ClosedAuths() ([]string, []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	authIDs := append([]string(nil), e.closedAuthIDs...)
+	reasons := append([]string(nil), e.closedReasons...)
+	return authIDs, reasons
 }
 
 func TestManagerRegisterExecutorClosesReplacedExecutionSessions(t *testing.T) {
@@ -100,5 +117,30 @@ func TestManagerExecutorReturnsRegisteredExecutor(t *testing.T) {
 	_, okMissing := manager.Executor("unknown")
 	if okMissing {
 		t.Fatal("expected unknown provider lookup to fail")
+	}
+}
+
+func TestManagerRemoveClosesOnlyRemovedAuthExecutionSessions(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	executor := &replaceAwareExecutor{id: "codex"}
+	manager.RegisterExecutor(executor)
+	auth := &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.Remove(context.Background(), auth.ID)
+
+	if closed := executor.ClosedSessionIDs(); len(closed) != 0 {
+		t.Fatalf("provider-wide close calls = %v, want none", closed)
+	}
+	authIDs, reasons := executor.ClosedAuths()
+	if len(authIDs) != 1 || authIDs[0] != auth.ID {
+		t.Fatalf("auth close calls = %v, want [%s]", authIDs, auth.ID)
+	}
+	if len(reasons) != 1 || reasons[0] != "auth_removed" {
+		t.Fatalf("auth close reasons = %v, want [auth_removed]", reasons)
 	}
 }

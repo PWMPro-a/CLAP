@@ -102,6 +102,11 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 }
 
 func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
+	if conn != nil {
+		// Reused connections can be close to the idle deadline installed by the
+		// reader loop. Give every newly sent request a full liveness window.
+		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
+	}
 	if sess != nil {
 		return sess.writeMessage(conn, websocket.TextMessage, payload)
 	}

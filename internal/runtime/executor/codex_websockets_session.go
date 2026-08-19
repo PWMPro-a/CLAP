@@ -732,6 +732,22 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	}
 }
 
+func closeCodexWebsocketSessionWhenIdle(sess *codexWebsocketSession, reason string) {
+	if sess == nil {
+		return
+	}
+	if sess.reqMu.TryLock() {
+		defer sess.reqMu.Unlock()
+		closeCodexWebsocketSession(sess, reason)
+		return
+	}
+	go func() {
+		sess.reqMu.Lock()
+		defer sess.reqMu.Unlock()
+		closeCodexWebsocketSession(sess, reason)
+	}()
+}
+
 func logCodexWebsocketConnected(sessionID string, authID string, wsURL string) {
 	log.Infof("codex websockets: upstream connected session=%s auth=%s url=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL))
 }
@@ -744,9 +760,9 @@ func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string
 	log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
 }
 
-// CloseCodexWebsocketSessionsForAuthID closes all active Codex upstream websocket sessions
-// associated with the supplied auth ID.
-func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
+// CloseExecutionSessionsForAuthID removes one auth's Codex websocket sessions
+// from reuse immediately and closes each connection after its active request drains.
+func (e *CodexWebsocketsExecutor) CloseExecutionSessionsForAuthID(authID string, reason string) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return
@@ -756,7 +772,10 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 		reason = "auth_removed"
 	}
 
-	store := globalCodexWebsocketSessionStore
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
 	if store == nil {
 		return
 	}
@@ -811,9 +830,15 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 	store.mu.Unlock()
 
 	for i := range toClose {
-		closeCodexWebsocketSession(toClose[i], reason)
+		closeCodexWebsocketSessionWhenIdle(toClose[i], reason)
 	}
 	for i := range statelessMatches {
-		closeCodexWebsocketSession(statelessMatches[i], reason)
+		closeCodexWebsocketSessionWhenIdle(statelessMatches[i], reason)
 	}
+}
+
+// CloseCodexWebsocketSessionsForAuthID closes all active Codex upstream websocket sessions
+// associated with the supplied auth ID.
+func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
+	(&CodexWebsocketsExecutor{store: globalCodexWebsocketSessionStore}).CloseExecutionSessionsForAuthID(authID, reason)
 }
