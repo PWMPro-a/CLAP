@@ -16,7 +16,6 @@ const (
 	defaultCodexTailBurstRemainingRatio      = 0.02
 	defaultCodexTailBurstSnapshotTTL         = 90 * time.Second
 	defaultCodexTailBurstExpiryWindow        = 10 * time.Minute
-	defaultCodexTailBurstNormalConcurrency   = 8
 	defaultCodexTailBurstFallbackConcurrency = 32
 	defaultCodexTailBurstConcurrency         = 32
 
@@ -59,7 +58,6 @@ type codexTailBurstSettings struct {
 	triggerRatio           float64
 	snapshotTTL            time.Duration
 	expiryWindow           time.Duration
-	normalMaxConcurrency   int
 	fallbackMaxConcurrency int
 	maxConcurrency         int
 }
@@ -69,7 +67,6 @@ func (m *Manager) codexTailBurstSettings() codexTailBurstSettings {
 		triggerRatio:           1 - defaultCodexTailBurstRemainingRatio,
 		snapshotTTL:            defaultCodexTailBurstSnapshotTTL,
 		expiryWindow:           defaultCodexTailBurstExpiryWindow,
-		normalMaxConcurrency:   defaultCodexTailBurstNormalConcurrency,
 		fallbackMaxConcurrency: defaultCodexTailBurstFallbackConcurrency,
 		maxConcurrency:         defaultCodexTailBurstConcurrency,
 	}
@@ -94,9 +91,6 @@ func (m *Manager) codexTailBurstSettings() codexTailBurstSettings {
 	}
 	if parsed, errParse := time.ParseDuration(strings.TrimSpace(tailCfg.ExpiryWindow)); errParse == nil && parsed > 0 {
 		settings.expiryWindow = parsed
-	}
-	if tailCfg.NormalMaxConcurrency > 0 {
-		settings.normalMaxConcurrency = tailCfg.NormalMaxConcurrency
 	}
 	if tailCfg.FallbackMaxConcurrency > 0 {
 		settings.fallbackMaxConcurrency = tailCfg.FallbackMaxConcurrency
@@ -393,17 +387,12 @@ func (m *Manager) refreshCodexTailBurstCandidates() {
 			continue
 		}
 		isCodex := strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex")
-		cacheAffinityLimit := 0
-		if isCodex && cacheSettings.active {
-			cacheAffinityLimit = cacheSettings.maxConcurrency
-		}
-		auth.setCodexCacheAffinityMaxConcurrency(cacheAffinityLimit)
-		authTailBurstEnabled := isCodex && codexTailBurstEnabledForAuth(auth)
 		normalLimit := 0
-		if settings.enabled && authTailBurstEnabled {
-			normalLimit = settings.normalMaxConcurrency
+		if isCodex && cacheSettings.active {
+			normalLimit = cacheSettings.maxConcurrency
 		}
-		auth.setCodexTailBurstNormalMaxConcurrency(normalLimit)
+		auth.setCodexCacheAffinityMaxConcurrency(normalLimit)
+		authTailBurstEnabled := isCodex && codexTailBurstEnabledForAuth(auth)
 		if !settings.enabled || !authTailBurstEnabled || auth.Disabled || auth.Status == StatusDisabled {
 			continue
 		}

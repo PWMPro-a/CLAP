@@ -34,7 +34,6 @@ func TestPutConfigYAMLReloadsRuntimeConfig(t *testing.T) {
     snapshot-ttl: "90s"
     trigger-remaining-ratio: 0.2
     expiry-window: "10m"
-    normal-max-concurrency: 8
     max-concurrency: 300
     quota-collector:
       enabled: true
@@ -54,7 +53,7 @@ func TestPutConfigYAMLReloadsRuntimeConfig(t *testing.T) {
 	select {
 	case reloaded := <-reloads:
 		tailBurst := reloaded.Codex.TailBurst
-		if !tailBurst.Enabled || tailBurst.SnapshotTTL != "90s" || tailBurst.NormalMaxConcurrency != 8 || tailBurst.MaxConcurrency != 300 {
+		if !tailBurst.Enabled || tailBurst.SnapshotTTL != "90s" || tailBurst.MaxConcurrency != 300 {
 			t.Fatalf("reloaded tail-burst config = %#v", tailBurst)
 		}
 		if !tailBurst.QuotaCollector.Enabled || tailBurst.QuotaCollector.Interval != "15s" || tailBurst.QuotaCollector.MaxConcurrency != 10 {

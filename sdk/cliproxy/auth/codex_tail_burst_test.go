@@ -10,6 +10,8 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+const testCacheAffinityMaxConcurrency = 8
+
 func newTailBurstConfig() *internalconfig.Config {
 	return &internalconfig.Config{
 		Codex: internalconfig.CodexConfig{
@@ -22,6 +24,13 @@ func newTailBurstConfig() *internalconfig.Config {
 			},
 		},
 	}
+}
+
+func newTailBurstConfigWithCacheAffinityLimit(limit int) *internalconfig.Config {
+	cfg := newTailBurstConfig()
+	cfg.Codex.CacheAffinity.Enabled = true
+	cfg.Codex.CacheAffinity.MaxConcurrency = limit
+	return cfg
 }
 
 func updateTailBurstSnapshot(t *testing.T, manager *Manager, authID string) {
@@ -104,11 +113,7 @@ func configureTailBurstAffinityManager(manager *Manager) (*SessionAffinitySelect
 		CacheAffinityEnabled: true,
 	})
 	manager.SetSelector(selector)
-	cfg := newTailBurstConfig()
-	cfg.Codex.CacheAffinity = internalconfig.CodexCacheAffinityConfig{
-		Enabled:        true,
-		MaxConcurrency: 8,
-	}
+	cfg := newTailBurstConfigWithCacheAffinityLimit(testCacheAffinityMaxConcurrency)
 	manager.SetConfig(cfg)
 	return selector, cfg
 }
@@ -231,24 +236,21 @@ func TestCodexTailBurstFirstSuccessBecomesWarmBinding(t *testing.T) {
 	}
 }
 
-func TestCodexTailBurstNormalConcurrencyCapIsIndependent(t *testing.T) {
+func TestCodexCacheAffinityAndTailBurstConcurrencyCapsAreIndependent(t *testing.T) {
 	now := time.Now().UTC()
 	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
 		&Auth{ID: "normal-cap", Provider: "codex", Status: StatusActive},
 	)
-	cfg := newTailBurstConfig()
+	cfg := newTailBurstConfigWithCacheAffinityLimit(testCacheAffinityMaxConcurrency)
 	cfg.Codex.TailBurst.MaxConcurrency = 300
 	manager.SetConfig(cfg)
 
 	auth := tailBurstAuthForTest(t, manager, "normal-cap")
 	settings := manager.codexTailBurstSettings()
-	if settings.normalMaxConcurrency != 8 {
-		t.Fatalf("normal max concurrency = %d, want default 8", settings.normalMaxConcurrency)
-	}
 	auth.tailBurstMaxConcurrency = settings.maxConcurrency
 
 	releases := make([]func(), 0, 300)
-	for i := 0; i < 8; i++ {
+	for i := 0; i < testCacheAffinityMaxConcurrency; i++ {
 		release, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false)
 		if !acquired {
 			t.Fatalf("normal slot %d not acquired: %s", i+1, reason)
@@ -259,7 +261,7 @@ func TestCodexTailBurstNormalConcurrencyCapIsIndependent(t *testing.T) {
 		t.Fatalf("normal slot 9 acquired=%t reason=%q, want false/concurrency_limit", acquired, reason)
 	}
 
-	for i := 8; i < 300; i++ {
+	for i := testCacheAffinityMaxConcurrency; i < 300; i++ {
 		release, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", true)
 		if !acquired {
 			t.Fatalf("tail-burst slot %d not acquired: %s", i+1, reason)
@@ -282,11 +284,11 @@ func TestCodexTailBurstFallbackConcurrencyCapIsIndependent(t *testing.T) {
 	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
 		&Auth{ID: "fallback-cap", Provider: "codex", Status: StatusActive},
 	)
-	manager.SetConfig(newTailBurstConfig())
+	manager.SetConfig(newTailBurstConfigWithCacheAffinityLimit(testCacheAffinityMaxConcurrency))
 
 	normalAuth := tailBurstAuthForTest(t, manager, "fallback-cap")
 	releases := make([]func(), 0, defaultCodexTailBurstFallbackConcurrency)
-	for i := 0; i < defaultCodexTailBurstNormalConcurrency; i++ {
+	for i := 0; i < testCacheAffinityMaxConcurrency; i++ {
 		release, acquired, reason, _ := normalAuth.acquireRuntimeSlotForModel(now, "gpt-5", false)
 		if !acquired {
 			t.Fatalf("normal slot %d not acquired: %s", i+1, reason)
@@ -296,7 +298,7 @@ func TestCodexTailBurstFallbackConcurrencyCapIsIndependent(t *testing.T) {
 
 	fallbackAuth := tailBurstAuthForTest(t, manager, "fallback-cap")
 	fallbackAuth.tailBurstFallbackMaxConcurrency = manager.codexTailBurstSettings().fallbackMaxConcurrency
-	for i := defaultCodexTailBurstNormalConcurrency; i < defaultCodexTailBurstFallbackConcurrency; i++ {
+	for i := testCacheAffinityMaxConcurrency; i < defaultCodexTailBurstFallbackConcurrency; i++ {
 		release, acquired, reason, _ := fallbackAuth.acquireRuntimeSlotForModel(now, "gpt-5", false)
 		if !acquired {
 			t.Fatalf("fallback slot %d not acquired: %s", i+1, reason)
@@ -347,13 +349,12 @@ func TestCodexTailBurstFallbackPreservesHardRuntimeFreezes(t *testing.T) {
 	}
 }
 
-func TestCodexTailBurstNormalConcurrencyCapHotReloads(t *testing.T) {
+func TestCodexCacheAffinityNormalConcurrencyCapHotReloads(t *testing.T) {
 	now := time.Now().UTC()
 	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
 		&Auth{ID: "hot-reload-cap", Provider: "codex", Status: StatusActive},
 	)
-	cfg := newTailBurstConfig()
-	cfg.Codex.TailBurst.NormalMaxConcurrency = 2
+	cfg := newTailBurstConfigWithCacheAffinityLimit(2)
 	manager.SetConfig(cfg)
 	auth := tailBurstAuthForTest(t, manager, "hot-reload-cap")
 
@@ -371,7 +372,7 @@ func TestCodexTailBurstNormalConcurrencyCapHotReloads(t *testing.T) {
 		t.Fatalf("third slot before reload acquired=%t reason=%q, want false/concurrency_limit", acquired, reason)
 	}
 
-	cfg.Codex.TailBurst.NormalMaxConcurrency = 3
+	cfg.Codex.CacheAffinity.MaxConcurrency = 3
 	manager.SetConfig(cfg)
 	thirdRelease, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false)
 	if !acquired {
@@ -379,11 +380,11 @@ func TestCodexTailBurstNormalConcurrencyCapHotReloads(t *testing.T) {
 	}
 	defer thirdRelease()
 
-	cfg.Codex.TailBurst.Enabled = false
+	cfg.Codex.CacheAffinity.Enabled = false
 	manager.SetConfig(cfg)
 	fourthRelease, acquired, reason, _ := auth.acquireRuntimeSlotForModel(now, "gpt-5", false)
 	if !acquired {
-		t.Fatalf("fourth slot after disabling tail burst not acquired: %s", reason)
+		t.Fatalf("fourth slot after disabling cache affinity not acquired: %s", reason)
 	}
 	defer fourthRelease()
 }
@@ -673,9 +674,9 @@ func TestCodexTailBurstFailureUsesNormalCapacityBeforeBurstFallback(t *testing.T
 		&Auth{ID: "healthy-high", Provider: "codex", Status: StatusActive},
 		&Auth{ID: "healthy-low", Provider: "codex", Status: StatusActive},
 	)
-	manager.SetConfig(newTailBurstConfig())
+	manager.SetConfig(newTailBurstConfigWithCacheAffinityLimit(testCacheAffinityMaxConcurrency))
 	manager.SetRetryConfig(0, 0, 1)
-	occupyNormalConcurrencyForTest(t, manager, "healthy-high", defaultCodexTailBurstNormalConcurrency)
+	occupyNormalConcurrencyForTest(t, manager, "healthy-high", testCacheAffinityMaxConcurrency)
 	freezeQuotaPreemptForTest(t, manager, "healthy-high")
 
 	manager.mu.Lock()
@@ -719,10 +720,10 @@ func TestCodexTailBurstFailurePrefersLowerConcurrencyAfterNormalPoolSaturates(t 
 		&Auth{ID: "healthy-high", Provider: "codex", Status: StatusActive},
 		&Auth{ID: "healthy-low", Provider: "codex", Status: StatusActive},
 	)
-	manager.SetConfig(newTailBurstConfig())
+	manager.SetConfig(newTailBurstConfigWithCacheAffinityLimit(testCacheAffinityMaxConcurrency))
 	manager.SetRetryConfig(0, 0, 1)
-	occupyNormalConcurrencyForTest(t, manager, "healthy-high", defaultCodexTailBurstNormalConcurrency)
-	occupyNormalConcurrencyForTest(t, manager, "healthy-low", defaultCodexTailBurstNormalConcurrency)
+	occupyNormalConcurrencyForTest(t, manager, "healthy-high", testCacheAffinityMaxConcurrency)
+	occupyNormalConcurrencyForTest(t, manager, "healthy-low", testCacheAffinityMaxConcurrency)
 	occupyTailBurstFallbackConcurrencyForTest(t, manager, "healthy-high", 4)
 	freezeQuotaPreemptForTest(t, manager, "healthy-high")
 
@@ -763,7 +764,7 @@ func TestCodexTailBurstFrozenCandidateFallsBackAboveNormalConcurrencyCap(t *test
 		&Auth{ID: "tail-frozen", Provider: "codex", Status: StatusActive},
 		&Auth{ID: "healthy", Provider: "codex", Status: StatusActive},
 	)
-	manager.SetConfig(newTailBurstConfig())
+	manager.SetConfig(newTailBurstConfigWithCacheAffinityLimit(testCacheAffinityMaxConcurrency))
 	updateTailBurstSnapshot(t, manager, "tail-frozen")
 
 	tailAuth := tailBurstAuthForTest(t, manager, "tail-frozen")
@@ -771,7 +772,7 @@ func TestCodexTailBurstFrozenCandidateFallsBackAboveNormalConcurrencyCap(t *test
 	if !tailAuth.freezeUpstreamRateLimit(time.Now(), &retryAfter) {
 		t.Fatal("tail credential was not frozen")
 	}
-	occupyNormalConcurrencyForTest(t, manager, "healthy", defaultCodexTailBurstNormalConcurrency)
+	occupyNormalConcurrencyForTest(t, manager, "healthy", testCacheAffinityMaxConcurrency)
 	freezeQuotaPreemptForTest(t, manager, "healthy")
 
 	response, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
@@ -808,12 +809,12 @@ func TestCodexTailBurstStream429FallsBackAboveNormalConcurrencyCap(t *testing.T)
 			t.Fatalf("Register(%s): %v", auth.ID, errRegister)
 		}
 	}
-	cfg := newTailBurstConfig()
+	cfg := newTailBurstConfigWithCacheAffinityLimit(testCacheAffinityMaxConcurrency)
 	cfg.Routing.NewCandidateMode = true
 	manager.SetConfig(cfg)
 	manager.SetRetryConfig(0, 0, 1)
 	updateTailBurstSnapshot(t, manager, "tail-stream")
-	occupyNormalConcurrencyForTest(t, manager, "healthy-stream", defaultCodexTailBurstNormalConcurrency)
+	occupyNormalConcurrencyForTest(t, manager, "healthy-stream", testCacheAffinityMaxConcurrency)
 	freezeQuotaPreemptForTest(t, manager, "healthy-stream")
 
 	result, errStream := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{

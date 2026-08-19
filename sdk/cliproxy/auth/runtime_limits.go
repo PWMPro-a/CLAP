@@ -50,12 +50,9 @@ type authRuntimeLimits struct {
 	// collector. Request-time reads remain lock-free.
 	codexQuotaSnapshots atomic.Value
 
-	// codexTailBurstNormalMaxConcurrency is updated on config/auth lifecycle
-	// events. It caps normal traffic while leaving the tail-burst lane independent.
-	codexTailBurstNormalMaxConcurrency atomic.Int64
-
-	// codexCacheAffinityMaxConcurrency caps cold requests and new affinity
-	// bindings. Established warm bindings bypass it to preserve cache locality.
+	// codexCacheAffinityMaxConcurrency caps cold requests and new affinity bindings.
+	// Established warm bindings bypass it to preserve cache locality, while the
+	// tail-burst lane keeps its independent concurrency ceiling.
 	codexCacheAffinityMaxConcurrency atomic.Int64
 }
 
@@ -135,16 +132,6 @@ func (a *Auth) setCodexCacheAffinityMaxConcurrency(limit int) {
 	a.ensureRuntimeLimits().codexCacheAffinityMaxConcurrency.Store(int64(limit))
 }
 
-func (a *Auth) setCodexTailBurstNormalMaxConcurrency(limit int) {
-	if a == nil {
-		return
-	}
-	if limit < 0 {
-		limit = 0
-	}
-	a.ensureRuntimeLimits().codexTailBurstNormalMaxConcurrency.Store(int64(limit))
-}
-
 func codexNormalConcurrencyLimit(state *authRuntimeLimits, configuredLimit int, affinityBypass bool) int {
 	if affinityBypass {
 		return configuredLimit
@@ -152,13 +139,9 @@ func codexNormalConcurrencyLimit(state *authRuntimeLimits, configuredLimit int, 
 	if state == nil {
 		return configuredLimit
 	}
-	for _, normalLimit := range []int{
-		int(state.codexTailBurstNormalMaxConcurrency.Load()),
-		int(state.codexCacheAffinityMaxConcurrency.Load()),
-	} {
-		if normalLimit > 0 && (configuredLimit <= 0 || normalLimit < configuredLimit) {
-			configuredLimit = normalLimit
-		}
+	normalLimit := int(state.codexCacheAffinityMaxConcurrency.Load())
+	if normalLimit > 0 && (configuredLimit <= 0 || normalLimit < configuredLimit) {
+		configuredLimit = normalLimit
 	}
 	return configuredLimit
 }
