@@ -216,6 +216,10 @@ func (d *sourceIPDialer) Dial(network, addr string) (net.Conn, error) {
 	return d.dialer.Dial(network, addr)
 }
 
+func (d *sourceIPDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return d.dialer.DialContext(ctx, network, addr)
+}
+
 func parseSourceIP(sourceIP string) (net.IP, error) {
 	trimmed := strings.TrimSpace(sourceIP)
 	if trimmed == "" {

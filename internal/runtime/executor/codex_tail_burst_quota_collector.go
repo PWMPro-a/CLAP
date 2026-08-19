@@ -23,6 +23,8 @@ const (
 	defaultCodexQuotaCollectorConcurrency = 4
 	defaultCodexQuotaCollectorTimeout     = 8 * time.Second
 	defaultCodexQuotaCollectorSnapshotTTL = 90 * time.Second
+	codexQuotaCollectorPublishInterval    = 250 * time.Millisecond
+	codexQuotaCollectorPublishBatchSize   = 16
 	maxCodexQuotaUsageResponseSize        = 256 << 10
 )
 
@@ -31,6 +33,19 @@ type codexTailBurstQuotaCollectorSettings struct {
 	maxConcurrency int
 	timeout        time.Duration
 	snapshotTTL    time.Duration
+}
+
+type codexTailBurstQuotaFetchFunc func(
+	context.Context,
+	*config.Config,
+	*cliproxyauth.Auth,
+	time.Duration,
+) (cliproxyauth.CodexQuotaSnapshot, error)
+
+type codexTailBurstQuotaFetchResult struct {
+	authID   string
+	snapshot cliproxyauth.CodexQuotaSnapshot
+	err      error
 }
 
 // StartCodexTailBurstQuotaCollector starts the asynchronous Codex usage
@@ -121,54 +136,115 @@ func collectCodexTailBurstQuotaSnapshots(
 	cfg *config.Config,
 	settings codexTailBurstQuotaCollectorSettings,
 ) {
+	collectCodexTailBurstQuotaSnapshotsWithFetcher(ctx, manager, cfg, settings, fetchCodexTailBurstQuotaSnapshot)
+}
+
+func collectCodexTailBurstQuotaSnapshotsWithFetcher(
+	ctx context.Context,
+	manager *cliproxyauth.Manager,
+	cfg *config.Config,
+	settings codexTailBurstQuotaCollectorSettings,
+	fetch codexTailBurstQuotaFetchFunc,
+) {
 	if manager == nil {
 		return
 	}
+	if fetch == nil {
+		fetch = fetchCodexTailBurstQuotaSnapshot
+	}
 	auths := manager.List()
-	jobs := make(chan *cliproxyauth.Auth)
-	updates := make([]cliproxyauth.CodexQuotaSnapshotUpdate, 0, len(auths))
-	var updatesMu sync.Mutex
+	eligible := make([]*cliproxyauth.Auth, 0, len(auths))
+	for _, auth := range auths {
+		if codexTailBurstQuotaAuthEligible(auth) {
+			eligible = append(eligible, auth)
+		}
+	}
+	if len(eligible) == 0 {
+		return
+	}
+
+	jobs := make(chan *cliproxyauth.Auth, len(eligible))
+	for _, auth := range eligible {
+		jobs <- auth
+	}
+	close(jobs)
+
 	var workers sync.WaitGroup
 	workerCount := settings.maxConcurrency
-	if workerCount > len(auths) {
-		workerCount = len(auths)
+	if workerCount < 1 {
+		workerCount = 1
 	}
+	if workerCount > len(eligible) {
+		workerCount = len(eligible)
+	}
+	results := make(chan codexTailBurstQuotaFetchResult, workerCount*2)
 	for i := 0; i < workerCount; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for auth := range jobs {
 				requestCtx, cancel := context.WithTimeout(ctx, settings.timeout)
-				snapshot, err := fetchCodexTailBurstQuotaSnapshot(requestCtx, cfg, auth, settings.snapshotTTL)
+				snapshot, err := fetch(requestCtx, cfg, auth, settings.snapshotTTL)
 				cancel()
-				if err != nil {
-					log.WithError(err).Debugf("codex tail-burst quota collector: auth %s", auth.ID)
-					continue
+				result := codexTailBurstQuotaFetchResult{authID: auth.ID, snapshot: snapshot, err: err}
+				select {
+				case <-ctx.Done():
+					return
+				case results <- result:
 				}
-				updatesMu.Lock()
-				updates = append(updates, cliproxyauth.CodexQuotaSnapshotUpdate{AuthID: auth.ID, Snapshot: snapshot})
-				updatesMu.Unlock()
 			}
 		}()
 	}
-	for _, auth := range auths {
-		if !codexTailBurstQuotaAuthEligible(auth) {
-			continue
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+
+	publishTicker := time.NewTicker(codexQuotaCollectorPublishInterval)
+	defer publishTicker.Stop()
+	updates := make([]cliproxyauth.CodexQuotaSnapshotUpdate, 0, codexQuotaCollectorPublishBatchSize)
+	acceptedTotal := 0
+	failureTotal := 0
+	flush := func() {
+		if len(updates) == 0 {
+			return
 		}
+		accepted, err := manager.UpdateCodexQuotaSnapshots(updates)
+		if err != nil {
+			log.WithError(err).Warn("codex tail-burst quota collector: store snapshot batch")
+		} else {
+			acceptedTotal += accepted
+		}
+		updates = updates[:0]
+	}
+
+	for {
 		select {
 		case <-ctx.Done():
-			close(jobs)
-			workers.Wait()
+			flush()
 			return
-		case jobs <- auth:
+		case <-publishTicker.C:
+			flush()
+		case result, ok := <-results:
+			if !ok {
+				flush()
+				if acceptedTotal == 0 {
+					log.Warnf("codex tail-burst quota collector: published no snapshots from %d eligible credentials (%d failures)", len(eligible), failureTotal)
+				} else {
+					log.Debugf("codex tail-burst quota collector: published %d usage snapshots from %d eligible credentials (%d failures)", acceptedTotal, len(eligible), failureTotal)
+				}
+				return
+			}
+			if result.err != nil {
+				failureTotal++
+				log.WithError(result.err).Debugf("codex tail-burst quota collector: auth %s", result.authID)
+				continue
+			}
+			updates = append(updates, cliproxyauth.CodexQuotaSnapshotUpdate{AuthID: result.authID, Snapshot: result.snapshot})
+			if len(updates) >= codexQuotaCollectorPublishBatchSize {
+				flush()
+			}
 		}
-	}
-	close(jobs)
-	workers.Wait()
-	if accepted, err := manager.UpdateCodexQuotaSnapshots(updates); err != nil {
-		log.WithError(err).Debug("codex tail-burst quota collector: store snapshot batch")
-	} else if accepted > 0 {
-		log.Debugf("codex tail-burst quota collector: published %d usage snapshots", accepted)
 	}
 }
 

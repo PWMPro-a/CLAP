@@ -20,12 +20,90 @@ import (
 
 	tls "github.com/refraction-networking/utls"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"golang.org/x/net/http2"
 )
 
 type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f utlsClientRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type blockingUTLSDialer struct {
+	started chan struct{}
+}
+
+func (d *blockingUTLSDialer) Dial(_, _ string) (net.Conn, error) {
+	return nil, errors.New("blockingUTLSDialer requires DialContext")
+}
+
+func (d *blockingUTLSDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	select {
+	case d.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestUTLSRoundTripperDialHonorsRequestContext(t *testing.T) {
+	t.Parallel()
+
+	roundTripper := &utlsRoundTripper{
+		connections: make(map[string]*http2.ClientConn),
+		pending:     make(map[string]chan struct{}),
+		dialer:      &blockingUTLSDialer{started: make(chan struct{}, 1)},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
+	if errRequest != nil {
+		t.Fatal(errRequest)
+	}
+
+	_, errRoundTrip := roundTripper.RoundTrip(req)
+	if !errors.Is(errRoundTrip, context.DeadlineExceeded) {
+		t.Fatalf("RoundTrip() error = %v, want context deadline exceeded", errRoundTrip)
+	}
+}
+
+func TestUTLSRoundTripperPendingConnectionWaitHonorsContext(t *testing.T) {
+	t.Parallel()
+
+	dialer := &blockingUTLSDialer{started: make(chan struct{}, 1)}
+	roundTripper := &utlsRoundTripper{
+		connections: make(map[string]*http2.ClientConn),
+		pending:     make(map[string]chan struct{}),
+		dialer:      dialer,
+	}
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := roundTripper.getOrCreateConnection(firstCtx, "chatgpt.com", "chatgpt.com:443")
+		firstDone <- err
+	}()
+	select {
+	case <-dialer.started:
+	case <-time.After(time.Second):
+		t.Fatal("first dial did not start")
+	}
+
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelSecond()
+	_, errSecond := roundTripper.getOrCreateConnection(secondCtx, "chatgpt.com", "chatgpt.com:443")
+	if !errors.Is(errSecond, context.DeadlineExceeded) {
+		t.Fatalf("pending connection wait error = %v, want context deadline exceeded", errSecond)
+	}
+
+	cancelFirst()
+	select {
+	case errFirst := <-firstDone:
+		if !errors.Is(errFirst, context.Canceled) {
+			t.Fatalf("first dial error = %v, want context canceled", errFirst)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first dial did not stop after cancellation")
+	}
 }
 
 type claudeCodeTLSFingerprintFixture struct {

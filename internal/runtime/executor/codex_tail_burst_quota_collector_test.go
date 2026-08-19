@@ -1,11 +1,14 @@
 package executor
 
 import (
+	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestParseCodexTailBurstQuotaSnapshotUsesMostConstrainedWindow(t *testing.T) {
@@ -99,6 +102,77 @@ func TestResolveCodexTailBurstQuotaCollectorSettingsForCacheAffinity(t *testing.
 	}
 	if settings.interval != 15*time.Second || settings.maxConcurrency != 2 {
 		t.Fatalf("unexpected cache-affinity collector settings: %#v", settings)
+	}
+}
+
+func TestCollectCodexTailBurstQuotaSnapshotsPublishesBeforeSlowCredentialFinishes(t *testing.T) {
+	manager := cliproxyauth.NewManager(nil, nil, nil)
+	for _, authID := range []string{"fast", "slow"} {
+		if _, errRegister := manager.Register(t.Context(), &cliproxyauth.Auth{
+			ID:       authID,
+			Provider: "codex",
+			Status:   cliproxyauth.StatusActive,
+			Metadata: map[string]any{"access_token": "test-token"},
+		}); errRegister != nil {
+			t.Fatalf("register %s: %v", authID, errRegister)
+		}
+	}
+
+	slowRelease := make(chan struct{})
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		collectCodexTailBurstQuotaSnapshotsWithFetcher(
+			context.Background(),
+			manager,
+			&config.Config{},
+			codexTailBurstQuotaCollectorSettings{
+				maxConcurrency: 2,
+				timeout:        time.Second,
+				snapshotTTL:    time.Minute,
+			},
+			func(ctx context.Context, _ *config.Config, auth *cliproxyauth.Auth, ttl time.Duration) (cliproxyauth.CodexQuotaSnapshot, error) {
+				if auth.ID == "slow" {
+					select {
+					case <-ctx.Done():
+						return cliproxyauth.CodexQuotaSnapshot{}, ctx.Err()
+					case <-slowRelease:
+						return cliproxyauth.CodexQuotaSnapshot{}, errors.New("released slow credential")
+					}
+				}
+				now := time.Now()
+				return cliproxyauth.CodexQuotaSnapshot{
+					UsedRatio: 0.9,
+					SampledAt: now,
+					ExpiresAt: now.Add(ttl),
+				}, nil
+			},
+		)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, ok := manager.CodexQuotaSnapshot("fast", "*"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(slowRelease)
+			<-collectorDone
+			t.Fatal("fast quota snapshot was not published while the slow credential was still running")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	select {
+	case <-collectorDone:
+		t.Fatal("collector finished before the slow credential was released")
+	default:
+	}
+	close(slowRelease)
+	select {
+	case <-collectorDone:
+	case <-time.After(time.Second):
+		t.Fatal("collector did not finish after the slow credential was released")
 	}
 }
 
