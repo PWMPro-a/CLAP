@@ -532,80 +532,19 @@ func withCodexTailBurstSelected(opts cliproxyexecutor.Options) cliproxyexecutor.
 	return opts
 }
 
-// codexTailBurstWarmAffinityAuth checks whether an existing session binding is
-// already inside the active tail-burst pool before that pool performs normal
-// round-robin selection.
-//
-// Normal-account bindings deliberately do not suppress tail-burst routing: the
-// first successful burst request migrates the binding to the selected tail
-// credential. Once migrated, this lookup keeps subsequent requests on that
-// credential until its burst capacity or a hard availability gate is reached.
-func (m *Manager) codexTailBurstWarmAffinityAuth(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, settings codexTailBurstSettings) (*Auth, bool) {
-	if m == nil {
-		return nil, false
-	}
-	lookup, ok := m.Selector().(sessionAffinityLookup)
-	if !ok || lookup == nil {
-		return nil, false
-	}
-	authID, ok := lookup.BoundAuthSession("codex", model, opts)
-	if !ok || strings.TrimSpace(authID) == "" {
-		return nil, false
-	}
-	if _, alreadyTried := tried[authID]; alreadyTried {
-		return nil, false
-	}
+type codexTailBurstTargetAvailability uint8
 
-	var auth *Auth
-	if m.newCandidateMode() && m.scheduler != nil {
-		auth = m.scheduler.snapshotAuth(authID)
-	} else {
-		m.mu.RLock()
-		auth = m.auths[authID]
-		if auth != nil {
-			auth = auth.Clone()
-		}
-		m.mu.RUnlock()
-	}
-	if auth == nil || auth.Disabled || auth.Status == StatusDisabled || !strings.EqualFold(strings.TrimSpace(executorKeyFromAuth(auth)), "codex") {
-		return nil, false
-	}
-	if !authSelectionEligibilityForRequest(ctx, opts).allows(auth) || !m.authSupportsRouteModel(registry.GetGlobalRegistry(), auth, model) {
-		return nil, false
-	}
-
-	now := time.Now()
-	if IsAuthLifecycleBlocking(auth) || authQuotaExceeded(auth, model) || runtimeAuthHasUsageLimitFreeze(auth, now) {
-		return nil, false
-	}
-	cacheSettings := m.cacheAffinitySettings()
-	if cacheSettings.active {
-		if snapshot, okSnapshot := auth.codexQuotaSnapshot(model, now); okSnapshot && snapshot.UsedRatio >= cacheSettings.hardStopRatio {
-			return nil, false
-		}
-	}
-	if !m.codexTailBurstActive(auth, model, now) {
-		return nil, false
-	}
-	auth.tailBurstMaxConcurrency = settings.maxConcurrency
-	if blocked, _, _ := isAuthBlockedForModelWithTailBurst(auth, model, now, true); blocked {
-		return nil, false
-	}
-	return auth.Clone(), true
-}
+const (
+	codexTailBurstTargetUnavailable codexTailBurstTargetAvailability = iota
+	codexTailBurstTargetTemporaryFallback
+	codexTailBurstTargetReady
+)
 
 func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, bool) {
 	if m == nil || m.HomeEnabled() || !codexTailBurstRequested(opts) || pinnedAuthIDFromMetadata(opts.Metadata) != "" || disallowFreeAuthFromMetadata(opts.Metadata) {
 		return nil, nil, false
 	}
 	settings := m.codexTailBurstSettings()
-	if warmAuth, protectWarm := m.codexTailBurstWarmAffinityAuth(ctx, model, opts, tried, settings); protectWarm {
-		executor, okExecutor := m.Executor("codex")
-		if !okExecutor || executor == nil {
-			return nil, nil, false
-		}
-		return warmAuth, executor, true
-	}
 	index, _ := m.codexTailBurstCandidates.Load().(codexTailBurstCandidateIndex)
 	key := normalizeCodexTailBurstModel(model)
 	candidateIDs := make([]string, 0, len(index[key])+len(index["*"]))
@@ -636,7 +575,6 @@ func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts
 	if len(candidateIDs) == 0 {
 		return nil, nil, false
 	}
-	start := int(m.codexTailBurstSequence.Add(1)-1) % len(candidateIDs)
 	now := time.Now()
 	registryRef := registry.GetGlobalRegistry()
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -645,11 +583,8 @@ func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts
 	if !okExecutor || executor == nil {
 		return nil, nil, false
 	}
-	for offset := 0; offset < len(candidateIDs); offset++ {
-		authID := candidateIDs[(start+offset)%len(candidateIDs)]
-		if _, alreadyTried := tried[authID]; alreadyTried {
-			continue
-		}
+
+	loadCandidate := func(authID string) (*Auth, codexTailBurstTargetAvailability) {
 		var auth *Auth
 		if m.newCandidateMode() && m.scheduler != nil {
 			auth = m.scheduler.snapshotAuth(authID)
@@ -661,14 +596,69 @@ func (m *Manager) pickCodexTailBurstAuth(ctx context.Context, model string, opts
 			}
 			m.mu.RUnlock()
 		}
-		if auth == nil || auth.Disabled || !eligibility.allows(auth) || !m.authSupportsRouteModel(registryRef, auth, model) || !m.codexTailBurstActive(auth, model, now) {
-			continue
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled || IsAuthLifecycleBlocking(auth) {
+			return nil, codexTailBurstTargetUnavailable
+		}
+		if availability, ok := auth.Runtime.(runtimeSelectionAvailability); ok && availability != nil && !availability.RuntimeSelectionAvailable() {
+			return nil, codexTailBurstTargetUnavailable
+		}
+		if blocked, _, _ := authModelAvailabilityBlock(auth, model, now); blocked || authQuotaExceeded(auth, model) {
+			return nil, codexTailBurstTargetUnavailable
+		}
+		// Account-group policy, model capability and the current tail threshold are
+		// request/model-specific. They send this request through normal routing but
+		// do not move the shared target used by other traffic.
+		if !eligibility.allows(auth) || !m.authSupportsRouteModel(registryRef, auth, model) || !m.codexTailBurstActive(auth, model, now) {
+			return nil, codexTailBurstTargetTemporaryFallback
 		}
 		auth.tailBurstMaxConcurrency = settings.maxConcurrency
-		if blocked, _, _ := isAuthBlockedForModelWithTailBurst(auth, model, now, true); blocked {
+		if blocked, reason, retryAt := runtimeAuthBlockedForModelWithTailBurst(auth, model, now, true); blocked {
+			if reason == blockReasonOther && retryAt.IsZero() {
+				// The tail concurrency ceiling is a healthy saturation signal. Keep the
+				// target and let only this request fall back to normal routing.
+				return nil, codexTailBurstTargetTemporaryFallback
+			}
+			// An active error/rate-limit freeze means the credential is genuinely not
+			// accepting requests, so the next candidate may become the shared target.
+			return nil, codexTailBurstTargetUnavailable
+		}
+		return auth.Clone(), codexTailBurstTargetReady
+	}
+
+	// Tail scheduling is deliberately serialized only for the small target
+	// decision. Requests release this lock before credential preparation or any
+	// network work, so the target can receive its full configured concurrency.
+	// Session affinity must not split this lane across multiple tail accounts.
+	m.codexTailBurstTargetMu.Lock()
+	defer m.codexTailBurstTargetMu.Unlock()
+
+	if targetID := strings.TrimSpace(m.codexTailBurstTarget); targetID != "" {
+		target, availability := loadCandidate(targetID)
+		if availability != codexTailBurstTargetUnavailable {
+			if _, alreadyTried := tried[targetID]; alreadyTried {
+				// A retry-local exclusion does not prove that the shared target stopped
+				// accepting traffic. Keep it sticky and let this request use the normal
+				// fallback lane instead of moving every subsequent request.
+				return nil, nil, false
+			}
+			if availability == codexTailBurstTargetReady {
+				return target, executor, true
+			}
+			return nil, nil, false
+		}
+		m.codexTailBurstTarget = ""
+	}
+
+	for _, authID := range candidateIDs {
+		if _, alreadyTried := tried[authID]; alreadyTried {
 			continue
 		}
-		return auth.Clone(), executor, true
+		auth, availability := loadCandidate(authID)
+		if availability != codexTailBurstTargetReady {
+			continue
+		}
+		m.codexTailBurstTarget = authID
+		return auth, executor, true
 	}
 	return nil, nil, false
 }

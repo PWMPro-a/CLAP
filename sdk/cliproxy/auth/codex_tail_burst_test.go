@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -140,7 +141,7 @@ func TestCodexTailBurstMigratesNormalWarmBindingIntoTailPool(t *testing.T) {
 	}
 }
 
-func TestCodexTailBurstWarmTailCredentialKeepsBindingAndBurstCapacity(t *testing.T) {
+func TestCodexTailBurstGlobalTargetOverridesWarmBindingAndKeepsBurstCapacity(t *testing.T) {
 	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
 		&Auth{ID: "warm-tail", Provider: "codex", Status: StatusActive, Metadata: map[string]any{"max_concurrency": 1}},
 		&Auth{ID: "other-tail", Provider: "codex", Status: StatusActive},
@@ -155,24 +156,139 @@ func TestCodexTailBurstWarmTailCredentialKeepsBindingAndBurstCapacity(t *testing
 		}
 	}
 
-	actual := tailBurstAuthForTest(t, manager, "warm-tail")
+	first, errFirst := manager.SelectAuth(context.Background(), "codex", "", tailBurstAffinityOptions("first-route"))
+	if errFirst != nil || first == nil || first.ID != "other-tail" {
+		t.Fatalf("initial concentrated target = %v, %v; want other-tail", first, errFirst)
+	}
+
+	actual := tailBurstAuthForTest(t, manager, "other-tail")
 	occupiedRelease, occupied, reason, _ := actual.acquireRuntimeSlotForModel(time.Now(), "", false)
 	if !occupied {
-		t.Fatalf("occupy warm credential normal slot: %s", reason)
+		t.Fatalf("occupy target credential normal slot: %s", reason)
 	}
 	defer occupiedRelease()
 	actual.updateQuotaPreempt(time.Now(), time.Now().Add(time.Hour), true)
 
 	selector.BindAuthSession("codex", "", "cache-affinity:warm-tail-route", "warm-tail")
 	selected, errSelected := manager.SelectAuth(context.Background(), "codex", "", tailBurstAffinityOptions("warm-tail-route"))
-	if errSelected != nil || selected == nil || selected.ID != "warm-tail" {
-		t.Fatalf("warm tail credential selection = %v, %v; want warm-tail", selected, errSelected)
+	if errSelected != nil || selected == nil || selected.ID != "other-tail" {
+		t.Fatalf("warm binding selection = %v, %v; want concentrated other-tail", selected, errSelected)
 	}
 	burstRelease, acquired, reason, _ := selected.acquireRuntimeSlotForModel(time.Now(), "", true)
 	if !acquired {
 		t.Fatalf("warm tail credential did not receive burst capacity: %s", reason)
 	}
 	burstRelease()
+}
+
+func TestCodexTailBurstConcentratesIndependentRoutesOnOneTarget(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "tail-a", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "tail-b", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "tail-c", Provider: "codex", Status: StatusActive},
+	)
+	selector, _ := configureTailBurstAffinityManager(manager)
+	defer selector.Stop()
+	for _, authID := range []string{"tail-a", "tail-b", "tail-c"} {
+		updateTailBurstSnapshot(t, manager, authID)
+	}
+
+	for i := 0; i < 24; i++ {
+		selected, errSelected := manager.SelectAuth(context.Background(), "codex", "", tailBurstAffinityOptions(fmt.Sprintf("route-%d", i)))
+		if errSelected != nil || selected == nil || selected.ID != "tail-a" {
+			t.Fatalf("route %d selected %v, %v; want concentrated tail-a", i, selected, errSelected)
+		}
+	}
+}
+
+func TestCodexTailBurstRetryDoesNotMoveSharedTarget(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "tail-a", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "tail-b", Provider: "codex", Status: StatusActive},
+	)
+	manager.SetConfig(newTailBurstConfig())
+	for _, authID := range []string{"tail-a", "tail-b"} {
+		updateTailBurstSnapshot(t, manager, authID)
+	}
+	opts := tailBurstAffinityOptions("sticky-retry")
+
+	first, _, okFirst := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{})
+	if !okFirst || first == nil || first.ID != "tail-a" {
+		t.Fatalf("initial target = %v ok=%t; want tail-a", first, okFirst)
+	}
+	if retried, _, okRetry := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{"tail-a": {}}); okRetry || retried != nil {
+		t.Fatalf("retry-local exclusion moved target to %v ok=%t", retried, okRetry)
+	}
+	fresh, _, okFresh := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{})
+	if !okFresh || fresh == nil || fresh.ID != "tail-a" {
+		t.Fatalf("target after retry = %v ok=%t; want tail-a", fresh, okFresh)
+	}
+}
+
+func TestCodexTailBurstSaturatedTargetFallsBackWithoutMigrating(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "tail-a", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "tail-b", Provider: "codex", Status: StatusActive},
+	)
+	manager.SetConfig(newTailBurstConfig())
+	for _, authID := range []string{"tail-a", "tail-b"} {
+		updateTailBurstSnapshot(t, manager, authID)
+	}
+	opts := tailBurstAffinityOptions("saturated-target")
+
+	target, _, okTarget := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{})
+	if !okTarget || target == nil || target.ID != "tail-a" {
+		t.Fatalf("initial target = %v ok=%t; want tail-a", target, okTarget)
+	}
+	releases := make([]func(), 0, defaultCodexTailBurstConcurrency)
+	for i := 0; i < defaultCodexTailBurstConcurrency; i++ {
+		release, acquired, reason, _ := target.acquireRuntimeSlotForModel(time.Now(), "", true)
+		if !acquired {
+			t.Fatalf("occupy tail slot %d: %s", i+1, reason)
+		}
+		releases = append(releases, release)
+	}
+	if selected, _, okSelected := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{}); okSelected || selected != nil {
+		t.Fatalf("saturated target migrated to %v ok=%t; want normal fallback", selected, okSelected)
+	}
+	for _, release := range releases {
+		release()
+	}
+
+	selected, _, okSelected := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{})
+	if !okSelected || selected == nil || selected.ID != "tail-a" {
+		t.Fatalf("target after saturation = %v ok=%t; want sticky tail-a", selected, okSelected)
+	}
+}
+
+func TestCodexTailBurstMovesTargetOnlyAfterCurrentBecomesUnavailable(t *testing.T) {
+	manager := newRuntimeLimitManager(t, &runtimeLimitTestExecutor{},
+		&Auth{ID: "tail-a", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "tail-b", Provider: "codex", Status: StatusActive},
+	)
+	manager.SetConfig(newTailBurstConfig())
+	for _, authID := range []string{"tail-a", "tail-b"} {
+		updateTailBurstSnapshot(t, manager, authID)
+	}
+	opts := tailBurstAffinityOptions("migration")
+
+	first, _, okFirst := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{})
+	if !okFirst || first == nil || first.ID != "tail-a" {
+		t.Fatalf("initial target = %v ok=%t; want tail-a", first, okFirst)
+	}
+	manager.mu.Lock()
+	manager.auths["tail-a"].Quota = QuotaState{Exceeded: true}
+	manager.mu.Unlock()
+	manager.refreshCodexTailBurstCandidates()
+
+	migrated, _, okMigrated := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{})
+	if !okMigrated || migrated == nil || migrated.ID != "tail-b" {
+		t.Fatalf("migrated target = %v ok=%t; want tail-b", migrated, okMigrated)
+	}
+	fresh, _, okFresh := manager.pickCodexTailBurstAuth(context.Background(), "", opts, map[string]struct{}{})
+	if !okFresh || fresh == nil || fresh.ID != "tail-b" {
+		t.Fatalf("target after migration = %v ok=%t; want sticky tail-b", fresh, okFresh)
+	}
 }
 
 func TestCodexTailBurstReleasesUnavailableWarmBinding(t *testing.T) {

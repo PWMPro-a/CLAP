@@ -165,7 +165,10 @@ type Manager struct {
 	// asynchronous quota/config updates.
 	codexTailBurstCandidates       atomic.Value
 	codexTailBurstExpiryCandidates atomic.Value
-	codexTailBurstSequence         atomic.Uint64
+	// codexTailBurstTarget keeps all tail traffic concentrated on one credential.
+	// It moves only when the current credential enters a hard unavailable state.
+	codexTailBurstTargetMu sync.Mutex
+	codexTailBurstTarget   string
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
