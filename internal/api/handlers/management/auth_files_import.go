@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
@@ -245,6 +247,261 @@ func applyAuthFileImportDefaultsToData(
 	return append(canonical, '\n'), nil
 }
 
+func normalizeImportedCodexAuthFileData(data []byte, now time.Time) ([]byte, error) {
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return data, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(authMetadataString(metadata, "type")), "codex") {
+		return data, nil
+	}
+	if !normalizeImportedCodexAuthFileMetadata(metadata, now) {
+		return data, nil
+	}
+	canonical, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("serialize normalized Codex auth file: %w", err)
+	}
+	return append(canonical, '\n'), nil
+}
+
+func normalizeImportedCodexAuthFileMetadata(metadata map[string]any, now time.Time) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	changed := false
+	if token := authMetadataString(metadata, "session_access_token", "sessionAccessToken"); token != "" && authMetadataString(metadata, "access_token", "accessToken") == "" {
+		metadata["access_token"] = token
+		changed = true
+	}
+
+	claimMaps := make([]map[string]any, 0, 3)
+	if idTokenClaims := codexClaimsObjectFromValue(metadata["id_token"]); len(idTokenClaims) > 0 {
+		claimMaps = append(claimMaps, idTokenClaims)
+	}
+	if idTokenClaims := codexClaimsObjectFromValue(metadata["idToken"]); len(idTokenClaims) > 0 {
+		claimMaps = append(claimMaps, idTokenClaims)
+	}
+	if accessClaims := codexJWTClaimsMap(authMetadataString(metadata, "access_token", "accessToken", "session_access_token", "sessionAccessToken")); len(accessClaims) > 0 {
+		claimMaps = append(claimMaps, accessClaims)
+		if exp, ok := codexClaimUnix(accessClaims, "exp"); ok {
+			expiresAt := time.Unix(exp, 0).UTC()
+			if codexAuthFileExpiryNeedsRewrite(metadata["expired"]) {
+				metadata["expired"] = expiresAt.Format(time.RFC3339)
+				changed = true
+			}
+			if _, exists := metadata["expires_at"]; !exists {
+				metadata["expires_at"] = exp
+				changed = true
+			}
+			if _, exists := metadata["expires_in"]; !exists && expiresAt.After(now) {
+				metadata["expires_in"] = int64(expiresAt.Sub(now).Seconds())
+				changed = true
+			}
+		}
+		if iat, ok := codexClaimUnix(accessClaims, "iat"); ok && strings.TrimSpace(authMetadataString(metadata, "last_refresh", "lastRefresh")) == "" {
+			metadata["last_refresh"] = time.Unix(iat, 0).UTC().Format(time.RFC3339)
+			changed = true
+		}
+	}
+
+	for _, claims := range claimMaps {
+		changed = copyCodexClaimsToMetadata(metadata, claims) || changed
+	}
+	return changed
+}
+
+func codexClaimsObjectFromValue(value any) map[string]any {
+	switch typed := value.(type) {
+	case string:
+		if claims := codexJWTClaimsMap(typed); len(claims) > 0 {
+			return claims
+		}
+		var object map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(typed)), &object); err == nil {
+			return object
+		}
+	case map[string]any:
+		return typed
+	case map[string]string:
+		object := make(map[string]any, len(typed))
+		for key, item := range typed {
+			object[key] = item
+		}
+		return object
+	}
+	return nil
+}
+
+func codexJWTClaimsMap(token string) map[string]any {
+	token = strings.TrimSpace(token)
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+	}
+	if err != nil {
+		return nil
+	}
+	claims := make(map[string]any)
+	if err = json.Unmarshal(payload, &claims); err != nil {
+		return nil
+	}
+	return claims
+}
+
+func codexClaimUnix(claims map[string]any, key string) (int64, bool) {
+	if claims == nil {
+		return 0, false
+	}
+	switch value := claims[key].(type) {
+	case float64:
+		return int64(value), value > 0
+	case int64:
+		return value, value > 0
+	case int:
+		return int64(value), value > 0
+	case json.Number:
+		parsed, err := value.Int64()
+		return parsed, err == nil && parsed > 0
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		return parsed, err == nil && parsed > 0
+	default:
+		return 0, false
+	}
+}
+
+func codexAuthFileExpiryNeedsRewrite(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(typed) == ""
+	case bool:
+		return !typed
+	default:
+		return false
+	}
+}
+
+func copyCodexClaimsToMetadata(metadata map[string]any, claims map[string]any) bool {
+	if len(metadata) == 0 || len(claims) == 0 {
+		return false
+	}
+	changed := false
+	authInfo := codexNestedClaimsMap(claims, "https://api.openai.com/auth", "auth")
+	profileInfo := codexNestedClaimsMap(claims, "https://api.openai.com/profile", "profile")
+
+	if accountID := firstNonEmptyAuthMetadataString(
+		codexClaimString(authInfo, "chatgpt_account_id", "chatgptAccountId", "account_id", "accountId"),
+		codexClaimString(claims, "chatgpt_account_id", "chatgptAccountId", "account_id", "accountId"),
+	); accountID != "" {
+		changed = setMissingCodexMetadataString(metadata, accountID, "account_id", "chatgpt_account_id") || changed
+	}
+	if accountUserID := firstNonEmptyAuthMetadataString(
+		codexClaimString(authInfo, "chatgpt_account_user_id", "chatgptAccountUserId"),
+		codexClaimString(claims, "chatgpt_account_user_id", "chatgptAccountUserId"),
+	); accountUserID != "" {
+		changed = setMissingCodexMetadataString(metadata, accountUserID, "chatgpt_account_user_id") || changed
+	}
+	if userID := firstNonEmptyAuthMetadataString(
+		codexClaimString(authInfo, "chatgpt_user_id", "chatgptUserId", "user_id", "userId"),
+		codexClaimString(claims, "chatgpt_user_id", "chatgptUserId", "user_id", "userId"),
+	); userID != "" {
+		changed = setMissingCodexMetadataString(metadata, userID, "chatgpt_user_id", "user_id") || changed
+	}
+	if planType := firstNonEmptyAuthMetadataString(
+		codexClaimString(authInfo, "chatgpt_plan_type", "chatgptPlanType", "plan_type", "planType"),
+		codexClaimString(claims, "chatgpt_plan_type", "chatgptPlanType", "plan_type", "planType"),
+	); planType != "" {
+		changed = setMissingCodexMetadataString(metadata, strings.ToLower(planType), "chatgpt_plan_type", "plan_type") || changed
+	}
+	if email := firstNonEmptyAuthMetadataString(
+		codexClaimString(profileInfo, "email"),
+		codexClaimString(claims, "email"),
+	); email != "" {
+		changed = setMissingCodexMetadataString(metadata, strings.ToLower(email), "email") || changed
+	}
+	if name := firstNonEmptyAuthMetadataString(
+		codexClaimString(profileInfo, "name"),
+		codexClaimString(claims, "name"),
+	); name != "" {
+		changed = setMissingCodexMetadataString(metadata, name, "name") || changed
+	}
+	if poid := codexClaimString(authInfo, "poid", "organization_id", "organizationId"); poid != "" {
+		changed = setMissingCodexMetadataString(metadata, poid, "poid") || changed
+	}
+	return changed
+}
+
+func codexNestedClaimsMap(claims map[string]any, keys ...string) map[string]any {
+	for _, key := range keys {
+		value, ok := claims[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case map[string]any:
+			return typed
+		case map[string]string:
+			object := make(map[string]any, len(typed))
+			for nestedKey, nestedValue := range typed {
+				object[nestedKey] = nestedValue
+			}
+			return object
+		}
+	}
+	return nil
+}
+
+func codexClaimString(claims map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value := claims[key]
+		switch typed := value.(type) {
+		case string:
+			if trimmed := strings.TrimSpace(typed); trimmed != "" {
+				return trimmed
+			}
+		case json.Number:
+			if text := strings.TrimSpace(typed.String()); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func firstNonEmptyAuthMetadataString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func setMissingCodexMetadataString(metadata map[string]any, value string, keys ...string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	changed := false
+	for _, key := range keys {
+		if strings.TrimSpace(authMetadataString(metadata, key)) == "" {
+			metadata[key] = value
+			changed = true
+		}
+	}
+	return changed
+}
+
 func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []byte) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
@@ -254,6 +511,10 @@ func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []b
 	}
 	var err error
 	data, err = preserveExistingAgentIdentityCredentials(dst, data)
+	if err != nil {
+		return err
+	}
+	data, err = normalizeImportedCodexAuthFileData(data, time.Now())
 	if err != nil {
 		return err
 	}
