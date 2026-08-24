@@ -51,13 +51,17 @@ func newUtlsRoundTripperWithSourceIP(proxyURL string, sourceIP string) *utlsRoun
 }
 
 func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+	connectionKey := addr
+	if connectionKey == "" {
+		connectionKey = host
+	}
 	for {
 		t.mu.Lock()
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
+		if h2Conn, ok := t.connections[connectionKey]; ok && h2Conn.CanTakeNewRequest() {
 			t.mu.Unlock()
 			return h2Conn, nil
 		}
-		if pending, ok := t.pending[host]; ok {
+		if pending, ok := t.pending[connectionKey]; ok {
 			t.mu.Unlock()
 			select {
 			case <-ctx.Done():
@@ -68,16 +72,16 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr
 		}
 
 		pending := make(chan struct{})
-		t.pending[host] = pending
+		t.pending[connectionKey] = pending
 		t.mu.Unlock()
 
 		h2Conn, err := t.createConnection(ctx, host, addr)
 
 		t.mu.Lock()
-		delete(t.pending, host)
+		delete(t.pending, connectionKey)
 		close(pending)
 		if err == nil {
-			t.connections[host] = h2Conn
+			t.connections[connectionKey] = h2Conn
 		}
 		t.mu.Unlock()
 		return h2Conn, err
@@ -130,14 +134,34 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	resp, err := h2Conn.RoundTrip(req)
 	if err != nil {
 		t.mu.Lock()
-		if cached, ok := t.connections[hostname]; ok && cached == h2Conn {
-			delete(t.connections, hostname)
+		if cached, ok := t.connections[addr]; ok && cached == h2Conn {
+			delete(t.connections, addr)
 		}
 		t.mu.Unlock()
 		return nil, err
 	}
 
 	return resp, nil
+}
+
+func (t *utlsRoundTripper) CloseIdleConnections() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	connections := make([]*http2.ClientConn, 0, len(t.connections))
+	for key, h2Conn := range t.connections {
+		if h2Conn != nil {
+			connections = append(connections, h2Conn)
+		}
+		delete(t.connections, key)
+	}
+	t.mu.Unlock()
+	for _, h2Conn := range connections {
+		if errClose := h2Conn.Close(); errClose != nil {
+			log.Debugf("utls: close cached HTTP/2 connection: %v", errClose)
+		}
+	}
 }
 
 // claudeCodeSessionCacheCapacity bounds the per-transport TLS session cache for
@@ -219,8 +243,19 @@ func claudeCodeTLSClientHelloSpec() *tls.ClientHelloSpec {
 
 const claudeCodeRoundTripperCacheCapacity = 64
 
+const codexChromeRoundTripperCacheCapacity = 2048
+
 var claudeCodeRoundTripperCache = internalcache.NewBoundedLRU[string, http.RoundTripper](
 	claudeCodeRoundTripperCacheCapacity,
+	func(_ string, roundTripper http.RoundTripper) {
+		if transport, ok := roundTripper.(interface{ CloseIdleConnections() }); ok {
+			transport.CloseIdleConnections()
+		}
+	},
+)
+
+var codexChromeRoundTripperCache = internalcache.NewBoundedLRU[string, http.RoundTripper](
+	codexChromeRoundTripperCacheCapacity,
 	func(_ string, roundTripper http.RoundTripper) {
 		if transport, ok := roundTripper.(interface{ CloseIdleConnections() }); ok {
 			transport.CloseIdleConnections()
@@ -355,6 +390,23 @@ func newClaudeCodeRoundTripperWithSourceIP(proxyURL string, sourceIP string) htt
 	return transport
 }
 
+func cachedCodexChromeRoundTripperWithSourceIP(proxyURL string, sourceIP string, auth *cliproxyauth.Auth) http.RoundTripper {
+	cacheKey := codexChromeRoundTripperCacheKey(proxyURL, sourceIP, auth)
+	return codexChromeRoundTripperCache.GetOrAdd(cacheKey, func() http.RoundTripper {
+		return newUtlsRoundTripperWithSourceIP(proxyURL, sourceIP)
+	})
+}
+
+func codexChromeRoundTripperCacheKey(proxyURL string, sourceIP string, auth *cliproxyauth.Auth) string {
+	authKey := "anonymous"
+	if auth != nil {
+		if id := strings.TrimSpace(auth.ID); id != "" {
+			authKey = "id:" + id
+		}
+	}
+	return authKey + "\x00" + strings.TrimSpace(proxyURL) + "\x00" + strings.TrimSpace(sourceIP)
+}
+
 // fallbackRoundTripper uses provider-specific TLS fingerprints for protected
 // HTTPS hosts and falls back to the standard transport for all other requests.
 type fallbackRoundTripper struct {
@@ -385,7 +437,7 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var chromeRT http.RoundTripper = newUtlsRoundTripperWithSourceIP(proxyURL, sourceIP)
+	var chromeRT http.RoundTripper = cachedCodexChromeRoundTripperWithSourceIP(proxyURL, sourceIP, auth)
 	var anthropicRT http.RoundTripper = cachedClaudeCodeRoundTripperWithSourceIP(proxyURL, sourceIP)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" || sourceIP != "" {

@@ -29,6 +29,22 @@ func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 	}
 }
 
+func TestCachedCodexChromeRoundTripperReusesPerAuthTransport(t *testing.T) {
+	t.Parallel()
+
+	firstAuth := &cliproxyauth.Auth{ID: "auth-1"}
+	first := cachedCodexChromeRoundTripperWithSourceIP("", "", firstAuth)
+	second := cachedCodexChromeRoundTripperWithSourceIP("", "", firstAuth)
+	if first != second {
+		t.Fatal("cached codex chrome transport returned different instances for one auth")
+	}
+
+	other := cachedCodexChromeRoundTripperWithSourceIP("", "", &cliproxyauth.Auth{ID: "auth-2"})
+	if other == first {
+		t.Fatal("different auths reused the same codex chrome transport")
+	}
+}
+
 func TestResolveEgressSettingsAuthSourceIPBypassesGlobalProxy(t *testing.T) {
 	t.Parallel()
 

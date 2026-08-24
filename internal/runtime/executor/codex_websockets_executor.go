@@ -4,6 +4,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -14,7 +15,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-const codexWebsocketSafeRequestBytes = 24 * 1024
+const codexWebsocketDefaultSafeRequestBytes = 24 * 1024
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
 //
@@ -83,8 +84,15 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if codexWebsocketStreamEnabled(ctx, auth, req, opts) {
-		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
+	if codexWebsocketStreamEnabled(e.codexConfig(), ctx, auth, req, opts) {
+		result, errStream := e.wsExec.ExecuteStream(ctx, auth, req, opts)
+		if errStream != nil {
+			if codexPlainHTTPWebsocketFallbackAllowed(ctx, opts) && isCodexWebsocketHTTPFallbackError(errStream) {
+				return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+			}
+			return result, errStream
+		}
+		return result, nil
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
@@ -92,7 +100,20 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
 }
 
-func codexWebsocketStreamEnabled(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+func (e *CodexAutoExecutor) codexConfig() *config.Config {
+	if e == nil {
+		return nil
+	}
+	if e.wsExec != nil && e.wsExec.CodexExecutor != nil {
+		return e.wsExec.CodexExecutor.cfg
+	}
+	if e.httpExec != nil {
+		return e.httpExec.cfg
+	}
+	return nil
+}
+
+func codexWebsocketStreamEnabled(cfg *config.Config, ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
 	if !codexWebsocketsEnabled(auth) || opts.Alt == "responses/compact" {
 		return false
 	}
@@ -109,11 +130,39 @@ func codexWebsocketStreamEnabled(ctx context.Context, auth *cliproxyauth.Auth, r
 		if len(opts.OriginalRequest) > requestBytes {
 			requestBytes = len(opts.OriginalRequest)
 		}
-		if requestBytes > codexWebsocketSafeRequestBytes {
+		if requestBytes > codexWebsocketSafeRequestBytes(cfg) {
 			return false
 		}
 	}
 	return true
+}
+
+func codexWebsocketSafeRequestBytes(cfg *config.Config) int {
+	if cfg != nil && cfg.Codex.CacheAffinity.WebsocketSafeRequestBytes > 0 {
+		return cfg.Codex.CacheAffinity.WebsocketSafeRequestBytes
+	}
+	return codexWebsocketDefaultSafeRequestBytes
+}
+
+func codexPlainHTTPWebsocketFallbackAllowed(ctx context.Context, opts cliproxyexecutor.Options) bool {
+	return !cliproxyexecutor.DownstreamWebsocket(ctx) &&
+		!cliproxyexecutor.RequiredUpstreamWebsocket(ctx) &&
+		opts.ExecutionLifecycle == nil
+}
+
+func isCodexWebsocketHTTPFallbackError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var tooBig codexWebsocketMessageTooBigError
+	if errors.As(err, &tooBig) {
+		return true
+	}
+	type statusCoder interface {
+		StatusCode() int
+	}
+	var sc statusCoder
+	return errors.As(err, &sc) && sc != nil && sc.StatusCode() == http.StatusRequestEntityTooLarge && strings.Contains(strings.ToLower(err.Error()), "message_too_big")
 }
 
 func (e *CodexAutoExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {

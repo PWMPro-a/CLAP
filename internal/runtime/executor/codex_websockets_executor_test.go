@@ -631,18 +631,23 @@ func TestCodexWebsocketStreamEnabledUsesHTTPForLargeNonWebsocketRequests(t *test
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{"websockets": true}}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
 	small := cliproxyexecutor.Request{Payload: []byte(`{"model":"gpt-5.4","input":[]}`)}
-	if !codexWebsocketStreamEnabled(context.Background(), auth, small, opts) {
+	if !codexWebsocketStreamEnabled(nil, context.Background(), auth, small, opts) {
 		t.Fatal("small request unexpectedly disabled websocket transport")
 	}
 
-	large := cliproxyexecutor.Request{Payload: []byte(strings.Repeat("x", codexWebsocketSafeRequestBytes+1))}
-	if codexWebsocketStreamEnabled(context.Background(), auth, large, opts) {
+	large := cliproxyexecutor.Request{Payload: []byte(strings.Repeat("x", codexWebsocketDefaultSafeRequestBytes+1))}
+	if codexWebsocketStreamEnabled(nil, context.Background(), auth, large, opts) {
 		t.Fatal("large HTTP request still selected websocket transport")
 	}
-	if !codexWebsocketStreamEnabled(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, large, opts) {
+	cfg := &config.Config{}
+	cfg.Codex.CacheAffinity.WebsocketSafeRequestBytes = codexWebsocketDefaultSafeRequestBytes + 1024
+	if !codexWebsocketStreamEnabled(cfg, context.Background(), auth, large, opts) {
+		t.Fatal("configured larger request budget still disabled websocket transport")
+	}
+	if !codexWebsocketStreamEnabled(nil, cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, large, opts) {
 		t.Fatal("downstream websocket request was switched to HTTP")
 	}
-	if !codexWebsocketStreamEnabled(cliproxyexecutor.WithRequiredUpstreamWebsocket(context.Background()), auth, large, opts) {
+	if !codexWebsocketStreamEnabled(nil, cliproxyexecutor.WithRequiredUpstreamWebsocket(context.Background()), auth, large, opts) {
 		t.Fatal("required upstream websocket request was switched to HTTP")
 	}
 }
@@ -670,7 +675,7 @@ func TestCodexAutoExecutorLargeHTTPRequestUsesSSEFallback(t *testing.T) {
 		},
 		Metadata: map[string]any{"websockets": true},
 	}
-	payload := []byte(`{"model":"gpt-5.6","input":[{"role":"user","content":"` + strings.Repeat("x", codexWebsocketSafeRequestBytes+1024) + `"}]}`)
+	payload := []byte(`{"model":"gpt-5.6","input":[{"role":"user","content":"` + strings.Repeat("x", codexWebsocketDefaultSafeRequestBytes+1024) + `"}]}`)
 	result, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-5.6", Payload: payload}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai-response"),
 		Stream:       true,
