@@ -1,11 +1,9 @@
 package handlers
 
 import (
-	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 // SetSSEHeaders applies the canonical SSE response headers used across streaming handlers.
@@ -38,15 +36,4 @@ func BootstrapStreamResponse(c *gin.Context, flusher http.Flusher, payload []byt
 		_, _ = c.Writer.Write(payload)
 	}
 	flusher.Flush()
-}
-
-// WithStreamClientFirstByteTracker attaches a usage tracker that records the
-// first byte sent to the downstream streaming client.
-func WithStreamClientFirstByteTracker(ctx context.Context) (context.Context, func()) {
-	trackedCtx, tracker := coreusage.WithDownstreamFirstByteTracker(ctx)
-	return trackedCtx, func() {
-		if tracker != nil {
-			tracker.Mark()
-		}
-	}
 }

@@ -37,7 +37,6 @@ type UsageReporter struct {
 	serviceTier     string
 	generate        bool
 	requestedAt     time.Time
-	downstreamTTFT  *usage.FirstByteTracker
 	ttftMu          sync.RWMutex
 	ttft            time.Duration
 	ttftStart       time.Time
@@ -76,7 +75,6 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
 		serviceTier: usage.ServiceTierFromContext(ctx),
 		generate:    usage.GenerateFromContext(ctx),
-		downstreamTTFT: usage.DownstreamFirstByteTrackerFromContext(ctx),
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -350,12 +348,8 @@ func (r *UsageReporter) ttftDuration() time.Duration {
 		return 0
 	}
 	r.ttftMu.RLock()
-	ttft := r.ttft
-	r.ttftMu.RUnlock()
-	if downstream, ok := r.downstreamTTFT.Duration(); ok && (ttft <= 0 || downstream < ttft) {
-		return downstream
-	}
-	return ttft
+	defer r.ttftMu.RUnlock()
+	return r.ttft
 }
 
 type usageTTFTRoundTripper struct {
