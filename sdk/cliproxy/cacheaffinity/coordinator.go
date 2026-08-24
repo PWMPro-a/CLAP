@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,9 @@ const (
 	defaultMaxConcurrency     = 8
 	defaultPrefixHeatTTL      = 10 * time.Minute
 	defaultPrefixHeatMinBytes = 4096
+	defaultShareWindow        = 5 * time.Minute
+	defaultShareBucket        = 10 * time.Second
+	shareBucketCount          = int(defaultShareWindow / defaultShareBucket)
 	shardCount                = 64
 	prefixInspectInterval     = 5 * time.Second
 )
@@ -39,8 +43,10 @@ type Decision struct {
 	PrefixFP      string `json:"prefix_fp,omitempty"`
 	PrefixHeatFP  string `json:"prefix_heat_fp,omitempty"`
 	Source        string `json:"source,omitempty"`
+	DecisionID    string `json:"decision_id,omitempty"`
 	Active        bool   `json:"active"`
 	PrefixChanged bool   `json:"prefix_changed"`
+	ShareLimited  bool   `json:"share_limited,omitempty"`
 }
 
 // Stats is a lock-free operational snapshot.
@@ -69,6 +75,7 @@ type Stats struct {
 	PrefixHeatMatches     uint64  `json:"prefix_heat_matches"`
 	PrefixHeatSelections  uint64  `json:"prefix_heat_selections"`
 	PrefixHeatShadow      uint64  `json:"prefix_heat_shadow"`
+	ShareLimited          uint64  `json:"share_limited"`
 	TrackedRoutes         int     `json:"tracked_routes"`
 	ResolveNanoseconds    uint64  `json:"resolve_nanoseconds"`
 	AverageResolveMicros  float64 `json:"average_resolve_micros"`
@@ -99,6 +106,7 @@ type counters struct {
 	prefixHeatMatches     atomic.Uint64
 	prefixHeatSelections  atomic.Uint64
 	prefixHeatShadow      atomic.Uint64
+	shareLimited          atomic.Uint64
 	resolveNanos          atomic.Uint64
 	trackedRoutes         atomic.Uint64
 }
@@ -115,9 +123,33 @@ type prefixShard struct {
 	entries map[string]prefixEntry
 }
 
+type shareBucket struct {
+	epoch  int64
+	total  uint64
+	active uint64
+}
+
+type shareScope struct {
+	buckets [shareBucketCount]shareBucket
+}
+
+type shareLimiter struct {
+	mu     sync.Mutex
+	scopes map[string]*shareScope
+}
+
+type suppressedDecisionStore struct {
+	mu        sync.Mutex
+	entries   map[string]time.Time
+	lastSweep time.Time
+}
+
 var global = struct {
-	counters counters
-	shards   [shardCount]prefixShard
+	counters            counters
+	shards              [shardCount]prefixShard
+	shareLimiter        shareLimiter
+	suppressedDecisions suppressedDecisionStore
+	decisionSequence    atomic.Uint64
 }{}
 
 // Enrich computes one decision before credential selection and publishes it in
@@ -167,9 +199,10 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, cfg *in
 		// Physical websocket slots are shared by model family while the upstream
 		// cache identity remains conversation-scoped. This avoids one socket pool
 		// per conversation without coupling connection churn to prompt caching.
-		PoolKey: stableID("pool", modelFamily),
-		Source:  source,
-		Active:  !settings.Shadow,
+		PoolKey:    stableID("pool", modelFamily),
+		Source:     source,
+		DecisionID: strconv.FormatUint(global.decisionSequence.Add(1), 10),
+		Active:     !settings.Shadow,
 	}
 	if settings.PrefixHeatEnabled {
 		if !rootParsed {
@@ -181,19 +214,21 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, cfg *in
 	decision.PrefixFP, decision.PrefixChanged = inspectPrefixPayload(routeKey, modelFamily, payload, root, rootParsed, settings.MaxEntries)
 	publishCounters(decision, time.Since(started))
 
-	metadata := cloneMetadata(opts.Metadata, 5)
+	metadata := cloneMetadata(opts.Metadata, 6)
 	metadata[cliproxyexecutor.CacheAffinityRouteKeyMetadataKey] = decision.RouteKey
 	metadata[cliproxyexecutor.CacheAffinityUpstreamKeyMetadataKey] = decision.UpstreamKey
 	metadata[cliproxyexecutor.CacheAffinityPoolKeyMetadataKey] = decision.PoolKey
 	metadata[cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey] = decision.PrefixHeatFP
 	metadata[cliproxyexecutor.CacheAffinityActiveMetadataKey] = decision.Active
+	metadata[cliproxyexecutor.CacheAffinityDecisionIDMetadataKey] = decision.DecisionID
 	opts.Metadata = metadata
-	req.Metadata = cloneMetadata(req.Metadata, 5)
+	req.Metadata = cloneMetadata(req.Metadata, 6)
 	req.Metadata[cliproxyexecutor.CacheAffinityRouteKeyMetadataKey] = decision.RouteKey
 	req.Metadata[cliproxyexecutor.CacheAffinityUpstreamKeyMetadataKey] = decision.UpstreamKey
 	req.Metadata[cliproxyexecutor.CacheAffinityPoolKeyMetadataKey] = decision.PoolKey
 	req.Metadata[cliproxyexecutor.CacheAffinityPrefixFingerprintMetadataKey] = decision.PrefixHeatFP
 	req.Metadata[cliproxyexecutor.CacheAffinityActiveMetadataKey] = decision.Active
+	req.Metadata[cliproxyexecutor.CacheAffinityDecisionIDMetadataKey] = decision.DecisionID
 	return req, opts, decision
 }
 
@@ -208,6 +243,7 @@ type RuntimeSettings struct {
 	WebsocketPoolSlots        int           `json:"websocket_pool_slots"`
 	MaxSessionRequests        int           `json:"max_session_requests"`
 	MaxSessionDuration        time.Duration `json:"max_session_duration"`
+	MaxShareRatio             float64       `json:"max_share_ratio"`
 	PrefixHeatEnabled         bool          `json:"prefix_heat_enabled"`
 	PrefixHeatShadow          bool          `json:"prefix_heat_shadow"`
 	PrefixHeatTTL             time.Duration `json:"prefix_heat_ttl"`
@@ -232,6 +268,7 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 		MaxConcurrency:            raw.MaxConcurrency,
 		WebsocketPoolSlots:        raw.WebsocketPoolSlots,
 		MaxSessionRequests:        raw.MaxSessionRequests,
+		MaxShareRatio:             raw.MaxShareRatio,
 		PrefixHeatEnabled:         raw.PrefixHeatEnabled,
 		PrefixHeatMaxEntries:      raw.PrefixHeatMaxEntries,
 		PrefixHeatMinBytes:        raw.PrefixHeatMinBytes,
@@ -258,6 +295,11 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 	}
 	if settings.MaxSessionRequests <= 0 {
 		settings.MaxSessionRequests = defaultMaxSessionRequests
+	}
+	if settings.MaxShareRatio < 0 {
+		settings.MaxShareRatio = 0
+	} else if settings.MaxShareRatio > 1 {
+		settings.MaxShareRatio = 1
 	}
 	if settings.PrefixHeatMaxEntries <= 0 {
 		settings.PrefixHeatMaxEntries = settings.MaxEntries
@@ -289,9 +331,172 @@ func Settings(cfg *internalconfig.Config) RuntimeSettings {
 	return settings
 }
 
+func (l *shareLimiter) admit(scope string, maxShareRatio float64, now time.Time) bool {
+	if maxShareRatio <= 0 || maxShareRatio >= 1 {
+		return true
+	}
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		scope = "default"
+	}
+	epoch := now.UnixNano() / int64(defaultShareBucket)
+	index := int(epoch % int64(shareBucketCount))
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.scopes == nil {
+		l.scopes = make(map[string]*shareScope)
+	}
+	state := l.scopes[scope]
+	if state == nil {
+		state = &shareScope{}
+		l.scopes[scope] = state
+	}
+	bucket := &state.buckets[index]
+	if bucket.epoch != epoch {
+		*bucket = shareBucket{epoch: epoch}
+	}
+
+	var total uint64
+	var active uint64
+	for i := range state.buckets {
+		item := state.buckets[i]
+		if item.epoch <= 0 || epoch-item.epoch >= int64(shareBucketCount) {
+			continue
+		}
+		total += item.total
+		active += item.active
+	}
+	allowed := total == 0 || float64(active+1)/float64(total+1) <= maxShareRatio
+	bucket.total++
+	if allowed {
+		bucket.active++
+	}
+	return allowed
+}
+
+// AdmitNewBinding accounts for one cold cache-affinity route and reports
+// whether it may create or use a new active affinity binding under the recent
+// share cap. Existing warm bindings must call neither this function nor the
+// limiter so they stay sticky.
+func AdmitNewBinding(metadata map[string]any, model string, maxShareRatio float64, now time.Time) bool {
+	if maxShareRatio <= 0 || maxShareRatio >= 1 {
+		return true
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	modelFamily := canonicalModelFamily(model)
+	return global.shareLimiter.admit(shareScopeKey(metadata, modelFamily), maxShareRatio, now)
+}
+
+func (s *suppressedDecisionStore) mark(decisionID string, now time.Time) {
+	decisionID = strings.TrimSpace(decisionID)
+	if decisionID == "" {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	expiresAt := now.Add(defaultShareWindow)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries == nil {
+		s.entries = make(map[string]time.Time)
+	}
+	if s.lastSweep.IsZero() || now.Sub(s.lastSweep) >= defaultShareBucket {
+		for key, expires := range s.entries {
+			if !expires.After(now) {
+				delete(s.entries, key)
+			}
+		}
+		s.lastSweep = now
+	}
+	s.entries[decisionID] = expiresAt
+}
+
+func (s *suppressedDecisionStore) contains(decisionID string, now time.Time) bool {
+	decisionID = strings.TrimSpace(decisionID)
+	if decisionID == "" {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiresAt, ok := s.entries[decisionID]
+	if !ok {
+		return false
+	}
+	if !expiresAt.After(now) {
+		delete(s.entries, decisionID)
+		return false
+	}
+	return true
+}
+
+// RecordShareLimited marks one request whose cold affinity binding was skipped
+// by share control. The decision ID allows later execution/binding stages to
+// suppress cache-affinity metadata even when selection received a cloned
+// metadata map.
+func RecordShareLimited(metadata map[string]any) {
+	global.counters.shareLimited.Add(1)
+	if metadata != nil {
+		metadata[cliproxyexecutor.CacheAffinityShareLimitedMetadataKey] = true
+	}
+	global.suppressedDecisions.mark(metadataString(metadata, cliproxyexecutor.CacheAffinityDecisionIDMetadataKey), time.Now())
+}
+
+// ShareLimited reports whether one request decision has been suppressed by the
+// cold-binding share cap.
+func ShareLimited(metadata map[string]any) bool {
+	if metadataBool(metadata, cliproxyexecutor.CacheAffinityShareLimitedMetadataKey) {
+		return true
+	}
+	return global.suppressedDecisions.contains(metadataString(metadata, cliproxyexecutor.CacheAffinityDecisionIDMetadataKey), time.Now())
+}
+
+func shareScopeKey(metadata map[string]any, modelFamily string) string {
+	groupKey := metadataString(metadata, cliproxyexecutor.AccountGroupPolicyKeyMetadataKey)
+	if groupKey == "" {
+		groupKey = "all"
+	}
+	endpoint := normalizeEndpoint(metadataString(metadata, cliproxyexecutor.RequestPathMetadataKey))
+	if endpoint == "" {
+		endpoint = "default"
+	}
+	modelFamily = strings.TrimSpace(modelFamily)
+	if modelFamily == "" {
+		modelFamily = "unknown"
+	}
+	return groupKey + "\x00" + modelFamily + "\x00" + endpoint
+}
+
+func normalizeEndpoint(path string) string {
+	path = strings.ToLower(strings.TrimSpace(path))
+	switch {
+	case strings.Contains(path, "/responses"):
+		return "responses"
+	case strings.Contains(path, "/chat/completions"):
+		return "chat"
+	case strings.Contains(path, "/completions"):
+		return "completions"
+	case strings.Contains(path, "/realtime"):
+		return "realtime"
+	case strings.Contains(path, "/models"):
+		return "models"
+	default:
+		return path
+	}
+}
+
 // MetadataValue returns a coordinator value only for active decisions.
 func MetadataValue(metadata map[string]any, key string) string {
 	if !metadataBool(metadata, cliproxyexecutor.CacheAffinityActiveMetadataKey) {
+		return ""
+	}
+	if ShareLimited(metadata) {
 		return ""
 	}
 	return metadataString(metadata, key)
@@ -326,6 +531,7 @@ func Snapshot() Stats {
 		PrefixHeatMatches:     global.counters.prefixHeatMatches.Load(),
 		PrefixHeatSelections:  global.counters.prefixHeatSelections.Load(),
 		PrefixHeatShadow:      global.counters.prefixHeatShadow.Load(),
+		ShareLimited:          global.counters.shareLimited.Load(),
 		TrackedRoutes:         int(global.counters.trackedRoutes.Load()),
 		ResolveNanoseconds:    nanos,
 	}
@@ -629,7 +835,9 @@ func inspectPrefixWith(routeKey string, maxEntries int, now time.Time, interval 
 func publishCounters(decision Decision, elapsed time.Duration) {
 	global.counters.resolved.Add(1)
 	global.counters.resolveNanos.Add(uint64(elapsed.Nanoseconds()))
-	if decision.Active {
+	if decision.ShareLimited {
+		global.counters.shareLimited.Add(1)
+	} else if decision.Active {
 		global.counters.active.Add(1)
 	} else {
 		global.counters.shadow.Add(1)

@@ -26,23 +26,24 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy                  string
-	newCandidateMode          bool
-	sessionAffinity           bool
-	sessionAffinityTTL        time.Duration
-	highCacheMode             bool
-	cacheAffinityEnabled      bool
-	expiryDrainIgnoreAffinity bool
-	cacheAffinityMaxEntries   int
-	maxSessionRequests        int
-	maxSessionDuration        time.Duration
-	prefixHeatEnabled         bool
-	prefixHeatShadow          bool
-	prefixHeatTTL             time.Duration
-	prefixHeatMaxEntries      int
-	prefixHeatMinBytes        int
-	quotaPreemptUsedRatio     float64
-	quotaHardStopUsedRatio    float64
+	strategy                   string
+	newCandidateMode           bool
+	sessionAffinity            bool
+	sessionAffinityTTL         time.Duration
+	highCacheMode              bool
+	cacheAffinityEnabled       bool
+	expiryDrainIgnoreAffinity  bool
+	cacheAffinityMaxEntries    int
+	cacheAffinityMaxShareRatio float64
+	maxSessionRequests         int
+	maxSessionDuration         time.Duration
+	prefixHeatEnabled          bool
+	prefixHeatShadow           bool
+	prefixHeatTTL              time.Duration
+	prefixHeatMaxEntries       int
+	prefixHeatMinBytes         int
+	quotaPreemptUsedRatio      float64
+	quotaHardStopUsedRatio     float64
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -67,6 +68,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state.cacheAffinityEnabled = cacheSettings.Enabled && !cacheSettings.Shadow
 	state.expiryDrainIgnoreAffinity = cacheSettings.ExpiryDrainIgnoreAffinity
 	state.cacheAffinityMaxEntries = cacheSettings.MaxEntries
+	state.cacheAffinityMaxShareRatio = cacheSettings.MaxShareRatio
 	state.maxSessionRequests = cacheSettings.MaxSessionRequests
 	state.maxSessionDuration = cacheSettings.MaxSessionDuration
 	state.prefixHeatEnabled = cacheSettings.PrefixHeatEnabled
@@ -96,20 +98,21 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	}
 	if state.sessionAffinity || state.highCacheMode || state.cacheAffinityEnabled {
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback:                  selector,
-			TTL:                       state.sessionAffinityTTL,
-			HighCacheMode:             state.highCacheMode,
-			CacheAffinityEnabled:      state.cacheAffinityEnabled,
-			ExpiryDrainIgnoreAffinity: state.expiryDrainIgnoreAffinity,
-			MaxEntries:                state.cacheAffinityMaxEntries,
-			MaxSessionRequests:        state.maxSessionRequests,
-			MaxSessionDuration:        state.maxSessionDuration,
-			PrefixHeatEnabled:         state.prefixHeatEnabled,
-			PrefixHeatShadow:          state.prefixHeatShadow,
-			PrefixHeatTTL:             state.prefixHeatTTL,
-			PrefixHeatMaxEntries:      state.prefixHeatMaxEntries,
-			QuotaPreemptUsedRatio:     state.quotaPreemptUsedRatio,
-			QuotaHardStopUsedRatio:    state.quotaHardStopUsedRatio,
+			Fallback:                   selector,
+			TTL:                        state.sessionAffinityTTL,
+			HighCacheMode:              state.highCacheMode,
+			CacheAffinityEnabled:       state.cacheAffinityEnabled,
+			CacheAffinityMaxShareRatio: state.cacheAffinityMaxShareRatio,
+			ExpiryDrainIgnoreAffinity:  state.expiryDrainIgnoreAffinity,
+			MaxEntries:                 state.cacheAffinityMaxEntries,
+			MaxSessionRequests:         state.maxSessionRequests,
+			MaxSessionDuration:         state.maxSessionDuration,
+			PrefixHeatEnabled:          state.prefixHeatEnabled,
+			PrefixHeatShadow:           state.prefixHeatShadow,
+			PrefixHeatTTL:              state.prefixHeatTTL,
+			PrefixHeatMaxEntries:       state.prefixHeatMaxEntries,
+			QuotaPreemptUsedRatio:      state.quotaPreemptUsedRatio,
+			QuotaHardStopUsedRatio:     state.quotaHardStopUsedRatio,
 		})
 	}
 	return selector
@@ -252,6 +255,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		if routingSelectorBaseState(*s.appliedRoutingState) == routingSelectorBaseState(routingState) {
 			if selector, ok := s.coreManager.Selector().(*coreauth.SessionAffinitySelector); ok && selector != nil {
 				selector.ConfigurePrefixHeat(routingState.prefixHeatEnabled, routingState.prefixHeatShadow, routingState.prefixHeatTTL, routingState.prefixHeatMaxEntries)
+				selector.ConfigureCacheAffinityMaxShareRatio(routingState.cacheAffinityMaxShareRatio)
 			} else {
 				s.coreManager.SetSelector(newRoutingSelector(routingState))
 			}
@@ -275,6 +279,7 @@ func routingSelectorBaseState(state routingRuntimeState) routingRuntimeState {
 	state.prefixHeatTTL = 0
 	state.prefixHeatMaxEntries = 0
 	state.prefixHeatMinBytes = 0
+	state.cacheAffinityMaxShareRatio = 0
 	return state
 }
 

@@ -102,6 +102,65 @@ func TestSettingsDefaultsPrefixHeatShadowOn(t *testing.T) {
 	}
 }
 
+func TestSettingsNormalizesMaxShareRatio(t *testing.T) {
+	settings := Settings(&internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:       true,
+		MaxShareRatio: 0.72,
+	}}})
+	if settings.MaxShareRatio != 0.72 {
+		t.Fatalf("max share ratio = %v, want 0.72", settings.MaxShareRatio)
+	}
+
+	settings = Settings(&internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:       true,
+		MaxShareRatio: -0.1,
+	}}})
+	if settings.MaxShareRatio != 0 {
+		t.Fatalf("negative max share ratio = %v, want 0", settings.MaxShareRatio)
+	}
+
+	settings = Settings(&internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:       true,
+		MaxShareRatio: 1.2,
+	}}})
+	if settings.MaxShareRatio != 1 {
+		t.Fatalf("oversized max share ratio = %v, want 1", settings.MaxShareRatio)
+	}
+}
+
+func TestAdmitNewBindingAppliesRecentShareCapByScope(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	metadata := map[string]any{
+		cliproxyexecutor.AccountGroupPolicyKeyMetadataKey: "share-cap-unit",
+		cliproxyexecutor.RequestPathMetadataKey:           "/unit/share-cap",
+	}
+	if !AdmitNewBinding(metadata, "gpt-share-cap-unit", 0.5, now) {
+		t.Fatal("first cold binding was not admitted")
+	}
+	if AdmitNewBinding(metadata, "gpt-share-cap-unit", 0.5, now.Add(time.Second)) {
+		t.Fatal("second cold binding was admitted above the 50% cap")
+	}
+}
+
+func TestRecordShareLimitedSuppressesClonedDecisionMetadata(t *testing.T) {
+	decisionID := "decision-share-limited-unit"
+	original := map[string]any{
+		cliproxyexecutor.CacheAffinityActiveMetadataKey:     true,
+		cliproxyexecutor.CacheAffinityRouteKeyMetadataKey:   "route-share-limited-unit",
+		cliproxyexecutor.CacheAffinityDecisionIDMetadataKey: decisionID,
+	}
+	cloned := cloneMetadata(original, 1)
+
+	RecordShareLimited(cloned)
+
+	if got := MetadataValue(original, cliproxyexecutor.CacheAffinityRouteKeyMetadataKey); got != "" {
+		t.Fatalf("suppressed cloned decision still exposed route key %q", got)
+	}
+	if !ShareLimited(original) {
+		t.Fatal("original metadata did not resolve share-limited decision")
+	}
+}
+
 func TestEnrichPublishesOnlyExactEligibleReusablePrefix(t *testing.T) {
 	shortCfg := &internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
 		Enabled:            true,

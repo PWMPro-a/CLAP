@@ -149,6 +149,46 @@ func TestPrefixHeatConfigFlowsIntoRoutingState(t *testing.T) {
 	defer selector.Stop()
 }
 
+func TestCacheAffinityMaxShareConfigFlowsAndHotReloads(t *testing.T) {
+	initialCfg := &internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:       true,
+		MaxShareRatio: 0.7,
+	}}}
+	initialState := normalizedRoutingRuntimeState(initialCfg)
+	if initialState.cacheAffinityMaxShareRatio != 0.7 {
+		t.Fatalf("routing max share ratio = %v, want 0.7", initialState.cacheAffinityMaxShareRatio)
+	}
+	selector, ok := newRoutingSelector(initialState).(*coreauth.SessionAffinitySelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", newRoutingSelector(initialState))
+	}
+	t.Cleanup(selector.Stop)
+	if got := selector.CacheAffinityMaxShareRatio(); got != 0.7 {
+		t.Fatalf("selector max share ratio = %v, want 0.7", got)
+	}
+	selector.BindAuthSession("codex", "gpt-5.6-sol", "cache-affinity:preserved-share-route", "preserved-auth")
+
+	manager := coreauth.NewManager(nil, selector, nil)
+	service := &Service{coreManager: manager, appliedRoutingState: &initialState}
+	updatedCfg := &internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{
+		Enabled:       true,
+		MaxShareRatio: 0.4,
+	}}}
+	if !service.applyManagerConfig(context.Background(), configCommit{cfg: updatedCfg}) {
+		t.Fatal("apply max share config update failed")
+	}
+	if got := manager.Selector(); got != selector {
+		t.Fatalf("max-share-only update replaced selector: got %T %p, want %p", got, got, selector)
+	}
+	if got := selector.CacheAffinityMaxShareRatio(); got != 0.4 {
+		t.Fatalf("hot-reloaded selector max share ratio = %v, want 0.4", got)
+	}
+	authID, found := selector.BoundAuthSession("codex", "gpt-5.6-sol", coreauthOptionsForRoute("preserved-share-route"))
+	if !found || authID != "preserved-auth" {
+		t.Fatalf("preserved share affinity binding = %q, %t; want preserved-auth, true", authID, found)
+	}
+}
+
 func TestServiceRejectsInvalidCredentialWeightConfigCommit(t *testing.T) {
 	originalCfg := &internalconfig.Config{}
 	service := &Service{cfg: originalCfg}

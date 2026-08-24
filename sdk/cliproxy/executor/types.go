@@ -80,6 +80,10 @@ const (
 	CacheAffinityPrefixFingerprintMetadataKey = "__cliproxy_cache_affinity_prefix_fingerprint"
 	// CacheAffinityActiveMetadataKey reports whether coordinator decisions are active rather than shadow-only.
 	CacheAffinityActiveMetadataKey = "__cliproxy_cache_affinity_active"
+	// CacheAffinityDecisionIDMetadataKey identifies one local cache-affinity decision for per-attempt suppression.
+	CacheAffinityDecisionIDMetadataKey = "__cliproxy_cache_affinity_decision_id"
+	// CacheAffinityShareLimitedMetadataKey marks one request whose cold cache-affinity binding was skipped by share control.
+	CacheAffinityShareLimitedMetadataKey = "__cliproxy_cache_affinity_share_limited"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.

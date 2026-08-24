@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -152,6 +153,70 @@ func TestSessionAffinityWarmBindingBypassesCacheAffinityNewSessionCap(t *testing
 	}
 }
 
+func TestSessionAffinityCacheShareCapSkipsOnlyColdBinding(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:                   &RoundRobinSelector{},
+		TTL:                        time.Hour,
+		CacheAffinityEnabled:       true,
+		CacheAffinityMaxShareRatio: 0.5,
+	})
+	defer selector.Stop()
+	model := "gpt-share-selector-cold"
+	first := &Auth{ID: "share-first", Provider: "codex", Status: StatusActive}
+	second := &Auth{ID: "share-second", Provider: "codex", Status: StatusActive}
+
+	firstOpts := activeCacheAffinityOptionsWithDecision("share-cold-1", "share-cold-decision-1")
+	firstPick, errFirst := selector.Pick(context.Background(), "codex", model, firstOpts, []*Auth{first, second})
+	if errFirst != nil || firstPick == nil || firstPick.ID != first.ID {
+		t.Fatalf("first cold pick = %v, %v; want first auth", firstPick, errFirst)
+	}
+	if cached, ok := selector.cache.GetAndRefresh(sessionAffinityCacheKey("codex", "cache-affinity:share-cold-1", model)); !ok || cached != first.ID {
+		t.Fatalf("first cold binding = %q, %t; want %s, true", cached, ok, first.ID)
+	}
+
+	secondOpts := activeCacheAffinityOptionsWithDecision("share-cold-2", "share-cold-decision-2")
+	secondPick, errSecond := selector.Pick(context.Background(), "codex", model, secondOpts, []*Auth{first, second})
+	if errSecond != nil || secondPick == nil || secondPick.ID != second.ID {
+		t.Fatalf("share-limited cold pick = %v, %v; want second auth", secondPick, errSecond)
+	}
+	if cached, ok := selector.cache.GetAndRefresh(sessionAffinityCacheKey("codex", "cache-affinity:share-cold-2", model)); ok {
+		t.Fatalf("share-limited cold request was bound to %q", cached)
+	}
+	if got := secondOpts.Metadata[cliproxyexecutor.CacheAffinityShareLimitedMetadataKey]; got != true {
+		t.Fatalf("share-limited metadata = %v, want true", got)
+	}
+}
+
+func TestSessionAffinityCacheShareCapKeepsWarmBinding(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:                   &RoundRobinSelector{},
+		TTL:                        time.Hour,
+		CacheAffinityEnabled:       true,
+		CacheAffinityMaxShareRatio: 0.5,
+	})
+	defer selector.Stop()
+	model := "gpt-share-selector-warm"
+	hot := &Auth{ID: "share-warm-hot", Provider: "codex", Status: StatusActive}
+	cold := &Auth{ID: "share-warm-cold", Provider: "codex", Status: StatusActive}
+	selector.cache.Set(sessionAffinityCacheKey("codex", "cache-affinity:share-warm-route", model), hot.ID)
+
+	// Consume the cold-binding share window so the next cold route would be
+	// limited. Warm bindings are looked up before the share cap and remain sticky.
+	_, errFirst := selector.Pick(context.Background(), "codex", model, activeCacheAffinityOptionsWithDecision("share-warm-cold-1", "share-warm-cold-decision-1"), []*Auth{hot, cold})
+	if errFirst != nil {
+		t.Fatalf("prime first cold route: %v", errFirst)
+	}
+	_, errSecond := selector.Pick(context.Background(), "codex", model, activeCacheAffinityOptionsWithDecision("share-warm-cold-2", "share-warm-cold-decision-2"), []*Auth{hot, cold})
+	if errSecond != nil {
+		t.Fatalf("prime share-limited cold route: %v", errSecond)
+	}
+
+	warm, errWarm := selector.Pick(context.Background(), "codex", model, activeCacheAffinityOptionsWithDecision("share-warm-route", "share-warm-decision"), []*Auth{hot, cold})
+	if errWarm != nil || warm == nil || warm.ID != hot.ID {
+		t.Fatalf("warm pick under share cap = %v, %v; want hot", warm, errWarm)
+	}
+}
+
 func TestManagerKeepsWarmAffinityAboveCacheAffinityNewSessionCap(t *testing.T) {
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback:             &RoundRobinSelector{},
@@ -224,8 +289,13 @@ func TestSessionAffinityCacheCoordinatorHardStopsWarmSession(t *testing.T) {
 }
 
 func activeCacheAffinityOptions(routeKey string) cliproxyexecutor.Options {
+	return activeCacheAffinityOptionsWithDecision(routeKey, fmt.Sprintf("decision-%s", routeKey))
+}
+
+func activeCacheAffinityOptionsWithDecision(routeKey, decisionID string) cliproxyexecutor.Options {
 	return cliproxyexecutor.Options{Metadata: map[string]any{
-		cliproxyexecutor.CacheAffinityActiveMetadataKey:   true,
-		cliproxyexecutor.CacheAffinityRouteKeyMetadataKey: routeKey,
+		cliproxyexecutor.CacheAffinityActiveMetadataKey:     true,
+		cliproxyexecutor.CacheAffinityRouteKeyMetadataKey:   routeKey,
+		cliproxyexecutor.CacheAffinityDecisionIDMetadataKey: decisionID,
 	}}
 }

@@ -635,35 +635,37 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback                  Selector
-	cache                     *SessionCache
-	failoverCache             *SessionCache
-	highCacheMode             bool
-	cacheAffinityEnabled      bool
-	expiryDrainIgnoreAffinity bool
-	prefixHeatEnabled         atomic.Bool
-	prefixHeatShadow          atomic.Bool
-	prefixHeat                *prefixHeatTracker
-	quotaPreemptUsedRatio     float64
-	quotaHardStopUsedRatio    float64
+	fallback                   Selector
+	cache                      *SessionCache
+	failoverCache              *SessionCache
+	highCacheMode              bool
+	cacheAffinityEnabled       bool
+	cacheAffinityMaxShareRatio atomic.Uint64
+	expiryDrainIgnoreAffinity  bool
+	prefixHeatEnabled          atomic.Bool
+	prefixHeatShadow           atomic.Bool
+	prefixHeat                 *prefixHeatTracker
+	quotaPreemptUsedRatio      float64
+	quotaHardStopUsedRatio     float64
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback                  Selector
-	TTL                       time.Duration
-	HighCacheMode             bool
-	CacheAffinityEnabled      bool
-	ExpiryDrainIgnoreAffinity bool
-	MaxEntries                int
-	MaxSessionRequests        int
-	MaxSessionDuration        time.Duration
-	PrefixHeatEnabled         bool
-	PrefixHeatShadow          bool
-	PrefixHeatTTL             time.Duration
-	PrefixHeatMaxEntries      int
-	QuotaPreemptUsedRatio     float64
-	QuotaHardStopUsedRatio    float64
+	Fallback                   Selector
+	TTL                        time.Duration
+	HighCacheMode              bool
+	CacheAffinityEnabled       bool
+	CacheAffinityMaxShareRatio float64
+	ExpiryDrainIgnoreAffinity  bool
+	MaxEntries                 int
+	MaxSessionRequests         int
+	MaxSessionDuration         time.Duration
+	PrefixHeatEnabled          bool
+	PrefixHeatShadow           bool
+	PrefixHeatTTL              time.Duration
+	PrefixHeatMaxEntries       int
+	QuotaPreemptUsedRatio      float64
+	QuotaHardStopUsedRatio     float64
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -700,6 +702,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		quotaHardStopUsedRatio:    cfg.QuotaHardStopUsedRatio,
 	}
 	selector.ConfigurePrefixHeat(cfg.PrefixHeatEnabled, cfg.PrefixHeatShadow, cfg.PrefixHeatTTL, cfg.PrefixHeatMaxEntries)
+	selector.ConfigureCacheAffinityMaxShareRatio(cfg.CacheAffinityMaxShareRatio)
 	return selector
 }
 
@@ -920,6 +923,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
+	if s.cacheAffinityShareLimited(opts.Metadata, model, now) {
+		cacheaffinity.RecordShareLimited(opts.Metadata)
+		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		if err != nil {
+			return nil, err
+		}
+		entry.Infof("session-affinity: cache miss, share cap fallback | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		return auth, nil
+	}
+
 	auth, err := s.pickPrefixHeatAuth(ctx, provider, model, opts, fallbackAuths, now)
 	if err != nil {
 		return nil, err
@@ -931,6 +944,20 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) cacheAffinityShareLimited(metadata map[string]any, model string, now time.Time) bool {
+	if s == nil || !s.cacheAffinityEnabled {
+		return false
+	}
+	maxShareRatio := s.CacheAffinityMaxShareRatio()
+	if maxShareRatio <= 0 || maxShareRatio >= 1 {
+		return false
+	}
+	if cacheaffinity.MetadataValue(metadata, cliproxyexecutor.CacheAffinityRouteKeyMetadataKey) == "" {
+		return false
+	}
+	return !cacheaffinity.AdmitNewBinding(metadata, model, maxShareRatio, now)
 }
 
 func (s *SessionAffinitySelector) cacheAffinityNewSessionAuths(auths []*Auth, model string, now time.Time) []*Auth {
@@ -1124,6 +1151,28 @@ func (s *SessionAffinitySelector) ConfigurePrefixHeat(enabled, shadow bool, ttl 
 	}
 	s.prefixHeatShadow.Store(shadow)
 	s.prefixHeatEnabled.Store(s.cacheAffinityEnabled && enabled)
+}
+
+// ConfigureCacheAffinityMaxShareRatio updates the cold-binding share cap
+// without rebuilding the selector or dropping warm affinity bindings.
+func (s *SessionAffinitySelector) ConfigureCacheAffinityMaxShareRatio(value float64) {
+	if s == nil {
+		return
+	}
+	if value < 0 {
+		value = 0
+	} else if value > 1 {
+		value = 1
+	}
+	s.cacheAffinityMaxShareRatio.Store(math.Float64bits(value))
+}
+
+// CacheAffinityMaxShareRatio reports the active cold-binding share cap.
+func (s *SessionAffinitySelector) CacheAffinityMaxShareRatio() float64 {
+	if s == nil {
+		return 0
+	}
+	return math.Float64frombits(s.cacheAffinityMaxShareRatio.Load())
 }
 
 // BoundAuthSession returns an existing session binding without creating a new

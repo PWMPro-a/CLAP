@@ -305,6 +305,10 @@ codex:
     # These local checks do not add network work to the SSE request path.
     max-session-requests: 500
     max-session-duration: "1h"
+    # 0 disables the cap. When set, e.g. 0.7, new cold cache-affinity routes are
+    # paused after cache-affinity selections reach roughly 70% of the recent
+    # local five-minute window; established warm bindings and tail-burst are kept.
+    max-share-ratio: 0
     # Track successful prompt-prefix/account combinations and use them only for
     # cold/new sessions after all group, priority, quota, expiry, and concurrency
     # filters have run. Existing affinity bindings are never changed by this.

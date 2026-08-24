@@ -186,6 +186,7 @@ type CodexCacheAffinityConfig struct {
 	WebsocketPoolSlots        int     `yaml:"websocket-pool-slots" json:"websocket-pool-slots"`
 	MaxSessionRequests        int     `yaml:"max-session-requests" json:"max-session-requests"`
 	MaxSessionDuration        string  `yaml:"max-session-duration" json:"max-session-duration"`
+	MaxShareRatio             float64 `yaml:"max-share-ratio" json:"max-share-ratio"`
 	PrefixHeatEnabled         bool    `yaml:"prefix-heat-enabled" json:"prefix-heat-enabled"`
 	PrefixHeatShadow          *bool   `yaml:"prefix-heat-shadow,omitempty" json:"prefix-heat-shadow,omitempty"`
 	PrefixHeatTTL             string  `yaml:"prefix-heat-ttl" json:"prefix-heat-ttl"`
