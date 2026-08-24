@@ -241,8 +241,8 @@ func TestOpenAIResponsesSSEBootstrapKeepAliveDefaults(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for bootstrap SSE heartbeat")
 	}
-	if elapsed := firstWrite.Sub(started); elapsed < 150*time.Millisecond || elapsed > 350*time.Millisecond {
-		t.Fatalf("bootstrap first write = %s, want near 200ms", elapsed)
+	if elapsed := firstWrite.Sub(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("bootstrap first write = %s, want immediate commit", elapsed)
 	}
 	select {
 	case <-done:

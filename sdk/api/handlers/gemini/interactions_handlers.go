@@ -147,22 +147,14 @@ func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx conte
 		return streamExecutionResult{stream: stream, errMsg: errMsg}
 	}
 
-	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
-	}
-
 	execution, streamStarted, canceled := handlers.WaitForStreamBootstrap(
 		c.Request.Context(),
 		handlers.StreamingBootstrapKeepAliveDelayOrDefault(h.Cfg),
 		handlers.StreamingKeepAliveInterval(h.Cfg),
 		execute,
 		func() {
-			setSSEHeaders()
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-			flusher.Flush()
+			handlers.SetSSEHeaders(c)
+			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
@@ -175,7 +167,7 @@ func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx conte
 	}
 	if execution.errMsg != nil {
 		if streamStarted {
-			setSSEHeaders()
+			handlers.SetSSEHeaders(c)
 			status := http.StatusInternalServerError
 			if execution.errMsg.StatusCode > 0 {
 				status = execution.errMsg.StatusCode
@@ -224,7 +216,7 @@ func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx conte
 		return
 	}
 
-	setSSEHeaders()
+	handlers.SetSSEHeaders(c)
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), stream.Headers)
 	h.forwardInteractionsStream(c, flusher, func(err error) { cliCancel(err) }, data, errs)
 }

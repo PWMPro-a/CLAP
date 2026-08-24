@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -154,6 +155,147 @@ func TestFinalizeStreamingWritesAPIWebsocketTimeline(t *testing.T) {
 	}
 }
 
+func TestStreamingWriteHeaderDoesNotWaitForLoggerInitialization(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	streamWriter := &testStreamingLogWriter{}
+	logger := &blockingStreamingRequestLogger{
+		testRequestLogger: testRequestLogger{enabled: true},
+		started:           make(chan struct{}),
+		release:           make(chan struct{}),
+		writer:            streamWriter,
+	}
+	wrapper := NewResponseWriterWrapper(c.Writer, logger, &RequestInfo{
+		URL:       "/v1/responses",
+		Method:    "POST",
+		Headers:   map[string][]string{"Content-Type": {"application/json"}},
+		RequestID: "req-stream",
+		Timestamp: time.Now(),
+	})
+	c.Writer = wrapper
+	c.Header("Content-Type", "text/event-stream")
+
+	startedAt := time.Now()
+	wrapper.WriteHeader(http.StatusOK)
+	if elapsed := time.Since(startedAt); elapsed > 50*time.Millisecond {
+		t.Fatalf("WriteHeader blocked on streaming logger for %s", elapsed)
+	}
+	select {
+	case <-logger.started:
+	case <-time.After(time.Second):
+		t.Fatal("streaming logger initialization did not start")
+	}
+	if _, err := wrapper.Write([]byte(": keep-alive\n\n")); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	close(logger.release)
+	if err := wrapper.Finalize(c); err != nil {
+		t.Fatalf("Finalize error: %v", err)
+	}
+	if got := string(streamWriter.chunksJoined()); got != ": keep-alive\n\n" {
+		t.Fatalf("captured chunks = %q", got)
+	}
+}
+
+func TestStreamingWriteHeaderNowInitializesStreamingLogging(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	streamWriter := &testStreamingLogWriter{}
+	logger := &blockingStreamingRequestLogger{
+		testRequestLogger: testRequestLogger{enabled: true},
+		started:           make(chan struct{}),
+		release:           make(chan struct{}),
+		writer:            streamWriter,
+	}
+	wrapper := NewResponseWriterWrapper(c.Writer, logger, &RequestInfo{
+		URL:       "/v1/responses",
+		Method:    "POST",
+		Headers:   map[string][]string{"Content-Type": {"application/json"}},
+		RequestID: "req-stream-now",
+		Timestamp: time.Now(),
+	})
+	c.Writer = wrapper
+	c.Header("Content-Type", "text/event-stream")
+
+	startedAt := time.Now()
+	wrapper.WriteHeaderNow()
+	if elapsed := time.Since(startedAt); elapsed > 50*time.Millisecond {
+		t.Fatalf("WriteHeaderNow blocked on streaming logger for %s", elapsed)
+	}
+	select {
+	case <-logger.started:
+	case <-time.After(time.Second):
+		t.Fatal("streaming logger initialization did not start")
+	}
+	if _, err := wrapper.Write([]byte(": keep-alive\n\n")); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if wrapper.body.Len() != 0 {
+		t.Fatalf("streaming body was buffered as non-streaming: %q", wrapper.body.String())
+	}
+	close(logger.release)
+	if err := wrapper.Finalize(c); err != nil {
+		t.Fatalf("Finalize error: %v", err)
+	}
+	if got := string(streamWriter.chunksJoined()); got != ": keep-alive\n\n" {
+		t.Fatalf("captured chunks = %q", got)
+	}
+}
+
+func TestStreamingFlushInitializesStreamingLogging(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	streamWriter := &testStreamingLogWriter{}
+	logger := &blockingStreamingRequestLogger{
+		testRequestLogger: testRequestLogger{enabled: true},
+		started:           make(chan struct{}),
+		release:           make(chan struct{}),
+		writer:            streamWriter,
+	}
+	wrapper := NewResponseWriterWrapper(c.Writer, logger, &RequestInfo{
+		URL:       "/v1/responses",
+		Method:    "POST",
+		Headers:   map[string][]string{"Content-Type": {"application/json"}},
+		RequestID: "req-stream-flush",
+		Timestamp: time.Now(),
+	})
+	c.Writer = wrapper
+	c.Header("Content-Type", "text/event-stream")
+
+	startedAt := time.Now()
+	wrapper.Flush()
+	if elapsed := time.Since(startedAt); elapsed > 50*time.Millisecond {
+		t.Fatalf("Flush blocked on streaming logger for %s", elapsed)
+	}
+	select {
+	case <-logger.started:
+	case <-time.After(time.Second):
+		t.Fatal("streaming logger initialization did not start")
+	}
+	if _, err := wrapper.WriteString(": keep-alive\n\n"); err != nil {
+		t.Fatalf("WriteString error: %v", err)
+	}
+	if wrapper.body.Len() != 0 {
+		t.Fatalf("streaming body was buffered as non-streaming: %q", wrapper.body.String())
+	}
+	close(logger.release)
+	if err := wrapper.Finalize(c); err != nil {
+		t.Fatalf("Finalize error: %v", err)
+	}
+	if got := string(streamWriter.chunksJoined()); got != ": keep-alive\n\n" {
+		t.Fatalf("captured chunks = %q", got)
+	}
+}
+
 type testRequestLogger struct {
 	enabled bool
 }
@@ -173,9 +315,12 @@ func (l *testRequestLogger) IsEnabled() bool {
 type testStreamingLogWriter struct {
 	apiWebsocketTimeline []byte
 	closed               bool
+	chunks               [][]byte
 }
 
-func (w *testStreamingLogWriter) WriteChunkAsync([]byte) {}
+func (w *testStreamingLogWriter) WriteChunkAsync(chunk []byte) {
+	w.chunks = append(w.chunks, bytes.Clone(chunk))
+}
 
 func (w *testStreamingLogWriter) WriteStatus(int, map[string][]string) error {
 	return nil
@@ -199,4 +344,21 @@ func (w *testStreamingLogWriter) SetFirstChunkTimestamp(time.Time) {}
 func (w *testStreamingLogWriter) Close() error {
 	w.closed = true
 	return nil
+}
+
+func (w *testStreamingLogWriter) chunksJoined() []byte {
+	return bytes.Join(w.chunks, nil)
+}
+
+type blockingStreamingRequestLogger struct {
+	testRequestLogger
+	started chan struct{}
+	release chan struct{}
+	writer  logging.StreamingLogWriter
+}
+
+func (l *blockingStreamingRequestLogger) LogStreamingRequest(string, string, map[string][]string, []byte, string) (logging.StreamingLogWriter, error) {
+	close(l.started)
+	<-l.release
+	return l.writer, nil
 }

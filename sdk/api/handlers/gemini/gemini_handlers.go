@@ -188,12 +188,6 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
-	}
 
 	type streamExecutionResult struct {
 		data            <-chan []byte
@@ -206,18 +200,24 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 
 	bootstrapDelay := handlers.StreamingBootstrapKeepAliveDelayOrDefault(h.Cfg)
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
 	if alt != "" {
 		bootstrapDelay = 0
+		keepAliveInterval = 0
 	}
 	execution, streamStarted, canceled := handlers.WaitForStreamBootstrap(
 		c.Request.Context(),
 		bootstrapDelay,
-		handlers.StreamingKeepAliveInterval(h.Cfg),
+		keepAliveInterval,
 		execute,
 		func() {
-			setSSEHeaders()
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-			flusher.Flush()
+			if alt == "" {
+				handlers.SetSSEHeaders(c)
+				handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			} else {
+				handlers.CommitStreamResponse(c)
+				flusher.Flush()
+			}
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
@@ -261,7 +261,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			if !ok {
 				// Closed without data
 				if alt == "" {
-					setSSEHeaders()
+					handlers.SetSSEHeaders(c)
 				}
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				flusher.Flush()
@@ -271,7 +271,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 
 			// Success! Set headers.
 			if alt == "" {
-				setSSEHeaders()
+				handlers.SetSSEHeaders(c)
 			}
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 

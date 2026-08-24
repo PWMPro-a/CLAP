@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -327,6 +328,72 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 	out := make([]string, len(e.authIDs))
 	copy(out, e.authIDs)
 	return out
+}
+
+func TestWaitForStreamBootstrapImmediateDefaultWritesBeforeDelayedExecution(t *testing.T) {
+	release := make(chan struct{})
+	bootstrapped := make(chan struct{}, 1)
+	errs := make(chan error, 1)
+
+	go func() {
+		result, streamStarted, canceled := WaitForStreamBootstrap(
+			context.Background(),
+			0,
+			0,
+			func() string {
+				<-release
+				return "ok"
+			},
+			func() {
+				bootstrapped <- struct{}{}
+			},
+			nil,
+		)
+		if canceled {
+			errs <- errors.New("unexpected cancellation")
+			return
+		}
+		if !streamStarted {
+			errs <- errors.New("stream was not bootstrapped")
+			return
+		}
+		if result != "ok" {
+			errs <- fmt.Errorf("result = %q, want ok", result)
+			return
+		}
+		errs <- nil
+	}()
+
+	select {
+	case <-bootstrapped:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("bootstrap write did not happen before delayed execution completed")
+	}
+	close(release)
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWaitForStreamBootstrapImmediateDefaultKeepsSynchronousResultUncommitted(t *testing.T) {
+	bootstrapped := false
+	result, streamStarted, canceled := WaitForStreamBootstrap(
+		context.Background(),
+		0,
+		0,
+		func() string { return "ok" },
+		func() { bootstrapped = true },
+		nil,
+	)
+	if canceled {
+		t.Fatal("unexpected cancellation")
+	}
+	if streamStarted || bootstrapped {
+		t.Fatalf("synchronous result unexpectedly bootstrapped: streamStarted=%v bootstrapped=%v", streamStarted, bootstrapped)
+	}
+	if result != "ok" {
+		t.Fatalf("result = %q, want ok", result)
+	}
 }
 
 func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {

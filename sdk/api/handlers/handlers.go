@@ -52,7 +52,7 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 
 const (
 	defaultStreamingKeepAliveSeconds         = 0
-	defaultStreamingBootstrapKeepAliveMillis = 200
+	defaultStreamingBootstrapKeepAliveMillis = 0
 	defaultStreamingBootstrapRetries         = 0
 	// Stream interceptor history is intentionally bounded and not configurable in the first SDK surface.
 	maxStreamInterceptorHistoryChunks = 64
@@ -123,8 +123,9 @@ func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 }
 
 // StreamingBootstrapKeepAliveDelay returns how long a streaming handler may wait
-// for the upstream bootstrap result before committing an SSE comment heartbeat.
-// Returning 0 disables the bootstrap heartbeat.
+// for the upstream bootstrap result before committing the response headers.
+// Returning 0 means the handler should commit after a very small grace window
+// once the upstream execution has not completed synchronously.
 func StreamingBootstrapKeepAliveDelay(cfg *config.SDKConfig) time.Duration {
 	millis := 0
 	if cfg != nil {
@@ -137,7 +138,7 @@ func StreamingBootstrapKeepAliveDelay(cfg *config.SDKConfig) time.Duration {
 }
 
 // StreamingBootstrapKeepAliveDelayOrDefault returns the configured bootstrap delay
-// or the default 200ms bootstrap window used by streaming handlers when unset.
+// or the default immediate-commit window used by streaming handlers when unset.
 func StreamingBootstrapKeepAliveDelayOrDefault(cfg *config.SDKConfig) time.Duration {
 	delay := StreamingBootstrapKeepAliveDelay(cfg)
 	if delay <= 0 {

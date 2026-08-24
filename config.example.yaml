@@ -405,7 +405,7 @@ ws-auth: true
 nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
-#   bootstrap-keepalive-millis: 150 # Default: 0 (disabled). Emit the first SSE comment while upstream bootstrap is still pending.
+#   bootstrap-keepalive-millis: 0   # Default: 0. Commit SSE after a tiny grace window when upstream bootstrap is still pending.
 #   keepalive-seconds: 10           # Default: 0 (disabled). Continue SSE comments while the stream is idle.
 #   bootstrap-retries: 1            # Default: 0 (disabled). Retries before first byte is sent.
 

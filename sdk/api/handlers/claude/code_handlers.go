@@ -235,12 +235,6 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
-	}
 
 	type streamExecutionResult struct {
 		data            <-chan []byte
@@ -258,9 +252,8 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		handlers.StreamingKeepAliveInterval(h.Cfg),
 		execute,
 		func() {
-			setSSEHeaders()
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-			flusher.Flush()
+			handlers.SetSSEHeaders(c)
+			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
@@ -312,7 +305,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 					return
 				}
 				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
+				handlers.SetSSEHeaders(c)
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				flusher.Flush()
 				cliCancel(nil)
@@ -320,7 +313,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			}
 
 			// Success! Set headers now.
-			setSSEHeaders()
+			handlers.SetSSEHeaders(c)
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write the first chunk

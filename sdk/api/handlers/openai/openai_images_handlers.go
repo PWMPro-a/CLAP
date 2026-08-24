@@ -65,10 +65,7 @@ type imagesStreamExecutionResult struct {
 }
 
 func setImagesSSEHeaders(c *gin.Context) {
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("Access-Control-Allow-Origin", "*")
+	handlers.SetSSEHeaders(c)
 }
 
 func (h *OpenAIAPIHandler) newImagesStreamKeepAliveTicker() (*time.Ticker, <-chan time.Time) {
@@ -112,7 +109,7 @@ func (h *OpenAIAPIHandler) waitImagesStreamExecution(c *gin.Context, flusher htt
 		execute,
 		func() {
 			setImagesSSEHeaders(c)
-			writeImagesStreamKeepAlive(c, flusher)
+			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
 		},
 		func() {
 			writeImagesStreamKeepAlive(c, flusher)
@@ -1454,7 +1451,10 @@ func (h *OpenAIAPIHandler) streamImagesWithModel(c *gin.Context, imageReq []byte
 		}
 	}
 	defer stopKeepAlive()
-	streamStarted := false
+	setImagesSSEHeaders(c)
+	handlers.CommitStreamResponse(c)
+	flusher.Flush()
+	streamStarted := true
 	writeError := func(errMsg *interfaces.ErrorMessage) {
 		if streamStarted {
 			writeImagesStreamErrorEvent(c, errMsg)

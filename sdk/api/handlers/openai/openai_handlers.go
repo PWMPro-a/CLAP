@@ -471,12 +471,6 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
-	}
 
 	type streamExecutionResult struct {
 		data            <-chan []byte
@@ -494,9 +488,8 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		handlers.StreamingKeepAliveInterval(h.Cfg),
 		execute,
 		func() {
-			setSSEHeaders()
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-			flusher.Flush()
+			handlers.SetSSEHeaders(c)
+			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
@@ -539,7 +532,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		case chunk, ok := <-dataChan:
 			if !ok {
 				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
+				handlers.SetSSEHeaders(c)
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 				flusher.Flush()
@@ -548,7 +541,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			}
 
 			// Success! Commit to streaming headers.
-			setSSEHeaders()
+			handlers.SetSSEHeaders(c)
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
@@ -615,12 +608,6 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 	modelName := gjson.GetBytes(chatCompletionsJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
-	}
 
 	type streamExecutionResult struct {
 		data            <-chan []byte
@@ -639,9 +626,8 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		handlers.StreamingKeepAliveInterval(h.Cfg),
 		execute,
 		func() {
-			setSSEHeaders()
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-			flusher.Flush()
+			handlers.SetSSEHeaders(c)
+			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
@@ -723,7 +709,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				setSSEHeaders()
+				handlers.SetSSEHeaders(c)
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 				flusher.Flush()
@@ -732,7 +718,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			}
 
 			// Success! Set headers.
-			setSSEHeaders()
+			handlers.SetSSEHeaders(c)
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write the first chunk

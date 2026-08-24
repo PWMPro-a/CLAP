@@ -5,9 +5,10 @@ import (
 	"time"
 )
 
-// WaitForStreamBootstrap runs execute in the background when bootstrapDelay is positive,
-// allows the caller to emit an early SSE bootstrap write, and then returns the execution
-// result once available.
+const immediateStreamBootstrapGrace = 5 * time.Millisecond
+
+// WaitForStreamBootstrap runs execute in the background, optionally emits an
+// early SSE bootstrap write, and then returns the execution result once available.
 func WaitForStreamBootstrap[T any](
 	ctx context.Context,
 	bootstrapDelay time.Duration,
@@ -23,14 +24,54 @@ func WaitForStreamBootstrap[T any](
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if bootstrapDelay <= 0 {
-		return execute(), false, false
-	}
 
 	resultChan := make(chan T, 1)
 	go func() {
 		resultChan <- execute()
 	}()
+
+	if bootstrapDelay <= 0 {
+		graceTimer := time.NewTimer(immediateStreamBootstrapGrace)
+		select {
+		case <-ctx.Done():
+			graceTimer.Stop()
+			return zero, false, true
+		case result := <-resultChan:
+			graceTimer.Stop()
+			return result, false, false
+		case <-graceTimer.C:
+		}
+
+		if writeBootstrap != nil {
+			writeBootstrap()
+		}
+		streamStarted := writeBootstrap != nil
+
+		var keepAlive *time.Ticker
+		var keepAliveC <-chan time.Time
+		defer func() {
+			if keepAlive != nil {
+				keepAlive.Stop()
+			}
+		}()
+		if keepAliveInterval > 0 {
+			keepAlive = time.NewTicker(keepAliveInterval)
+			keepAliveC = keepAlive.C
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return zero, streamStarted, true
+			case result := <-resultChan:
+				return result, streamStarted, false
+			case <-keepAliveC:
+				if writeKeepAlive != nil {
+					writeKeepAlive()
+				}
+			}
+		}
+	}
 
 	bootstrapTimer := time.NewTimer(bootstrapDelay)
 	defer bootstrapTimer.Stop()

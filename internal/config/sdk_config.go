@@ -86,9 +86,9 @@ type StreamingConfig struct {
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
 
 	// BootstrapKeepAliveMillis controls how quickly the server commits an SSE response with
-	// a comment heartbeat while the upstream request is still waiting for its first event.
-	// This protects long-running stream bootstrap work from downstream first-byte timeouts
-	// without delaying immediate HTTP error responses. <= 0 disables the bootstrap heartbeat.
+	// a bootstrap heartbeat while the upstream request is still waiting for its first event.
+	// This protects long-running stream bootstrap work from downstream first-byte timeouts.
+	// <= 0 commits after a very small grace window once upstream has not completed synchronously.
 	BootstrapKeepAliveMillis int `yaml:"bootstrap-keepalive-millis,omitempty" json:"bootstrap-keepalive-millis,omitempty"`
 
 	// BootstrapRetries controls how many times the server may retry a streaming request before any bytes are sent,
