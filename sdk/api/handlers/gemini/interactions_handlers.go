@@ -137,32 +137,95 @@ func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx conte
 		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{Error: handlers.ErrorDetail{Message: "Streaming not supported", Type: "server_error"}})
 		return
 	}
-	stream, errMsg := h.ExecuteProtocolStreamWithAuthManager(cliCtx, req)
-	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
-		cliCancel(errMsg.Error)
+
+	type streamExecutionResult struct {
+		stream handlers.ModelExecutionStream
+		errMsg *interfaces.ErrorMessage
+	}
+	execute := func() streamExecutionResult {
+		stream, errMsg := h.ExecuteProtocolStreamWithAuthManager(cliCtx, req)
+		return streamExecutionResult{stream: stream, errMsg: errMsg}
+	}
+
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
+
+	execution, streamStarted, canceled := handlers.WaitForStreamBootstrap(
+		c.Request.Context(),
+		handlers.StreamingBootstrapKeepAliveDelayOrDefault(h.Cfg),
+		handlers.StreamingKeepAliveInterval(h.Cfg),
+		execute,
+		func() {
+			setSSEHeaders()
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+		},
+		func() {
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+		},
+	)
+	if canceled {
+		cliCancel(c.Request.Context().Err())
 		return
 	}
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("Access-Control-Allow-Origin", "*")
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), stream.Headers)
-	data := make(chan []byte)
-	errs := make(chan *interfaces.ErrorMessage, 1)
-	go func() {
-		defer close(data)
-		defer close(errs)
-		for chunk := range stream.Chunks {
-			if chunk.Err != nil {
-				errs <- &interfaces.ErrorMessage{StatusCode: chunk.Err.StatusCode, Error: chunk.Err}
-				return
+	if execution.errMsg != nil {
+		if streamStarted {
+			setSSEHeaders()
+			status := http.StatusInternalServerError
+			if execution.errMsg.StatusCode > 0 {
+				status = execution.errMsg.StatusCode
 			}
-			if len(chunk.Payload) > 0 {
-				data <- chunk.Payload
+			errText := http.StatusText(status)
+			if execution.errMsg.Error != nil && execution.errMsg.Error.Error() != "" {
+				errText = execution.errMsg.Error.Error()
 			}
+			body := handlers.BuildErrorResponseBody(status, errText)
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+			flusher.Flush()
+		} else {
+			h.WriteErrorResponse(c, execution.errMsg)
 		}
-	}()
+		if execution.errMsg.Error != nil {
+			cliCancel(execution.errMsg.Error)
+		} else {
+			cliCancel(nil)
+		}
+		return
+	}
+
+	stream := execution.stream
+	toChannels := func(stream handlers.ModelExecutionStream) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
+		data := make(chan []byte)
+		errs := make(chan *interfaces.ErrorMessage, 1)
+		go func() {
+			defer close(data)
+			defer close(errs)
+			for chunk := range stream.Chunks {
+				if chunk.Err != nil {
+					errs <- &interfaces.ErrorMessage{StatusCode: chunk.Err.StatusCode, Error: chunk.Err}
+					return
+				}
+				if len(chunk.Payload) > 0 {
+					data <- chunk.Payload
+				}
+			}
+		}()
+		return data, errs
+	}
+
+	data, errs := toChannels(stream)
+	if streamStarted {
+		h.forwardInteractionsStream(c, flusher, func(err error) { cliCancel(err) }, data, errs)
+		return
+	}
+
+	setSSEHeaders()
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), stream.Headers)
 	h.forwardInteractionsStream(c, flusher, func(err error) { cliCancel(err) }, data, errs)
 }
 

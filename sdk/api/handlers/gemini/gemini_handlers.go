@@ -188,13 +188,53 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
-
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+	}
+
+	type streamExecutionResult struct {
+		data            <-chan []byte
+		upstreamHeaders http.Header
+		errs            <-chan *interfaces.ErrorMessage
+	}
+	execute := func() streamExecutionResult {
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
+		return streamExecutionResult{data: dataChan, upstreamHeaders: upstreamHeaders, errs: errChan}
+	}
+
+	bootstrapDelay := handlers.StreamingBootstrapKeepAliveDelayOrDefault(h.Cfg)
+	if alt != "" {
+		bootstrapDelay = 0
+	}
+	execution, streamStarted, canceled := handlers.WaitForStreamBootstrap(
+		c.Request.Context(),
+		bootstrapDelay,
+		handlers.StreamingKeepAliveInterval(h.Cfg),
+		execute,
+		func() {
+			setSSEHeaders()
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+		},
+		func() {
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+		},
+	)
+	if canceled {
+		cliCancel(c.Request.Context().Err())
+		return
+	}
+
+	dataChan := execution.data
+	upstreamHeaders := execution.upstreamHeaders
+	errChan := execution.errs
+	if streamStarted {
+		h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
+		return
 	}
 
 	// Peek at the first chunk

@@ -105,31 +105,19 @@ func writeImagesStreamErrorEvent(c *gin.Context, errMsg *interfaces.ErrorMessage
 }
 
 func (h *OpenAIAPIHandler) waitImagesStreamExecution(c *gin.Context, flusher http.Flusher, execute func() imagesStreamExecutionResult) (imagesStreamExecutionResult, bool, bool) {
-	resultChan := make(chan imagesStreamExecutionResult, 1)
-	go func() {
-		resultChan <- execute()
-	}()
-
-	keepAlive, keepAliveC := h.newImagesStreamKeepAliveTicker()
-	defer func() {
-		if keepAlive != nil {
-			keepAlive.Stop()
-		}
-	}()
-
-	streamStarted := false
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			return imagesStreamExecutionResult{}, streamStarted, true
-		case result := <-resultChan:
-			return result, streamStarted, false
-		case <-keepAliveC:
+	return handlers.WaitForStreamBootstrap(
+		c.Request.Context(),
+		handlers.StreamingBootstrapKeepAliveDelayOrDefault(h.Cfg),
+		handlers.StreamingKeepAliveInterval(h.Cfg),
+		execute,
+		func() {
 			setImagesSSEHeaders(c)
 			writeImagesStreamKeepAlive(c, flusher)
-			streamStarted = true
-		}
-	}
+		},
+		func() {
+			writeImagesStreamKeepAlive(c, flusher)
+		},
+	)
 }
 
 func (a *sseFrameAccumulator) AddChunk(chunk []byte) [][]byte {

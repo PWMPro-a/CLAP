@@ -51,8 +51,9 @@ type ErrorDetail struct {
 const idempotencyKeyMetadataKey = "idempotency_key"
 
 const (
-	defaultStreamingKeepAliveSeconds = 0
-	defaultStreamingBootstrapRetries = 0
+	defaultStreamingKeepAliveSeconds         = 0
+	defaultStreamingBootstrapKeepAliveMillis = 200
+	defaultStreamingBootstrapRetries         = 0
 	// Stream interceptor history is intentionally bounded and not configurable in the first SDK surface.
 	maxStreamInterceptorHistoryChunks = 64
 	maxStreamInterceptorHistoryBytes  = 1 << 20
@@ -133,6 +134,16 @@ func StreamingBootstrapKeepAliveDelay(cfg *config.SDKConfig) time.Duration {
 		return 0
 	}
 	return time.Duration(millis) * time.Millisecond
+}
+
+// StreamingBootstrapKeepAliveDelayOrDefault returns the configured bootstrap delay
+// or the default 200ms bootstrap window used by streaming handlers when unset.
+func StreamingBootstrapKeepAliveDelayOrDefault(cfg *config.SDKConfig) time.Duration {
+	delay := StreamingBootstrapKeepAliveDelay(cfg)
+	if delay <= 0 {
+		return defaultStreamingBootstrapKeepAliveMillis * time.Millisecond
+	}
+	return delay
 }
 
 // NonStreamingKeepAliveInterval returns the keep-alive interval for non-streaming responses.

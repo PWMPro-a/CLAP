@@ -205,7 +205,7 @@ func TestOpenAIResponsesSSEBootstrapKeepAlive(t *testing.T) {
 	}
 }
 
-func TestOpenAIResponsesSSEBootstrapKeepAliveDefaultsForCodexClient(t *testing.T) {
+func TestOpenAIResponsesSSEBootstrapKeepAliveDefaults(t *testing.T) {
 	const upstreamDelay = 2200 * time.Millisecond
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -228,7 +228,6 @@ func TestOpenAIResponsesSSEBootstrapKeepAliveDefaultsForCodexClient(t *testing.T
 	recorder := newFirstWriteRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"handler-ttft-model","stream":true,"input":"hello"}`))
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("User-Agent", "Codex Desktop/1.0.0")
 	started := time.Now()
 	done := make(chan struct{})
 	go func() {
@@ -240,10 +239,10 @@ func TestOpenAIResponsesSSEBootstrapKeepAliveDefaultsForCodexClient(t *testing.T
 	select {
 	case firstWrite = <-recorder.firstWrite:
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for codex bootstrap SSE heartbeat")
+		t.Fatal("timed out waiting for bootstrap SSE heartbeat")
 	}
 	if elapsed := firstWrite.Sub(started); elapsed < 150*time.Millisecond || elapsed > 350*time.Millisecond {
-		t.Fatalf("codex bootstrap first write = %s, want near 200ms", elapsed)
+		t.Fatalf("bootstrap first write = %s, want near 200ms", elapsed)
 	}
 	select {
 	case <-done:
@@ -254,7 +253,7 @@ func TestOpenAIResponsesSSEBootstrapKeepAliveDefaultsForCodexClient(t *testing.T
 		t.Fatalf("status = %d, body = %q", recorder.Code, recorder.Body.String())
 	}
 	if !strings.Contains(recorder.Body.String(), ": keep-alive") {
-		t.Fatalf("missing codex bootstrap heartbeat: %q", recorder.Body.String())
+		t.Fatalf("missing bootstrap heartbeat: %q", recorder.Body.String())
 	}
 }
 
