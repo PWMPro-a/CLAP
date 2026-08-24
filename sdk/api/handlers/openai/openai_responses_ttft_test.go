@@ -205,6 +205,59 @@ func TestOpenAIResponsesSSEBootstrapKeepAlive(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesSSEBootstrapKeepAliveDefaultsForCodexClient(t *testing.T) {
+	const upstreamDelay = 2200 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		timer := time.NewTimer(upstreamDelay)
+		defer timer.Stop()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+		}
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+		flusher.Flush()
+	}))
+	t.Cleanup(upstream.Close)
+
+	engine := newResponsesTTFTTestEngine(t, upstream.URL, internalconfig.StreamingConfig{})
+	recorder := newFirstWriteRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"handler-ttft-model","stream":true,"input":"hello"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("User-Agent", "Codex Desktop/1.0.0")
+	started := time.Now()
+	done := make(chan struct{})
+	go func() {
+		engine.ServeHTTP(recorder, request)
+		close(done)
+	}()
+
+	var firstWrite time.Time
+	select {
+	case firstWrite = <-recorder.firstWrite:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for codex bootstrap SSE heartbeat")
+	}
+	if elapsed := firstWrite.Sub(started); elapsed < 150*time.Millisecond || elapsed > 350*time.Millisecond {
+		t.Fatalf("codex bootstrap first write = %s, want near 200ms", elapsed)
+	}
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for codex stream completion")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), ": keep-alive") {
+		t.Fatalf("missing codex bootstrap heartbeat: %q", recorder.Body.String())
+	}
+}
+
 func TestOpenAIResponsesSSEBootstrapKeepsImmediateHTTPError(t *testing.T) {
 	engine := newResponsesTTFTTestEngine(t, "http://127.0.0.1:1", internalconfig.StreamingConfig{
 		BootstrapKeepAliveMillis: 150,

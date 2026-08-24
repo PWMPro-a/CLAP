@@ -48,6 +48,8 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 	}
 }
 
+const codexResponsesBootstrapKeepAliveDelay = 200 * time.Millisecond
+
 type responsesSSEFramer struct {
 	pending              []byte
 	outputItems          map[int][]byte
@@ -542,6 +544,9 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	var execution streamExecutionResult
 	streamStarted := false
 	bootstrapDelay := handlers.StreamingBootstrapKeepAliveDelay(h.Cfg)
+	if isCodexResponsesClientRequest(c) && (bootstrapDelay <= 0 || bootstrapDelay > codexResponsesBootstrapKeepAliveDelay) {
+		bootstrapDelay = codexResponsesBootstrapKeepAliveDelay
+	}
 	if bootstrapDelay <= 0 {
 		execution = execute()
 	} else {
