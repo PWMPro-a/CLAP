@@ -111,7 +111,8 @@ func (h *GeminiAPIHandler) Interactions(c *gin.Context) {
 
 	req := buildInteractionsExecutionRequest(target, modelName, rawJSON, alt)
 	if target.Stream {
-		h.handleInteractionsStream(c, cliCtx, cliCancel, req)
+		cliCtx, markClientFirstByte := handlers.WithStreamClientFirstByteTracker(cliCtx)
+		h.handleInteractionsStream(c, cliCtx, cliCancel, req, markClientFirstByte)
 		return
 	}
 	h.handleInteractionsNonStream(c, cliCtx, cliCancel, req)
@@ -131,7 +132,7 @@ func (h *GeminiAPIHandler) handleInteractionsNonStream(c *gin.Context, cliCtx co
 	_, _ = c.Writer.Write(resp.Body)
 }
 
-func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx context.Context, cliCancel handlers.APIHandlerCancelFunc, req handlers.ProtocolExecutionRequest) {
+func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx context.Context, cliCancel handlers.APIHandlerCancelFunc, req handlers.ProtocolExecutionRequest, markClientFirstByte func()) {
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{Error: handlers.ErrorDetail{Message: "Streaming not supported", Type: "server_error"}})
@@ -155,10 +156,12 @@ func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx conte
 		func() {
 			handlers.SetSSEHeaders(c)
 			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			markClientFirstByte()
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 			flusher.Flush()
+			markClientFirstByte()
 		},
 	)
 	if canceled {
@@ -179,6 +182,7 @@ func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx conte
 			body := handlers.BuildErrorResponseBody(status, errText)
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
 			flusher.Flush()
+			markClientFirstByte()
 		} else {
 			h.WriteErrorResponse(c, execution.errMsg)
 		}
@@ -218,6 +222,9 @@ func (h *GeminiAPIHandler) handleInteractionsStream(c *gin.Context, cliCtx conte
 
 	handlers.SetSSEHeaders(c)
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), stream.Headers)
+	handlers.CommitStreamResponse(c)
+	flusher.Flush()
+	markClientFirstByte()
 	h.forwardInteractionsStream(c, flusher, func(err error) { cliCancel(err) }, data, errs)
 }
 

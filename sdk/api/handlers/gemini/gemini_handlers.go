@@ -188,6 +188,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, markClientFirstByte := handlers.WithStreamClientFirstByteTracker(cliCtx)
 
 	type streamExecutionResult struct {
 		data            <-chan []byte
@@ -218,10 +219,12 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 				handlers.CommitStreamResponse(c)
 				flusher.Flush()
 			}
+			markClientFirstByte()
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 			flusher.Flush()
+			markClientFirstByte()
 		},
 	)
 	if canceled {
@@ -265,6 +268,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 				}
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				flusher.Flush()
+				markClientFirstByte()
 				cliCancel(nil)
 				return
 			}
@@ -284,8 +288,23 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 				_, _ = c.Writer.Write(chunk)
 			}
 			flusher.Flush()
+			markClientFirstByte()
 
 			// Continue
+			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
+			return
+		default:
+			// Commit an unbuffered first byte immediately after the upstream stream is open.
+			if alt == "" {
+				handlers.SetSSEHeaders(c)
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			} else {
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				handlers.CommitStreamResponse(c)
+				flusher.Flush()
+			}
+			markClientFirstByte()
 			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}

@@ -566,6 +566,21 @@ func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUsageReporterTTFTPrefersDownstreamFirstByte(t *testing.T) {
+	ctx, tracker := usage.WithDownstreamFirstByteTracker(context.Background())
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+
+	tracker.Mark()
+	reporter.StartResponseTTFT()
+	upstreamDelay := 30 * time.Millisecond
+	time.Sleep(upstreamDelay)
+	reporter.MarkFirstResponseByte()
+
+	if got := reporter.ttftDuration(); got >= upstreamDelay {
+		t.Fatalf("ttft = %v, want downstream first byte below upstream delay %v", got, upstreamDelay)
+	}
+}
+
 func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
 	ctx := usage.WithRequestedModelAlias(context.Background(), "client-gpt")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)

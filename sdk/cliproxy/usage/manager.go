@@ -78,6 +78,71 @@ type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
 type generateContextKey struct{}
+type downstreamFirstByteTrackerContextKey struct{}
+
+// FirstByteTracker records the first byte observed on the downstream response
+// path. It is shared through context so handlers can mark client-visible SSE
+// bootstrap writes while executors still publish usage records.
+type FirstByteTracker struct {
+	start time.Time
+	mu    sync.RWMutex
+	first time.Time
+}
+
+// NewFirstByteTracker creates a tracker whose duration is measured from now.
+func NewFirstByteTracker() *FirstByteTracker {
+	return &FirstByteTracker{start: time.Now()}
+}
+
+// Mark records the first downstream byte timestamp. Subsequent calls are ignored.
+func (t *FirstByteTracker) Mark() {
+	if t == nil {
+		return
+	}
+	now := time.Now()
+	t.mu.Lock()
+	if t.first.IsZero() {
+		t.first = now
+	}
+	t.mu.Unlock()
+}
+
+// Duration returns the time from tracker creation to the first downstream byte.
+func (t *FirstByteTracker) Duration() (time.Duration, bool) {
+	if t == nil {
+		return 0, false
+	}
+	t.mu.RLock()
+	start := t.start
+	first := t.first
+	t.mu.RUnlock()
+	if start.IsZero() || first.IsZero() {
+		return 0, false
+	}
+	duration := first.Sub(start)
+	if duration < 0 {
+		duration = 0
+	}
+	return duration, true
+}
+
+// WithDownstreamFirstByteTracker attaches a downstream first-byte tracker to ctx.
+func WithDownstreamFirstByteTracker(ctx context.Context) (context.Context, *FirstByteTracker) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tracker := NewFirstByteTracker()
+	return context.WithValue(ctx, downstreamFirstByteTrackerContextKey{}, tracker), tracker
+}
+
+// DownstreamFirstByteTrackerFromContext returns the tracker attached to ctx.
+func DownstreamFirstByteTrackerFromContext(ctx context.Context) *FirstByteTracker {
+	if ctx == nil {
+		return nil
+	}
+	tracker, _ := ctx.Value(downstreamFirstByteTrackerContextKey{}).(*FirstByteTracker)
+	return tracker
+}
 
 // WithRequestedModelAlias stores the client-requested model name for usage sinks.
 func WithRequestedModelAlias(ctx context.Context, alias string) context.Context {

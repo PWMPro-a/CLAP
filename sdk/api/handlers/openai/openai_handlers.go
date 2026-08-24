@@ -471,6 +471,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, markClientFirstByte := handlers.WithStreamClientFirstByteTracker(cliCtx)
 
 	type streamExecutionResult struct {
 		data            <-chan []byte
@@ -490,10 +491,12 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		func() {
 			handlers.SetSSEHeaders(c)
 			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			markClientFirstByte()
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 			flusher.Flush()
+			markClientFirstByte()
 		},
 	)
 	if canceled {
@@ -536,6 +539,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 				flusher.Flush()
+				markClientFirstByte()
 				cliCancel(nil)
 				return
 			}
@@ -546,8 +550,17 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 			flusher.Flush()
+			markClientFirstByte()
 
 			// Continue streaming the rest
+			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			return
+		default:
+			// Commit an unbuffered SSE heartbeat immediately after the upstream stream is open.
+			handlers.SetSSEHeaders(c)
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			markClientFirstByte()
 			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}
@@ -608,6 +621,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 	modelName := gjson.GetBytes(chatCompletionsJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, markClientFirstByte := handlers.WithStreamClientFirstByteTracker(cliCtx)
 
 	type streamExecutionResult struct {
 		data            <-chan []byte
@@ -628,10 +642,12 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		func() {
 			handlers.SetSSEHeaders(c)
 			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			markClientFirstByte()
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 			flusher.Flush()
+			markClientFirstByte()
 		},
 	)
 	if canceled {
@@ -713,6 +729,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 				flusher.Flush()
+				markClientFirstByte()
 				cliCancel(nil)
 				return
 			}
@@ -726,8 +743,17 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			if converted != nil {
 				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(converted))
 				flusher.Flush()
+				markClientFirstByte()
 			}
 			forwardConvertedStream(func() {})
+			return
+		default:
+			// Commit an unbuffered SSE heartbeat immediately after the upstream stream is open.
+			handlers.SetSSEHeaders(c)
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			markClientFirstByte()
+			forwardConvertedStream(nil)
 			return
 		}
 	}

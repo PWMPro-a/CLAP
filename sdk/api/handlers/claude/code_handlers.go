@@ -235,6 +235,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// Create a cancellable context for the backend client request
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx, markClientFirstByte := handlers.WithStreamClientFirstByteTracker(cliCtx)
 
 	type streamExecutionResult struct {
 		data            <-chan []byte
@@ -254,10 +255,12 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		func() {
 			handlers.SetSSEHeaders(c)
 			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			markClientFirstByte()
 		},
 		func() {
 			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 			flusher.Flush()
+			markClientFirstByte()
 		},
 	)
 	if canceled {
@@ -308,6 +311,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				handlers.SetSSEHeaders(c)
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				flusher.Flush()
+				markClientFirstByte()
 				cliCancel(nil)
 				return
 			}
@@ -320,9 +324,18 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			if len(chunk) > 0 {
 				_, _ = c.Writer.Write(chunk)
 				flusher.Flush()
+				markClientFirstByte()
 			}
 
 			// Continue streaming the rest
+			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			return
+		default:
+			// Commit an unbuffered SSE heartbeat immediately after the upstream stream is open.
+			handlers.SetSSEHeaders(c)
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			handlers.BootstrapStreamResponse(c, flusher, []byte(": keep-alive\n\n"))
+			markClientFirstByte()
 			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}

@@ -98,6 +98,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 			flusher.Flush()
 		case errMsg, ok := <-errs:
 			if !ok {
+				errs = nil
 				continue
 			}
 			if errMsg != nil {
