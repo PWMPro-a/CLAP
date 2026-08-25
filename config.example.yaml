@@ -299,10 +299,10 @@ codex:
     # Per-credential cap for cold requests and new affinity bindings.
     # Established warm bindings bypass it to preserve cache locality.
     max-concurrency: 8
-    # Plain HTTP/SSE Codex requests up to this approximate JSON size can use
-    # the upstream websocket transport. Keep this multi-MB by default so long
-    # cached Codex prompts still take the fast websocket path. <=0 uses 4194304.
-    websocket-safe-request-bytes: 4194304
+    # Plain HTTP/SSE Codex requests use the upstream websocket transport first.
+    # 0 disables local size precheck; a concrete upstream 1009/message-too-big
+    # before the first payload falls back to HTTP/SSE automatically.
+    websocket-safe-request-bytes: 0
     # Bounded hot websocket slots per auth/egress/model/session pool.
     websocket-pool-slots: 8
     # Rebalance long-lived hot sessions after either bound is reached.

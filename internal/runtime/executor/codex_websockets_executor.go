@@ -15,7 +15,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-const codexWebsocketDefaultSafeRequestBytes = 4 * 1024 * 1024
+const codexWebsocketDefaultSafeRequestBytes = 0
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
 //
@@ -90,6 +90,9 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			}
 			return result, errStream
 		}
+		if codexPlainHTTPWebsocketFallbackAllowed(ctx, opts) {
+			return e.maybeFallbackPlainHTTPWebsocketBootstrap(ctx, result, auth, req, opts)
+		}
 		return result, nil
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
@@ -120,15 +123,17 @@ func codexWebsocketStreamEnabled(cfg *config.Config, ctx context.Context, auth *
 		return false
 	}
 	// Very large JSON messages may be rejected by the upstream websocket endpoint
-	// with close code 1009. Keep a high default cap so long cached Codex prompts
-	// still take the fast websocket path, while preserving an operator override
-	// for environments that observe upstream message-too-big responses.
+	// with close code 1009. By default no local size precheck is applied: plain
+	// HTTP/SSE calls try the fast websocket path first and fall back only after a
+	// concrete upstream message-too-big bootstrap error. Operators can still set
+	// websocket-safe-request-bytes to a positive value for an environment-specific
+	// precheck.
 	if !cliproxyexecutor.DownstreamWebsocket(ctx) && !cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		requestBytes := len(req.Payload)
 		if len(opts.OriginalRequest) > requestBytes {
 			requestBytes = len(opts.OriginalRequest)
 		}
-		if requestBytes > codexWebsocketSafeRequestBytes(cfg) {
+		if limit := codexWebsocketSafeRequestBytes(cfg); limit > 0 && requestBytes > limit {
 			return false
 		}
 	}
@@ -140,6 +145,106 @@ func codexWebsocketSafeRequestBytes(cfg *config.Config) int {
 		return cfg.Codex.CacheAffinity.WebsocketSafeRequestBytes
 	}
 	return codexWebsocketDefaultSafeRequestBytes
+}
+
+func (e *CodexAutoExecutor) maybeFallbackPlainHTTPWebsocketBootstrap(ctx context.Context, result *cliproxyexecutor.StreamResult, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if result == nil || result.Chunks == nil {
+		return result, nil
+	}
+	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	for {
+		var (
+			chunk cliproxyexecutor.StreamChunk
+			ok    bool
+		)
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				codexDiscardStreamChunks(result.Chunks)
+				return nil, ctx.Err()
+			case chunk, ok = <-result.Chunks:
+			}
+		} else {
+			chunk, ok = <-result.Chunks
+		}
+		if !ok {
+			return codexBufferedStreamResult(ctx, result.Headers, buffered, nil), nil
+		}
+		if chunk.Err != nil {
+			codexDiscardStreamChunks(result.Chunks)
+			if isCodexWebsocketHTTPFallbackError(chunk.Err) {
+				return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+			}
+			return codexStreamErrorResult(result.Headers, chunk.Err), nil
+		}
+		buffered = append(buffered, chunk)
+		if len(chunk.Payload) > 0 {
+			return codexBufferedStreamResult(ctx, result.Headers, buffered, result.Chunks), nil
+		}
+	}
+}
+
+func codexDiscardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
+	if ch == nil {
+		return
+	}
+	go func() {
+		for range ch {
+		}
+	}()
+}
+
+func codexStreamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamResult {
+	ch := make(chan cliproxyexecutor.StreamChunk, 1)
+	ch <- cliproxyexecutor.StreamChunk{Err: err}
+	close(ch)
+	return &cliproxyexecutor.StreamResult{
+		Headers: cloneCodexHTTPHeader(headers),
+		Chunks:  ch,
+	}
+}
+
+func codexBufferedStreamResult(ctx context.Context, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(out)
+		for _, chunk := range buffered {
+			if !codexSendStreamChunk(ctx, out, chunk) {
+				codexDiscardStreamChunks(remaining)
+				return
+			}
+		}
+		for chunk := range remaining {
+			if !codexSendStreamChunk(ctx, out, chunk) {
+				codexDiscardStreamChunks(remaining)
+				return
+			}
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{
+		Headers: cloneCodexHTTPHeader(headers),
+		Chunks:  out,
+	}
+}
+
+func codexSendStreamChunk(ctx context.Context, out chan<- cliproxyexecutor.StreamChunk, chunk cliproxyexecutor.StreamChunk) bool {
+	if ctx == nil {
+		out <- chunk
+		return true
+	}
+	select {
+	case out <- chunk:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func cloneCodexHTTPHeader(headers http.Header) http.Header {
+	if headers == nil {
+		return nil
+	}
+	return headers.Clone()
 }
 
 func codexPlainHTTPWebsocketFallbackAllowed(ctx context.Context, opts cliproxyexecutor.Options) bool {
