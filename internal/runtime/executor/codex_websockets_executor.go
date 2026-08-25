@@ -69,8 +69,12 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.Execute(ctx, auth, req, opts)
+	if codexWebsocketStreamEnabled(e.codexConfig(), ctx, auth, req, opts) {
+		resp, errExecute := e.wsExec.Execute(ctx, auth, req, opts)
+		if errExecute != nil && codexPlainHTTPWebsocketFallbackAllowed(ctx, opts) && isCodexWebsocketHTTPFallbackError(errExecute) {
+			return e.httpExec.Execute(ctx, auth, req, opts)
+		}
+		return resp, errExecute
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		return cliproxyexecutor.Response{}, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()

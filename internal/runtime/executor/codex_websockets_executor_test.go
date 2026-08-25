@@ -700,6 +700,134 @@ func TestCodexAutoExecutorLargeHTTPRequestUsesSSEFallback(t *testing.T) {
 	}
 }
 
+func TestCodexAutoExecutorExecuteUsesWebsocketForEnabledAccounts(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var wsRequests atomic.Int32
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			if r.URL.Path != "/responses" {
+				http.Error(w, "unexpected websocket request", http.StatusBadRequest)
+				return
+			}
+			wsRequests.Add(1)
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upgrade websocket: %v", err)
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				t.Errorf("read upstream websocket message: %v", errRead)
+				return
+			}
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-ws","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				t.Errorf("write completed websocket message: %v", errWrite)
+			}
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/responses" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		httpRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{
+		ID:       "ws-enabled-auth",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{"websockets": true},
+	}
+	resp, errExecute := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := wsRequests.Load(); got != 1 {
+		t.Fatalf("websocket requests = %d, want 1", got)
+	}
+	if got := httpRequests.Load(); got != 0 {
+		t.Fatalf("HTTP requests = %d, want 0", got)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "hello" {
+		t.Fatalf("choices.0.message.content = %q, want hello; payload=%s", got, resp.Payload)
+	}
+}
+
+func TestCodexAutoExecutorExecuteFallsBackAfterWebsocketMessageTooBig(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var wsRequests atomic.Int32
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			wsRequests.Add(1)
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upgrade websocket: %v", err)
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				t.Errorf("read upstream websocket message: %v", errRead)
+				return
+			}
+			deadline := time.Now().Add(time.Second)
+			closeMessage := websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "message too big")
+			if errWrite := conn.WriteControl(websocket.CloseMessage, closeMessage, deadline); errWrite != nil {
+				t.Errorf("write close websocket message: %v", errWrite)
+			}
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/responses" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		httpRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewCodexAutoExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{
+		ID:       "ws-enabled-large-auth",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{"websockets": true},
+	}
+	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"` + strings.Repeat("x", codexWebsocketDefaultSafeRequestBytes+1024) + `"}]}`)
+	resp, errExecute := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := wsRequests.Load(); got != 1 {
+		t.Fatalf("websocket requests = %d, want 1", got)
+	}
+	if got := httpRequests.Load(); got != 1 {
+		t.Fatalf("HTTP fallback requests = %d, want 1", got)
+	}
+	if got := gjson.GetBytes(resp.Payload, "id").String(); got != "resp-http" {
+		t.Fatalf("response id = %q, want resp-http; payload=%s", got, resp.Payload)
+	}
+}
+
 func TestCodexAutoExecutorPlainHTTPSSEFallsBackAfterWebsocketMessageTooBigBootstrap(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var wsRequests atomic.Int32
