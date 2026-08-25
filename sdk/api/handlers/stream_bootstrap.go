@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const immediateStreamBootstrapGrace = 5 * time.Millisecond
+const immediateStreamBootstrapFastFailGrace = time.Millisecond
 
 // WaitForStreamBootstrap runs execute in the background, optionally emits an
 // early SSE bootstrap write, and then returns the execution result once available.
@@ -31,15 +31,15 @@ func WaitForStreamBootstrap[T any](
 	}()
 
 	if bootstrapDelay <= 0 {
-		graceTimer := time.NewTimer(immediateStreamBootstrapGrace)
+		fastFailTimer := time.NewTimer(immediateStreamBootstrapFastFailGrace)
 		select {
 		case <-ctx.Done():
-			graceTimer.Stop()
+			fastFailTimer.Stop()
 			return zero, false, true
 		case result := <-resultChan:
-			graceTimer.Stop()
+			fastFailTimer.Stop()
 			return result, false, false
-		case <-graceTimer.C:
+		case <-fastFailTimer.C:
 		}
 
 		if writeBootstrap != nil {

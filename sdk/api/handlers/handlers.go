@@ -124,8 +124,7 @@ func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 
 // StreamingBootstrapKeepAliveDelay returns how long a streaming handler may wait
 // for the upstream bootstrap result before committing the response headers.
-// Returning 0 means the handler should commit after a very small grace window
-// once the upstream execution has not completed synchronously.
+// Returning 0 means the handler commits and flushes a bootstrap SSE frame immediately.
 func StreamingBootstrapKeepAliveDelay(cfg *config.SDKConfig) time.Duration {
 	millis := 0
 	if cfg != nil {
@@ -138,7 +137,7 @@ func StreamingBootstrapKeepAliveDelay(cfg *config.SDKConfig) time.Duration {
 }
 
 // StreamingBootstrapKeepAliveDelayOrDefault returns the configured bootstrap delay
-// or the default immediate-commit window used by streaming handlers when unset.
+// or the default immediate commit used by streaming handlers when unset.
 func StreamingBootstrapKeepAliveDelayOrDefault(cfg *config.SDKConfig) time.Duration {
 	delay := StreamingBootstrapKeepAliveDelay(cfg)
 	if delay <= 0 {
