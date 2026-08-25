@@ -15,7 +15,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-const codexWebsocketDefaultSafeRequestBytes = 24 * 1024
+const codexWebsocketDefaultSafeRequestBytes = 4 * 1024 * 1024
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
 //
@@ -34,11 +34,9 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	}
 }
 
-// CodexAutoExecutor routes Codex requests to the websocket transport only when:
-//  1. The downstream transport is websocket, and
-//  2. The selected auth enables websockets.
-//
-// For non-websocket downstream requests, it always uses the legacy HTTP implementation.
+// CodexAutoExecutor routes Codex stream requests to the websocket transport
+// whenever the selected auth enables websockets. Plain HTTP/SSE callers reuse
+// upstream websocket slots too, then keep the downstream response as SSE.
 type CodexAutoExecutor struct {
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
@@ -121,10 +119,10 @@ func codexWebsocketStreamEnabled(cfg *config.Config, ctx context.Context, auth *
 	if isCodexOpenAIImageRequest(opts) {
 		return false
 	}
-	// Large JSON messages are rejected by the upstream websocket endpoint with
-	// close code 1009. Plain HTTP/SSE callers can use the equivalent HTTP
-	// transport, while downstream websocket sessions keep their protocol and
-	// incremental-context guarantees.
+	// Very large JSON messages may be rejected by the upstream websocket endpoint
+	// with close code 1009. Keep a high default cap so long cached Codex prompts
+	// still take the fast websocket path, while preserving an operator override
+	// for environments that observe upstream message-too-big responses.
 	if !cliproxyexecutor.DownstreamWebsocket(ctx) && !cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 		requestBytes := len(req.Payload)
 		if len(opts.OriginalRequest) > requestBytes {
