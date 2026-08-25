@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -766,6 +767,11 @@ func TestCodexAutoExecutorExecuteUsesWebsocketForEnabledAccounts(t *testing.T) {
 }
 
 func TestCodexAutoExecutorExecuteFallsBackAfterWebsocketMessageTooBig(t *testing.T) {
+	codexWebsocketMessageTooBigAdaptiveLimits = sync.Map{}
+	t.Cleanup(func() {
+		codexWebsocketMessageTooBigAdaptiveLimits = sync.Map{}
+	})
+
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var wsRequests atomic.Int32
 	var httpRequests atomic.Int32
@@ -809,7 +815,7 @@ func TestCodexAutoExecutorExecuteFallsBackAfterWebsocketMessageTooBig(t *testing
 		},
 		Metadata: map[string]any{"websockets": true},
 	}
-	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"` + strings.Repeat("x", codexWebsocketDefaultSafeRequestBytes+1024) + `"}]}`)
+	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"` + strings.Repeat("x", codexWebsocketMessageTooBigAdaptiveFloor+1024) + `"}]}`)
 	resp, errExecute := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
 		Payload: payload,
@@ -825,6 +831,20 @@ func TestCodexAutoExecutorExecuteFallsBackAfterWebsocketMessageTooBig(t *testing
 	}
 	if got := gjson.GetBytes(resp.Payload, "id").String(); got != "resp-http" {
 		t.Fatalf("response id = %q, want resp-http; payload=%s", got, resp.Payload)
+	}
+
+	_, errExecute = exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+	if errExecute != nil {
+		t.Fatalf("second Execute() error = %v", errExecute)
+	}
+	if got := wsRequests.Load(); got != 1 {
+		t.Fatalf("websocket requests after adaptive fallback = %d, want 1", got)
+	}
+	if got := httpRequests.Load(); got != 2 {
+		t.Fatalf("HTTP fallback requests after adaptive fallback = %d, want 2", got)
 	}
 }
 

@@ -48,6 +48,29 @@ type usageExecutor interface {
 	Identifier() string
 }
 
+type usageExecutorTypeOverrideKey struct{}
+
+func WithUsageExecutorType(ctx context.Context, executorType string) context.Context {
+	executorType = strings.TrimSpace(executorType)
+	if executorType == "" {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, usageExecutorTypeOverrideKey{}, executorType)
+}
+
+func UsageExecutorTypeFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if value, ok := ctx.Value(usageExecutorTypeOverrideKey{}).(string); ok {
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
 func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model string, auth *cliproxyauth.Auth) *UsageReporter {
 	provider := ""
 	if executor != nil {
@@ -55,6 +78,9 @@ func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model
 	}
 	reporter := NewUsageReporter(ctx, provider, model, auth)
 	reporter.executorType = ExecutorTypeName(executor)
+	if override := UsageExecutorTypeFromContext(ctx); override != "" {
+		reporter.executorType = override
+	}
 	return reporter
 }
 

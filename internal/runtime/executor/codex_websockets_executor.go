@@ -69,10 +69,14 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
+	if codexPlainHTTPWebsocketFallbackAllowed(ctx, opts) && codexWebsocketAdaptiveMessageTooBigSkip(auth, req, opts) {
+		return e.httpExec.Execute(codexWebsocketFallbackContext(ctx), auth, req, opts)
+	}
 	if codexWebsocketStreamEnabled(e.codexConfig(), ctx, auth, req, opts) {
 		resp, errExecute := e.wsExec.Execute(ctx, auth, req, opts)
 		if errExecute != nil && codexPlainHTTPWebsocketFallbackAllowed(ctx, opts) && isCodexWebsocketHTTPFallbackError(errExecute) {
-			return e.httpExec.Execute(ctx, auth, req, opts)
+			codexRecordWebsocketMessageTooBig(auth, req, opts)
+			return e.httpExec.Execute(codexWebsocketFallbackContext(ctx), auth, req, opts)
 		}
 		return resp, errExecute
 	}
@@ -86,11 +90,15 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
+	if codexPlainHTTPWebsocketFallbackAllowed(ctx, opts) && codexWebsocketAdaptiveMessageTooBigSkip(auth, req, opts) {
+		return e.httpExec.ExecuteStream(codexWebsocketFallbackContext(ctx), auth, req, opts)
+	}
 	if codexWebsocketStreamEnabled(e.codexConfig(), ctx, auth, req, opts) {
 		result, errStream := e.wsExec.ExecuteStream(ctx, auth, req, opts)
 		if errStream != nil {
 			if codexPlainHTTPWebsocketFallbackAllowed(ctx, opts) && isCodexWebsocketHTTPFallbackError(errStream) {
-				return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+				codexRecordWebsocketMessageTooBig(auth, req, opts)
+				return e.httpExec.ExecuteStream(codexWebsocketFallbackContext(ctx), auth, req, opts)
 			}
 			return result, errStream
 		}
@@ -133,10 +141,7 @@ func codexWebsocketStreamEnabled(cfg *config.Config, ctx context.Context, auth *
 	// websocket-safe-request-bytes to a positive value for an environment-specific
 	// precheck.
 	if !cliproxyexecutor.DownstreamWebsocket(ctx) && !cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
-		requestBytes := len(req.Payload)
-		if len(opts.OriginalRequest) > requestBytes {
-			requestBytes = len(opts.OriginalRequest)
-		}
+		requestBytes := codexRequestApproxBytes(req, opts)
 		if limit := codexWebsocketSafeRequestBytes(cfg); limit > 0 && requestBytes > limit {
 			return false
 		}
@@ -177,7 +182,8 @@ func (e *CodexAutoExecutor) maybeFallbackPlainHTTPWebsocketBootstrap(ctx context
 		if chunk.Err != nil {
 			codexDiscardStreamChunks(result.Chunks)
 			if isCodexWebsocketHTTPFallbackError(chunk.Err) {
-				return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+				codexRecordWebsocketMessageTooBig(auth, req, opts)
+				return e.httpExec.ExecuteStream(codexWebsocketFallbackContext(ctx), auth, req, opts)
 			}
 			return codexStreamErrorResult(result.Headers, chunk.Err), nil
 		}

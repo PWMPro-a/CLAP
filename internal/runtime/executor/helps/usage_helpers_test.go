@@ -591,6 +591,19 @@ func TestNewExecutorUsageReporterIncludesExecutorType(t *testing.T) {
 	}
 }
 
+func TestNewExecutorUsageReporterHonorsExecutorTypeOverride(t *testing.T) {
+	ctx := WithUsageExecutorType(context.Background(), "CodexWebsocketFallbackExecutor")
+	reporter := NewExecutorUsageReporter(ctx, &TestUsageExecutor{}, "gpt-5.4", nil)
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.Provider != "test-provider" {
+		t.Fatalf("provider = %q, want %q", record.Provider, "test-provider")
+	}
+	if record.ExecutorType != "CodexWebsocketFallbackExecutor" {
+		t.Fatalf("executor type = %q, want CodexWebsocketFallbackExecutor", record.ExecutorType)
+	}
+}
+
 func TestUsageReporterBuildRecordIncludesReasoningEffort(t *testing.T) {
 	ctx := usage.WithReasoningEffort(context.Background(), "medium")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
