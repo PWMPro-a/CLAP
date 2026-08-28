@@ -567,8 +567,9 @@ func (a *Auth) observeUpstreamRateLimitSuccess(now time.Time) {
 }
 
 // clearTransientRateLimitRecovery releases the generic request-error freeze
-// after the credential lifecycle has successfully refreshed both the token and
-// quota. The upstream rate-limit guard deliberately survives the refresh: the
+// after the credential lifecycle has successfully refreshed quota or verified
+// the existing access token. The upstream rate-limit guard deliberately
+// survives the lifecycle: the
 // quota endpoint can succeed while chat requests are still inside Retry-After,
 // and clearing that guard creates a refresh/select/429 loop. Keeping the
 // account-wide deadline lets one request probe the account after the cooldown
