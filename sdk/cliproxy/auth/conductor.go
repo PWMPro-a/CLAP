@@ -30,17 +30,18 @@ type ProviderExecutor interface {
 	HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
 }
 
-// QuotaRefresher is implemented by provider executors that can verify quota
-// after a credential token rotation. It is called only by background lifecycle
-// workers and never from request execution.
+// QuotaRefresher is implemented by provider executors that can fetch a fresh
+// usage/quota snapshot with the credential currently attached to the auth. It
+// is called only by background lifecycle workers and never from request
+// execution. For a transient 429 recovery this is the existing Access Token,
+// after the upstream cooldown has elapsed.
 type QuotaRefresher interface {
 	RefreshQuota(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error)
 }
 
-// UsageProber verifies that the access token currently attached to an auth can
-// still reach the provider usage endpoint. Runtime 429 recovery calls this
-// after quota refresh; implementations should use the existing access token
-// and avoid rotating credentials again.
+// UsageProber verifies that the usage snapshot was obtained with the access
+// token currently attached to an auth. Runtime 429 recovery calls this after
+// QuotaRefresher; implementations must not rotate credentials again.
 type UsageProber interface {
 	ProbeUsage(ctx context.Context, auth *Auth, evidence CodexQuotaSnapshot) error
 }
