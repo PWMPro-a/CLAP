@@ -350,7 +350,8 @@ func TestRateLimitRecoveryClassificationExcludesQuotaAndWebsocketLimits(t *testi
 		{name: "weekly quota", code: "rate_limit", message: "weekly quota reached", httpStatus: http.StatusTooManyRequests, want: false},
 		{name: "quota json", code: "rate_limit", message: `{"error":"quota"}`, httpStatus: http.StatusTooManyRequests, want: false},
 		{name: "websocket", code: "retry_after", message: "websocket_connection_limit_reached", httpStatus: http.StatusTooManyRequests, want: false},
-		{name: "generic 429", message: "too many requests", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "model capacity", code: "model_capacity", message: "selected model is at capacity", httpStatus: http.StatusTooManyRequests, want: false},
+		{name: "generic 429", message: "too many requests", httpStatus: http.StatusTooManyRequests, want: true},
 		{name: "marker without 429", code: "retry_after", message: "Rate limit exceeded", httpStatus: http.StatusBadRequest, want: false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {

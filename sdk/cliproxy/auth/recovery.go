@@ -701,7 +701,10 @@ func shouldQueueRateLimitRecovery(auth *Auth, result Result) bool {
 		strings.Contains(raw, `"error":"quota"`) ||
 		strings.Contains(raw, `"error": "quota"`) ||
 		strings.Contains(raw, "websocket_connection_limit_reached") ||
-		strings.Contains(raw, "too many websocket") {
+		strings.Contains(raw, "too many websocket") ||
+		strings.Contains(raw, "model_capacity") ||
+		strings.Contains(raw, "model at capacity") ||
+		strings.Contains(raw, "selected model is at capacity") {
 		return false
 	}
 	for _, marker := range []string{
@@ -716,7 +719,11 @@ func shouldQueueRateLimitRecovery(auth *Auth, result Result) bool {
 			return true
 		}
 	}
-	return false
+	// Codex may return a bare 429 (empty body or a provider-specific error
+	// string). Once quota and WebSocket-limit signals have been excluded above,
+	// treat every remaining 429 as a transient account throttle and schedule the
+	// same post-cooldown existing-token usage probe.
+	return true
 }
 
 // isRateLimitRecovery identifies the lifecycle started by a transient 429.
