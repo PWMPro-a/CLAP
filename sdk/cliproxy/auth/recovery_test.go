@@ -136,18 +136,35 @@ func TestRateLimitProbeFailureDoesNotDisableCredential(t *testing.T) {
 		generation:        "probe-generation",
 		rateLimitRecovery: true,
 	})
-	if result.stale || result.retry <= 0 {
-		t.Fatalf("probe failure result = %+v, want retry", result)
+	if result.stale || result.retry != authRecoveryInitialBackoff {
+		t.Fatalf("probe failure result = %+v, want initial retry %s", result, authRecoveryInitialBackoff)
 	}
 	updated, _ := manager.GetByID(auth.ID)
 	if updated.Disabled || updated.Status == StatusDisabled {
 		t.Fatalf("probe failure disabled credential: %+v", updated)
+	}
+	if got := AuthRecoveryAttempts(updated); got != 1 {
+		t.Fatalf("recovery attempts = %d, want 1", got)
 	}
 	if got := executor.refreshCalls.Load(); got != 0 {
 		t.Fatalf("refresh calls = %d, want 0 for a 429 recovery", got)
 	}
 	if got := executor.probeCalls.Load(); got != 0 {
 		t.Fatalf("probe calls = %d, want 0 after quota failure", got)
+	}
+
+	result = manager.runLifecycleRecovery(context.Background(), authRecoveryRequest{
+		authID:            auth.ID,
+		kind:              authLifecycleRecovery,
+		generation:        "probe-generation",
+		rateLimitRecovery: true,
+	})
+	if result.stale || result.retry != 2*authRecoveryInitialBackoff {
+		t.Fatalf("second probe failure result = %+v, want exponential retry %s", result, 2*authRecoveryInitialBackoff)
+	}
+	updated, _ = manager.GetByID(auth.ID)
+	if got := AuthRecoveryAttempts(updated); got != 2 {
+		t.Fatalf("recovery attempts = %d, want 2", got)
 	}
 }
 
