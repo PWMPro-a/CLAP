@@ -32,6 +32,14 @@ type RoundRobinSelector struct {
 	maxKeys int
 }
 
+// ConcurrencyBalancedSelector selects the credential with the fewest in-flight
+// requests and uses round-robin ordering to break ties.
+type ConcurrencyBalancedSelector struct {
+	mu      sync.Mutex
+	cursors map[string]int
+	maxKeys int
+}
+
 // WeightedRoundRobinSelector provides smooth weighted round-robin selection.
 type WeightedRoundRobinSelector struct {
 	mu      sync.Mutex
@@ -403,6 +411,52 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
 		s.cursors = make(map[string]int)
 	}
+}
+
+// Pick selects the least-concurrent available auth for the provider.
+func (s *ConcurrencyBalancedSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, opts, available)
+	available = expiryPriorityAuths(available, now)
+	key := provider + ":" + canonicalModelKey(model)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cursors == nil {
+		s.cursors = make(map[string]int)
+	}
+	limit := s.maxKeys
+	if limit <= 0 {
+		limit = 4096
+	}
+	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
+		s.cursors = make(map[string]int)
+	}
+
+	start := normalizeCursor(s.cursors[key], len(available))
+	pickedIndex := -1
+	pickedConcurrency := 0
+	for offset := 0; offset < len(available); offset++ {
+		index := (start + offset) % len(available)
+		candidate := available[index]
+		if candidate == nil {
+			continue
+		}
+		concurrency := candidate.RuntimeLimitSnapshot(now).CurrentConcurrency
+		if pickedIndex < 0 || concurrency < pickedConcurrency {
+			pickedIndex = index
+			pickedConcurrency = concurrency
+		}
+	}
+	if pickedIndex < 0 {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+	s.cursors[key] = pickedIndex + 1
+	return available[pickedIndex], nil
 }
 
 func positiveWeightAuths(auths []*Auth) []*Auth {

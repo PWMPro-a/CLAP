@@ -93,6 +93,46 @@ func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	}
 }
 
+func TestConcurrencyBalancedSelectorPick_PrefersLeastInFlight(t *testing.T) {
+	authA := &Auth{ID: "auth-a", Provider: "gemini", Status: StatusActive}
+	authB := &Auth{ID: "auth-b", Provider: "gemini", Status: StatusActive}
+	authC := &Auth{ID: "auth-c", Provider: "gemini", Status: StatusActive}
+	releaseA1, ok, reason, _ := authA.acquireRuntimeSlot(time.Now())
+	if !ok {
+		t.Fatalf("acquire auth-a first slot: %s", reason)
+	}
+	defer releaseA1()
+	releaseA2, ok, reason, _ := authA.acquireRuntimeSlot(time.Now())
+	if !ok {
+		t.Fatalf("acquire auth-a second slot: %s", reason)
+	}
+	defer releaseA2()
+	releaseB, ok, reason, _ := authB.acquireRuntimeSlot(time.Now())
+	if !ok {
+		t.Fatalf("acquire auth-b slot: %s", reason)
+	}
+	defer releaseB()
+	releaseC, ok, reason, _ := authC.acquireRuntimeSlot(time.Now())
+	if !ok {
+		t.Fatalf("acquire auth-c slot: %s", reason)
+	}
+	defer releaseC()
+
+	selector := &ConcurrencyBalancedSelector{}
+	auths := []*Auth{authA, authB, authC}
+	first, err := selector.Pick(context.Background(), "gemini", "model-a", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("first pick: %v", err)
+	}
+	second, err := selector.Pick(context.Background(), "gemini", "model-a", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("second pick: %v", err)
+	}
+	if first.ID != "auth-b" || second.ID != "auth-c" {
+		t.Fatalf("balanced picks = %q, %q; want auth-b, auth-c", first.ID, second.ID)
+	}
+}
+
 func TestWeightedRoundRobinSelectorPick_DistributesAndSkipsNonPositiveWeights(t *testing.T) {
 	t.Parallel()
 

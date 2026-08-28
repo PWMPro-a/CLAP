@@ -48,7 +48,7 @@ type routingRuntimeState struct {
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
-		strategy:           "round-robin",
+		strategy:           "concurrency-balanced",
 		sessionAffinityTTL: time.Hour,
 	}
 	if cfg == nil {
@@ -56,6 +56,10 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	}
 
 	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
+	case "", "concurrency-balanced", "concurrencybalanced", "least-concurrent", "least-connections":
+		state.strategy = "concurrency-balanced"
+	case "round-robin", "roundrobin", "rr":
+		state.strategy = "round-robin"
 	case "weighted-round-robin", "weightedroundrobin", "wrr":
 		state.strategy = "weighted-round-robin"
 	case "fill-first", "fillfirst", "ff":
@@ -89,6 +93,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	var selector coreauth.Selector
 	switch state.strategy {
+	case "concurrency-balanced":
+		selector = &coreauth.ConcurrencyBalancedSelector{}
 	case "weighted-round-robin":
 		selector = &coreauth.WeightedRoundRobinSelector{}
 	case "fill-first":

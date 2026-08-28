@@ -22,6 +22,18 @@ func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 	}
 }
 
+func TestConcurrencyBalancedRoutingSelectorIsDefault(t *testing.T) {
+	for _, cfg := range []*internalconfig.Config{nil, {}} {
+		state := normalizedRoutingRuntimeState(cfg)
+		if state.strategy != "concurrency-balanced" {
+			t.Fatalf("strategy = %q, want concurrency-balanced", state.strategy)
+		}
+		if _, ok := newRoutingSelector(state).(*coreauth.ConcurrencyBalancedSelector); !ok {
+			t.Fatalf("selector type = %T, want *auth.ConcurrencyBalancedSelector", newRoutingSelector(state))
+		}
+	}
+}
+
 func TestPrefixHeatHotReloadPreservesSessionAffinitySelector(t *testing.T) {
 	shadow := true
 	initialCfg := &internalconfig.Config{Codex: internalconfig.CodexConfig{CacheAffinity: internalconfig.CodexCacheAffinityConfig{

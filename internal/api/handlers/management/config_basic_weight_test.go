@@ -19,6 +19,15 @@ func TestNormalizeRoutingStrategyWeightedRoundRobin(t *testing.T) {
 	}
 }
 
+func TestNormalizeRoutingStrategyConcurrencyBalanced(t *testing.T) {
+	for _, input := range []string{"", "concurrency-balanced", "concurrencybalanced", "least-concurrent", "least-connections"} {
+		got, ok := normalizeRoutingStrategy(input)
+		if !ok || got != "concurrency-balanced" {
+			t.Fatalf("normalizeRoutingStrategy(%q) = %q, %v; want concurrency-balanced, true", input, got, ok)
+		}
+	}
+}
+
 func TestRoutingHighCacheModeRoundTrip(t *testing.T) {
 	h := &Handler{cfg: &config.Config{Routing: config.RoutingConfig{HighCacheMode: true}}}
 	rec := httptest.NewRecorder()

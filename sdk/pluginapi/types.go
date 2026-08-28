@@ -454,6 +454,8 @@ type FrontendAuthResponse struct {
 }
 
 const (
+	// SchedulerBuiltinConcurrencyBalanced delegates to the built-in least-in-flight scheduler.
+	SchedulerBuiltinConcurrencyBalanced = "concurrency-balanced"
 	// SchedulerBuiltinRoundRobin delegates auth selection to the built-in round-robin scheduler.
 	SchedulerBuiltinRoundRobin = "round-robin"
 	// SchedulerBuiltinFillFirst delegates auth selection to the built-in fill-first scheduler.

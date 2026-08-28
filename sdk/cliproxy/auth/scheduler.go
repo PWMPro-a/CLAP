@@ -16,11 +16,12 @@ import (
 type schedulerStrategy int
 
 const (
-	schedulerStrategyCurrent            schedulerStrategy = -1
-	schedulerStrategyCustom             schedulerStrategy = 0
-	schedulerStrategyRoundRobin         schedulerStrategy = 1
-	schedulerStrategyFillFirst          schedulerStrategy = 2
-	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+	schedulerStrategyCurrent             schedulerStrategy = -1
+	schedulerStrategyCustom              schedulerStrategy = 0
+	schedulerStrategyRoundRobin          schedulerStrategy = 1
+	schedulerStrategyFillFirst           schedulerStrategy = 2
+	schedulerStrategyWeightedRoundRobin  schedulerStrategy = 3
+	schedulerStrategyConcurrencyBalanced schedulerStrategy = 4
 
 	maxAccountGroupReadyViewCacheEntries = 64
 	maxAccountGroupMixedStateEntries     = 256
@@ -195,6 +196,8 @@ func newAuthScheduler(selector Selector) *authScheduler {
 // selectorStrategy maps a selector implementation to the scheduler semantics it should emulate.
 func selectorStrategy(selector Selector) schedulerStrategy {
 	switch selector.(type) {
+	case *ConcurrencyBalancedSelector:
+		return schedulerStrategyConcurrencyBalanced
 	case *FillFirstSelector:
 		return schedulerStrategyFillFirst
 	case *WeightedRoundRobinSelector:
@@ -559,12 +562,51 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if picked != nil && picked.meta != nil {
 				return picked.auth, picked.meta.providerKey, nil
 			}
+		case schedulerStrategyConcurrencyBalanced:
+			picked, nextCursor := pickLeastConcurrentScheduled(
+				expiringEntries,
+				s.mixedExpiryCursors[cursorKey],
+				predicate,
+				now,
+			)
+			if picked != nil && picked.meta != nil {
+				s.mixedExpiryCursors[cursorKey] = nextCursor
+				return picked.auth, picked.meta.providerKey, nil
+			}
 		default:
 			start := s.mixedExpiryCursors[cursorKey] % len(expiringEntries)
 			picked := expiringEntries[start]
 			s.mixedExpiryCursors[cursorKey] = start + 1
 			return picked.auth, picked.meta.providerKey, nil
 		}
+	}
+
+	if strategy == schedulerStrategyConcurrencyBalanced {
+		entries := make([]*scheduledAuth, 0)
+		for _, shard := range candidateShards {
+			if shard == nil {
+				continue
+			}
+			bucket := shard.readyByPriority[bestPriority]
+			if bucket != nil {
+				entries = append(entries, bucket.view(false, groups).flat...)
+			}
+		}
+		sort.Slice(entries, func(left, right int) bool {
+			if entries[left] == nil || entries[left].auth == nil {
+				return false
+			}
+			if entries[right] == nil || entries[right].auth == nil {
+				return true
+			}
+			return entries[left].auth.ID < entries[right].auth.ID
+		})
+		picked, nextCursor := pickLeastConcurrentScheduled(entries, s.mixedCursors[cursorKey], predicate, now)
+		if picked != nil && picked.meta != nil {
+			s.mixedCursors[cursorKey] = nextCursor
+			return picked.auth, picked.meta.providerKey, nil
+		}
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
 
 	if strategy == schedulerStrategyFillFirst {
@@ -1191,6 +1233,8 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		picked = view.pickFirst(predicate)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
+	case schedulerStrategyConcurrencyBalanced:
+		picked = view.pickLeastConcurrent(predicate, time.Now())
 	default:
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -1479,6 +1523,42 @@ func (v *readyView) pickWeighted(predicate func(*scheduledAuth) bool) *scheduled
 	return pickSmoothWeightedScheduled(v.flat, v.weightedState.current, predicate)
 }
 
+func (v *readyView) pickLeastConcurrent(predicate func(*scheduledAuth) bool, now time.Time) *scheduledAuth {
+	if v == nil || len(v.flat) == 0 {
+		return nil
+	}
+	picked, nextCursor := pickLeastConcurrentScheduled(v.flat, v.cursor, predicate, now)
+	if picked != nil {
+		v.cursor = nextCursor
+	}
+	return picked
+}
+
+func pickLeastConcurrentScheduled(entries []*scheduledAuth, cursor int, predicate func(*scheduledAuth) bool, now time.Time) (*scheduledAuth, int) {
+	if len(entries) == 0 {
+		return nil, cursor
+	}
+	start := normalizeCursor(cursor, len(entries))
+	pickedIndex := -1
+	pickedConcurrency := 0
+	for offset := 0; offset < len(entries); offset++ {
+		index := (start + offset) % len(entries)
+		entry := entries[index]
+		if entry == nil || entry.auth == nil || (predicate != nil && !predicate(entry)) {
+			continue
+		}
+		concurrency := entry.auth.RuntimeLimitSnapshot(now).CurrentConcurrency
+		if pickedIndex < 0 || concurrency < pickedConcurrency {
+			pickedIndex = index
+			pickedConcurrency = concurrency
+		}
+	}
+	if pickedIndex < 0 {
+		return nil, cursor
+	}
+	return entries[pickedIndex], pickedIndex + 1
+}
+
 func (v *readyView) pickExpiring(predicate func(*scheduledAuth) bool, strategy schedulerStrategy, now time.Time) *scheduledAuth {
 	if v == nil || len(v.expiryFlat) == 0 {
 		return nil
@@ -1521,6 +1601,11 @@ func (v *readyView) pickExpiring(predicate func(*scheduledAuth) bool, strategy s
 	case schedulerStrategyWeightedRoundRobin:
 		v.expiryWeightedState.prepare(scheduledWeightVectorMatching(v.expiryFlat, isExpiring))
 		return pickSmoothWeightedScheduled(v.expiryFlat, v.expiryWeightedState.current, isExpiring)
+	case schedulerStrategyConcurrencyBalanced:
+		view := readyView{flat: v.expiryFlat, cursor: v.expiryCursor}
+		picked := view.pickLeastConcurrent(isExpiring, now)
+		v.expiryCursor = view.cursor
+		return picked
 	default:
 		start := v.expiryCursor % len(v.expiryFlat)
 		for offset := 0; offset < len(v.expiryFlat); offset++ {

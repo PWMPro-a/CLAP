@@ -176,6 +176,25 @@ func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_ConcurrencyBalancedPrefersLeastInFlight(t *testing.T) {
+	authA := &Auth{ID: "auth-a", Provider: "gemini", Status: StatusActive}
+	authB := &Auth{ID: "auth-b", Provider: "gemini", Status: StatusActive}
+	release, ok, reason, _ := authA.acquireRuntimeSlot(time.Now())
+	if !ok {
+		t.Fatalf("acquire auth-a slot: %s", reason)
+	}
+	defer release()
+
+	scheduler := newSchedulerForTest(&ConcurrencyBalancedSelector{}, authA, authB)
+	picked, err := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle: %v", err)
+	}
+	if picked == nil || picked.ID != "auth-b" {
+		t.Fatalf("picked = %#v, want auth-b", picked)
+	}
+}
+
 func TestSchedulerPick_WeightedRoundRobin(t *testing.T) {
 	t.Parallel()
 
@@ -1599,6 +1618,13 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	manager.SetSelector(&FillFirstSelector{})
 	if manager.scheduler.strategy != schedulerStrategyFillFirst {
 		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
+	}
+}
+
+func TestManager_InitializesConcurrencyBalancedScheduler(t *testing.T) {
+	manager := NewManager(nil, &ConcurrencyBalancedSelector{}, nil)
+	if manager.scheduler == nil || manager.scheduler.strategy != schedulerStrategyConcurrencyBalanced {
+		t.Fatalf("scheduler strategy = %v, want concurrency-balanced", manager.scheduler.strategy)
 	}
 }
 

@@ -103,7 +103,7 @@ func schedulerCandidateExists(candidates []pluginapi.SchedulerAuthCandidate, aut
 
 func validSchedulerBuiltin(delegate string) bool {
 	switch delegate {
-	case pluginapi.SchedulerBuiltinRoundRobin, pluginapi.SchedulerBuiltinFillFirst:
+	case pluginapi.SchedulerBuiltinConcurrencyBalanced, pluginapi.SchedulerBuiltinRoundRobin, pluginapi.SchedulerBuiltinFillFirst:
 		return true
 	default:
 		return false

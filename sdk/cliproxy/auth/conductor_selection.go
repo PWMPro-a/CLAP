@@ -60,7 +60,7 @@ func (m *Manager) PluginScheduler() PluginScheduler {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector:
+	case *ConcurrencyBalancedSelector, *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector:
 		return true
 	default:
 		return false
@@ -714,6 +714,8 @@ func pickSchedulerAuthByID(candidates []*Auth, authID string) *Auth {
 
 func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 	switch strings.TrimSpace(delegate) {
+	case pluginapi.SchedulerBuiltinConcurrencyBalanced:
+		return schedulerStrategyConcurrencyBalanced, true
 	case pluginapi.SchedulerBuiltinRoundRobin:
 		return schedulerStrategyRoundRobin, true
 	case pluginapi.SchedulerBuiltinFillFirst:
