@@ -2,13 +2,42 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+type recoveryStateHook struct {
+	NoopHook
+	mu     sync.Mutex
+	states []RecoveryState
+}
+
+func (h *recoveryStateHook) OnAuthUpdated(_ context.Context, auth *Auth) {
+	if auth == nil {
+		return
+	}
+	state := AuthRecoveryState(auth)
+	if state == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.states) == 0 || h.states[len(h.states)-1] != state {
+		h.states = append(h.states, state)
+	}
+}
+
+func (h *recoveryStateHook) snapshot() []RecoveryState {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]RecoveryState(nil), h.states...)
+}
 
 type recoveryTestExecutor struct {
 	refreshStarted chan struct{}
@@ -17,7 +46,9 @@ type recoveryTestExecutor struct {
 	quotaErr       error
 	refreshCalls   atomic.Int32
 	quotaCalls     atomic.Int32
+	probeCalls     atomic.Int32
 	quotaToken     atomic.Value
+	probeToken     atomic.Value
 }
 
 func (e *recoveryTestExecutor) Identifier() string { return "codex" }
@@ -65,7 +96,18 @@ func (e *recoveryTestExecutor) RefreshQuota(_ context.Context, auth *Auth) (Code
 		e.quotaToken.Store(auth.Metadata["access_token"])
 	}
 	now := time.Now().UTC()
-	return CodexQuotaSnapshot{UsedRatio: 0.25, SampledAt: now, ExpiresAt: now.Add(time.Minute)}, nil
+	return CodexQuotaSnapshot{UsedRatio: 0.25, SampledAt: now, ExpiresAt: now.Add(time.Minute), AccessTokenSHA256: AccessTokenSHA256(auth)}, nil
+}
+
+func (e *recoveryTestExecutor) ProbeUsage(_ context.Context, auth *Auth, evidence CodexQuotaSnapshot) error {
+	e.probeCalls.Add(1)
+	if auth != nil && auth.Metadata != nil {
+		e.probeToken.Store(auth.Metadata["access_token"])
+	}
+	if auth == nil || evidence.AccessTokenSHA256 != AccessTokenSHA256(auth) {
+		return errors.New("probe evidence mismatch")
+	}
+	return nil
 }
 
 func TestRateLimitProbeFailureDoesNotDisableCredential(t *testing.T) {
@@ -103,6 +145,9 @@ func TestRateLimitProbeFailureDoesNotDisableCredential(t *testing.T) {
 	}
 	if got := executor.refreshCalls.Load(); got != 1 {
 		t.Fatalf("refresh calls = %d, want 1", got)
+	}
+	if got := executor.probeCalls.Load(); got != 0 {
+		t.Fatalf("probe calls = %d, want 0 after quota failure", got)
 	}
 }
 
@@ -165,7 +210,8 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 	executor := &recoveryTestExecutor{
 		refreshStarted: make(chan struct{}, 1),
 	}
-	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	hook := &recoveryStateHook{}
+	manager := NewManager(nil, &RoundRobinSelector{}, hook)
 	manager.RegisterExecutor(executor)
 	auth := &Auth{
 		ID:              "codex-recovery",
@@ -236,6 +282,27 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 	}
 	if got, _ := executor.quotaToken.Load().(string); got != "new-access-token" {
 		t.Fatalf("quota token = %q, want refreshed access token", got)
+	}
+	if got := executor.probeCalls.Load(); got != 1 {
+		t.Fatalf("probe calls = %d, want 1", got)
+	}
+	if got, _ := executor.probeToken.Load().(string); got != "new-access-token" {
+		t.Fatalf("probe token = %q, want current access token", got)
+	}
+	wantStates := []RecoveryState{
+		RecoveryStateRefreshingToken,
+		RecoveryStateRefreshingQuota,
+		RecoveryStateProbingUsage,
+		RecoveryStateReady,
+	}
+	gotStates := hook.snapshot()
+	if len(gotStates) != len(wantStates) {
+		t.Fatalf("recovery states = %v, want %v", gotStates, wantStates)
+	}
+	for i := range wantStates {
+		if gotStates[i] != wantStates[i] {
+			t.Fatalf("recovery states = %v, want %v", gotStates, wantStates)
+		}
 	}
 	restored, _ := manager.GetByID(auth.ID)
 	if len(restored.ModelStates) != 0 || restored.LastError != nil || restored.Quota.Exceeded {
@@ -362,6 +429,9 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 	}
 	if got := executor.quotaCalls.Load(); got != 1 {
 		t.Fatalf("canonical quota calls = %d, want 1", got)
+	}
+	if got := executor.probeCalls.Load(); got != 1 {
+		t.Fatalf("canonical probe calls = %d, want 1", got)
 	}
 }
 

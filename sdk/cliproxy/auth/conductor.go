@@ -37,6 +37,14 @@ type QuotaRefresher interface {
 	RefreshQuota(ctx context.Context, auth *Auth) (CodexQuotaSnapshot, error)
 }
 
+// UsageProber verifies that the access token currently attached to an auth can
+// still reach the provider usage endpoint. Runtime 429 recovery calls this
+// after quota refresh; implementations should use the existing access token
+// and avoid rotating credentials again.
+type UsageProber interface {
+	ProbeUsage(ctx context.Context, auth *Auth, evidence CodexQuotaSnapshot) error
+}
+
 // RequestAuthPreparer lets an executor update missing auth metadata immediately
 // before a request. Manager serializes and persists returned updates.
 type RequestAuthPreparer interface {

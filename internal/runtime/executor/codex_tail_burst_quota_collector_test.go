@@ -55,6 +55,25 @@ func TestParseCodexTailBurstQuotaSnapshotRejectsMissingUsage(t *testing.T) {
 	}
 }
 
+func TestCodexProbeUsageReusesQuotaEvidenceForCurrentAccessToken(t *testing.T) {
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "current-access-token"}}
+	now := time.Now()
+	evidence := cliproxyauth.CodexQuotaSnapshot{
+		SampledAt:         now,
+		ExpiresAt:         now.Add(time.Minute),
+		AccessTokenSHA256: cliproxyauth.AccessTokenSHA256(auth),
+	}
+	executor := NewCodexExecutor(&config.Config{})
+	if err := executor.ProbeUsage(t.Context(), auth, evidence); err != nil {
+		t.Fatalf("ProbeUsage: %v", err)
+	}
+
+	auth.Metadata["access_token"] = "different-access-token"
+	if err := executor.ProbeUsage(t.Context(), auth, evidence); err == nil {
+		t.Fatal("ProbeUsage accepted evidence from a different access token")
+	}
+}
+
 func TestResolveCodexTailBurstQuotaCollectorSettings(t *testing.T) {
 	disabled, enabled := resolveCodexTailBurstQuotaCollectorSettings(&config.Config{})
 	if enabled {

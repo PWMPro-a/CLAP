@@ -202,7 +202,7 @@ func lifecycleRecoveryRequest(auth *Auth, now time.Time) (authRecoveryRequest, b
 		}
 		return authRecoveryRequest{authID: auth.ID, kind: authLifecycleInitialization, generation: AuthInitializationGeneration(auth), due: due}, AuthInitializationGeneration(auth) != ""
 	}
-	if state := AuthRecoveryState(auth); state == RecoveryStateRefreshingToken || state == RecoveryStateRefreshingQuota || state == RecoveryStateFailed {
+	if state := AuthRecoveryState(auth); state == RecoveryStateRefreshingToken || state == RecoveryStateRefreshingQuota || state == RecoveryStateProbingUsage || state == RecoveryStateFailed {
 		generation := AuthRecoveryGeneration(auth)
 		rateLimitRecovery := isRateLimitRecovery(auth)
 		due := initializationMetadataTime(auth.Metadata, MetadataRecoveryNextRetryAt)
@@ -231,6 +231,7 @@ func (m *Manager) runLifecycleRecovery(parent context.Context, request authRecov
 	defer cancel()
 
 	var refreshed *Auth
+	var quotaSnapshot CodexQuotaSnapshot
 	var err error
 	if _, err = m.transitionLifecycle(request, true); err == nil {
 		refreshed, err = m.forceRefreshLifecycleToken(ctx, request)
@@ -239,7 +240,12 @@ func (m *Manager) runLifecycleRecovery(parent context.Context, request authRecov
 		_, err = m.transitionLifecycle(request, false)
 	}
 	if err == nil {
-		err = m.refreshLifecycleQuota(ctx, request, refreshed)
+		quotaSnapshot, err = m.refreshLifecycleQuota(ctx, request, refreshed)
+	}
+	if err == nil && request.rateLimitRecovery {
+		if err = m.transitionLifecycleUsageProbe(request); err == nil {
+			err = m.probeLifecycleUsage(ctx, request, refreshed, quotaSnapshot)
+		}
 	}
 	if err == nil {
 		err = m.completeLifecycle(request)
@@ -379,27 +385,82 @@ func (m *Manager) forceRefreshLifecycleToken(ctx context.Context, request authRe
 	return snapshot.Clone(), nil
 }
 
-func (m *Manager) refreshLifecycleQuota(ctx context.Context, request authRecoveryRequest, auth *Auth) error {
+func (m *Manager) refreshLifecycleQuota(ctx context.Context, request authRecoveryRequest, auth *Auth) (CodexQuotaSnapshot, error) {
 	if auth == nil {
-		return fmt.Errorf("refreshed auth is unavailable")
+		return CodexQuotaSnapshot{}, fmt.Errorf("refreshed auth is unavailable")
 	}
 	m.mu.RLock()
 	exec := m.executors[executorKeyFromAuth(auth)]
 	m.mu.RUnlock()
 	refresher, ok := exec.(QuotaRefresher)
 	if !ok || refresher == nil {
-		return fmt.Errorf("provider quota refresher is unavailable")
+		return CodexQuotaSnapshot{}, fmt.Errorf("provider quota refresher is unavailable")
 	}
 	snapshot, err := refresher.RefreshQuota(ctx, auth.Clone())
 	if err != nil {
-		return err
+		return CodexQuotaSnapshot{}, err
 	}
 	if _, accepted, errUpdate := m.UpdateCodexQuotaSnapshot(request.authID, "*", snapshot); errUpdate != nil {
-		return errUpdate
+		return CodexQuotaSnapshot{}, errUpdate
 	} else if !accepted {
 		log.Debugf("auth lifecycle quota snapshot for %s was older than the active sample", request.authID)
 	}
+	return snapshot, nil
+}
+
+func (m *Manager) transitionLifecycleUsageProbe(request authRecoveryRequest) error {
+	now := time.Now().UTC()
+	m.mu.Lock()
+	auth := m.auths[request.authID]
+	if !lifecycleGenerationMatches(auth, request) {
+		m.mu.Unlock()
+		return errStaleAuthLifecycle
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[MetadataRecoveryState] = string(RecoveryStateProbingUsage)
+	auth.Metadata[MetadataRecoveryUpdatedAt] = now.Format(time.RFC3339Nano)
+	auth.Status = StatusProbingUsage
+	auth.StatusMessage = "probing usage"
+	auth.Unavailable = true
+	auth.NextRetryAfter = time.Time{}
+	auth.UpdatedAt = now
+	stored := auth.Clone()
+	snapshot := stored.Clone()
+	m.auths[auth.ID] = stored
+	m.mu.Unlock()
+	m.publishLifecycleUpdate(snapshot)
 	return nil
+}
+
+func (m *Manager) probeLifecycleUsage(ctx context.Context, request authRecoveryRequest, auth *Auth, evidence CodexQuotaSnapshot) error {
+	if auth == nil {
+		return fmt.Errorf("refreshed auth is unavailable")
+	}
+	m.mu.RLock()
+	current := m.auths[request.authID]
+	var exec ProviderExecutor
+	if current != nil {
+		exec = m.executors[executorKeyFromAuth(current)]
+	}
+	if !lifecycleGenerationMatches(current, request) {
+		m.mu.RUnlock()
+		return errStaleAuthLifecycle
+	}
+	probeAuth := current.Clone()
+	m.mu.RUnlock()
+	if probeAuth == nil {
+		probeAuth = auth.Clone()
+	}
+	prober, ok := exec.(UsageProber)
+	if !ok || prober == nil {
+		return fmt.Errorf("provider usage prober is unavailable")
+	}
+	if strings.TrimSpace(authAccessToken(probeAuth)) == "" {
+		return fmt.Errorf("access token is unavailable for usage probe")
+	}
+	return prober.ProbeUsage(ctx, probeAuth, evidence)
 }
 
 func (m *Manager) completeLifecycle(request authRecoveryRequest) error {
@@ -439,6 +500,9 @@ func (m *Manager) completeLifecycle(request authRecoveryRequest) error {
 		auth.Metadata[MetadataRecoveryQuotaAt] = now.Format(time.RFC3339Nano)
 		delete(auth.Metadata, MetadataRecoveryError)
 		delete(auth.Metadata, MetadataRecoveryNextRetryAt)
+		if request.rateLimitRecovery {
+			auth.Metadata[MetadataRecoveryUsageAt] = now.Format(time.RFC3339Nano)
+		}
 	}
 	if request.kind == authLifecycleRecovery {
 		for candidateID, candidate := range m.auths {
@@ -640,7 +704,7 @@ func shouldQueueRateLimitRecovery(auth *Auth, result Result) bool {
 
 // isRateLimitRecovery identifies the lifecycle started by a transient 429.
 // The reason is persisted with the auth so a process restart can retain the
-// probe-only behavior instead of falling back to a refresh-token rotation.
+// cooldown-aware token, quota, and usage verification sequence.
 func isRateLimitRecovery(auth *Auth) bool {
 	if auth == nil || auth.Metadata == nil {
 		return false

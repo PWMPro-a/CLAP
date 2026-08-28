@@ -290,7 +290,13 @@ func fetchCodexTailBurstQuotaSnapshot(
 	if auth == nil {
 		return cliproxyauth.CodexQuotaSnapshot{}, fmt.Errorf("missing auth")
 	}
-	apiKey, _ := codexCreds(auth)
+	// OAuth lifecycle probes must use the access token that is currently stored
+	// on the auth. Fall back to the configured API key only for non-OAuth Codex
+	// credentials that do not carry an access token.
+	apiKey := codexAccessToken(auth)
+	if apiKey == "" {
+		apiKey, _ = codexCreds(auth)
+	}
 	client := helps.NewUtlsHTTPClient(ctx, cfg, auth, 0)
 	authorization, _, err := helps.PrepareCodexAuthorization(ctx, auth, client, apiKey)
 	if err != nil {
@@ -327,6 +333,7 @@ func fetchCodexTailBurstQuotaSnapshot(
 	if !ok {
 		return cliproxyauth.CodexQuotaSnapshot{}, fmt.Errorf("usage response has no usable quota windows")
 	}
+	snapshot.AccessTokenSHA256 = cliproxyauth.AccessTokenSHA256(auth)
 	return snapshot, nil
 }
 
@@ -337,6 +344,39 @@ func (e *CodexExecutor) RefreshQuota(ctx context.Context, auth *cliproxyauth.Aut
 		return cliproxyauth.CodexQuotaSnapshot{}, fmt.Errorf("codex executor is nil")
 	}
 	return fetchCodexTailBurstQuotaSnapshot(ctx, e.cfg, auth, defaultCodexQuotaCollectorSnapshotTTL)
+}
+
+// ProbeUsage validates that the successful quota request was made with the
+// access token currently attached to auth. The quota response is reused as
+// evidence so runtime 429 recovery does not issue a duplicate usage request.
+func (e *CodexExecutor) ProbeUsage(_ context.Context, auth *cliproxyauth.Auth, evidence cliproxyauth.CodexQuotaSnapshot) error {
+	if e == nil {
+		return fmt.Errorf("codex executor is nil")
+	}
+	if strings.TrimSpace(codexAccessToken(auth)) == "" {
+		return fmt.Errorf("access token is unavailable")
+	}
+	fingerprint := cliproxyauth.AccessTokenSHA256(auth)
+	if fingerprint == "" || evidence.AccessTokenSHA256 != fingerprint {
+		return fmt.Errorf("quota evidence does not match the current access token")
+	}
+	if evidence.SampledAt.IsZero() || evidence.ExpiresAt.IsZero() || !evidence.ExpiresAt.After(time.Now()) {
+		return fmt.Errorf("quota evidence is stale")
+	}
+	return nil
+}
+
+func codexAccessToken(auth *cliproxyauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if token, ok := auth.Metadata["access_token"].(string); ok {
+		return strings.TrimSpace(token)
+	}
+	if token, ok := auth.Metadata["accessToken"].(string); ok {
+		return strings.TrimSpace(token)
+	}
+	return ""
 }
 
 func parseCodexTailBurstQuotaSnapshot(body []byte, sampledAt time.Time, ttl time.Duration) (cliproxyauth.CodexQuotaSnapshot, bool) {

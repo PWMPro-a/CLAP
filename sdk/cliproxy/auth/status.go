@@ -30,6 +30,9 @@ const (
 	// StatusRecoveringQuota indicates token rotation completed and the runtime
 	// recovery is verifying the credential against the quota endpoint.
 	StatusRecoveringQuota Status = "recovering_quota"
+	// StatusProbingUsage indicates runtime recovery is validating the current
+	// access token against the provider usage endpoint.
+	StatusProbingUsage Status = "probing_usage"
 	// StatusRecoveryFailed indicates a runtime recovery attempt failed and is
 	// waiting for a background retry.
 	StatusRecoveryFailed Status = "recovery_failed"

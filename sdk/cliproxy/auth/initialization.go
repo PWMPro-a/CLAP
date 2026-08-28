@@ -23,6 +23,7 @@ type RecoveryState string
 const (
 	RecoveryStateRefreshingToken RecoveryState = "recovering_token"
 	RecoveryStateRefreshingQuota RecoveryState = "recovering_quota"
+	RecoveryStateProbingUsage    RecoveryState = "probing_usage"
 	RecoveryStateReady           RecoveryState = "ready"
 	RecoveryStateFailed          RecoveryState = "recovery_failed"
 )
@@ -37,6 +38,7 @@ const (
 	MetadataRecoveryNextRetryAt = "recovery_next_retry_at"
 	MetadataRecoveryReadyAt     = "recovery_ready_at"
 	MetadataRecoveryQuotaAt     = "recovery_quota_refreshed_at"
+	MetadataRecoveryUsageAt     = "recovery_usage_probed_at"
 )
 
 const (
@@ -132,6 +134,8 @@ func AuthRecoveryState(auth *Auth) RecoveryState {
 		return RecoveryStateRefreshingToken
 	case RecoveryStateRefreshingQuota:
 		return RecoveryStateRefreshingQuota
+	case RecoveryStateProbingUsage:
+		return RecoveryStateProbingUsage
 	case RecoveryStateReady:
 		return RecoveryStateReady
 	case RecoveryStateFailed:
@@ -161,11 +165,11 @@ func IsAuthRecoveryBlocking(auth *Auth) bool {
 		return false
 	}
 	switch auth.Status {
-	case StatusRecoveringToken, StatusRecoveringQuota, StatusRecoveryFailed:
+	case StatusRecoveringToken, StatusRecoveringQuota, StatusProbingUsage, StatusRecoveryFailed:
 		return true
 	}
 	switch AuthRecoveryState(auth) {
-	case RecoveryStateRefreshingToken, RecoveryStateRefreshingQuota, RecoveryStateFailed:
+	case RecoveryStateRefreshingToken, RecoveryStateRefreshingQuota, RecoveryStateProbingUsage, RecoveryStateFailed:
 		return true
 	default:
 		return false
@@ -221,6 +225,9 @@ func applyRecoveryStateFromMetadata(auth *Auth) {
 	case RecoveryStateRefreshingQuota:
 		auth.Status = StatusRecoveringQuota
 		auth.StatusMessage = "recovering quota"
+	case RecoveryStateProbingUsage:
+		auth.Status = StatusProbingUsage
+		auth.StatusMessage = "probing usage"
 	case RecoveryStateFailed:
 		auth.Status = StatusRecoveryFailed
 		if detail := initializationMetadataString(auth.Metadata, MetadataRecoveryError); detail != "" {

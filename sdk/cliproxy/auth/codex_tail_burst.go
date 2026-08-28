@@ -34,6 +34,9 @@ type CodexQuotaSnapshot struct {
 	ExpiresAt      time.Time `json:"expires_at"`
 	ResetAt        time.Time `json:"reset_at,omitempty"`
 	Generation     uint64    `json:"generation"`
+	// AccessTokenSHA256 binds lifecycle probe evidence to the access token that
+	// made the usage request without retaining or exposing the token itself.
+	AccessTokenSHA256 string `json:"-"`
 }
 
 // CodexQuotaSnapshotUpdate is one collector-produced usage snapshot. Batching
