@@ -37,6 +37,11 @@ type authRecoveryRequest struct {
 	kind       authLifecycleKind
 	generation string
 	due        time.Time
+	// rateLimitRecovery marks lifecycle recovery triggered by a transient 429.
+	// The worker waits for the upstream cooldown before running the normal
+	// refresh-token and quota verification sequence. Terminal refresh errors
+	// in this path stay retryable so a 429 never directly disables a credential.
+	rateLimitRecovery bool
 }
 
 type authRecoveryResult struct {
@@ -198,11 +203,24 @@ func lifecycleRecoveryRequest(auth *Auth, now time.Time) (authRecoveryRequest, b
 		return authRecoveryRequest{authID: auth.ID, kind: authLifecycleInitialization, generation: AuthInitializationGeneration(auth), due: due}, AuthInitializationGeneration(auth) != ""
 	}
 	if state := AuthRecoveryState(auth); state == RecoveryStateRefreshingToken || state == RecoveryStateRefreshingQuota || state == RecoveryStateFailed {
+		generation := AuthRecoveryGeneration(auth)
+		rateLimitRecovery := isRateLimitRecovery(auth)
 		due := initializationMetadataTime(auth.Metadata, MetadataRecoveryNextRetryAt)
-		if due.IsZero() || state != RecoveryStateFailed {
+		if rateLimitRecovery {
+			// Runtime cooldown is kept in memory (and in the cooldown store),
+			// while the lifecycle state is persisted with the auth. Use the
+			// later of the two deadlines so a restart cannot probe inside the
+			// provider's Retry-After window.
+			if runtimeDue := auth.RuntimeLimitSnapshot(now).RateLimitedUntil; runtimeDue.After(due) {
+				due = runtimeDue
+			}
+			if due.IsZero() || (state != RecoveryStateFailed && !due.After(now)) {
+				due = now
+			}
+		} else if due.IsZero() || state != RecoveryStateFailed {
 			due = now
 		}
-		return authRecoveryRequest{authID: auth.ID, kind: authLifecycleRecovery, generation: AuthRecoveryGeneration(auth), due: due}, AuthRecoveryGeneration(auth) != ""
+		return authRecoveryRequest{authID: auth.ID, kind: authLifecycleRecovery, generation: generation, due: due, rateLimitRecovery: rateLimitRecovery}, generation != ""
 	}
 	return authRecoveryRequest{}, false
 }
@@ -212,11 +230,11 @@ func (m *Manager) runLifecycleRecovery(parent context.Context, request authRecov
 	ctx, cancel := context.WithTimeout(parent, authRecoveryAttemptTimeout)
 	defer cancel()
 
-	if _, err := m.transitionLifecycle(request, true); err != nil {
-		result.stale = errors.Is(err, errStaleAuthLifecycle)
-		return result
+	var refreshed *Auth
+	var err error
+	if _, err = m.transitionLifecycle(request, true); err == nil {
+		refreshed, err = m.forceRefreshLifecycleToken(ctx, request)
 	}
-	refreshed, err := m.forceRefreshLifecycleToken(ctx, request)
 	if err == nil {
 		_, err = m.transitionLifecycle(request, false)
 	}
@@ -477,7 +495,15 @@ func (m *Manager) failLifecycle(request authRecoveryRequest, lifecycleErr error)
 	if request.kind == authLifecycleInitialization {
 		attempts = AuthInitializationAttempts(auth)
 	}
-	terminal := isTerminalCredentialFailure(lifecycleErr)
+	// A quota probe belongs to a transient 429 recovery. Even if the probe
+	// surfaces a terminal-looking refresh/token error from an upstream helper,
+	// keep the credential in retrying state; only an explicit credential
+	// lifecycle (initialization or unauthorized recovery) may disable it.
+	// A rate-limit recovery is temporary. Even if the post-cooldown refresh
+	// surfaces a terminal-looking token error, keep this recovery retryable so
+	// the original 429 does not directly disable the credential. Explicit
+	// initialization and other credential lifecycles retain terminal handling.
+	terminal := !request.rateLimitRecovery && isTerminalCredentialFailure(lifecycleErr)
 	retry := authRecoveryBackoff(attempts)
 	nextRetry := now.Add(retry)
 	message := strings.TrimSpace(lifecycleErr.Error())
@@ -610,6 +636,17 @@ func shouldQueueRateLimitRecovery(auth *Auth, result Result) bool {
 		}
 	}
 	return false
+}
+
+// isRateLimitRecovery identifies the lifecycle started by a transient 429.
+// The reason is persisted with the auth so a process restart can retain the
+// probe-only behavior instead of falling back to a refresh-token rotation.
+func isRateLimitRecovery(auth *Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	reason, _ := auth.Metadata[MetadataRecoveryReason].(string)
+	return strings.EqualFold(strings.TrimSpace(reason), "rate_limit_exceeded")
 }
 
 func markRateLimitRecoveryQueuedLocked(auth *Auth, now time.Time) string {

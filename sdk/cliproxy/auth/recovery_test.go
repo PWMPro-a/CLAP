@@ -14,6 +14,7 @@ type recoveryTestExecutor struct {
 	refreshStarted chan struct{}
 	refreshRelease chan struct{}
 	refreshErr     error
+	quotaErr       error
 	refreshCalls   atomic.Int32
 	quotaCalls     atomic.Int32
 	quotaToken     atomic.Value
@@ -57,11 +58,52 @@ func (e *recoveryTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, 
 
 func (e *recoveryTestExecutor) RefreshQuota(_ context.Context, auth *Auth) (CodexQuotaSnapshot, error) {
 	e.quotaCalls.Add(1)
+	if e.quotaErr != nil {
+		return CodexQuotaSnapshot{}, e.quotaErr
+	}
 	if auth != nil && auth.Metadata != nil {
 		e.quotaToken.Store(auth.Metadata["access_token"])
 	}
 	now := time.Now().UTC()
 	return CodexQuotaSnapshot{UsedRatio: 0.25, SampledAt: now, ExpiresAt: now.Add(time.Minute)}, nil
+}
+
+func TestRateLimitProbeFailureDoesNotDisableCredential(t *testing.T) {
+	executor := &recoveryTestExecutor{quotaErr: terminalCredentialTestError{}}
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &Auth{
+		ID:       "probe-failure",
+		Provider: "codex",
+		Status:   StatusRecoveringToken,
+		Metadata: map[string]any{
+			"type":                     "codex",
+			"access_token":             "existing-access-token",
+			"refresh_token":            "refresh-token",
+			MetadataRecoveryState:      string(RecoveryStateRefreshingToken),
+			MetadataRecoveryGeneration: "probe-generation",
+			MetadataRecoveryReason:     "rate_limit_exceeded",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	result := manager.runLifecycleRecovery(context.Background(), authRecoveryRequest{
+		authID:            auth.ID,
+		kind:              authLifecycleRecovery,
+		generation:        "probe-generation",
+		rateLimitRecovery: true,
+	})
+	if result.stale || result.retry <= 0 {
+		t.Fatalf("probe failure result = %+v, want retry", result)
+	}
+	updated, _ := manager.GetByID(auth.ID)
+	if updated.Disabled || updated.Status == StatusDisabled {
+		t.Fatalf("probe failure disabled credential: %+v", updated)
+	}
+	if got := executor.refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
+	}
 }
 
 func (e *recoveryTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -122,7 +164,6 @@ func TestLifecycleTerminalRefreshFailureDisablesCredentialWithoutRetry(t *testin
 func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 	executor := &recoveryTestExecutor{
 		refreshStarted: make(chan struct{}, 1),
-		refreshRelease: make(chan struct{}),
 	}
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(executor)
@@ -157,10 +198,12 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 		},
 	})
 
+	// Runtime 429 recovery must remain in cooldown and must not rotate the
+	// refresh token while the upstream Retry-After window is active.
 	select {
 	case <-executor.refreshStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("recovery token refresh did not start")
+		t.Fatal("429 recovery unexpectedly started a token refresh")
+	case <-time.After(250 * time.Millisecond):
 	}
 	blocked, ok := manager.GetByID(auth.ID)
 	if !ok || blocked.Status != StatusRecoveringToken || !blocked.Unavailable || !IsAuthRecoveryBlocking(blocked) {
@@ -170,18 +213,29 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 		t.Fatal("recovering auth remained schedulable")
 	}
 
-	close(executor.refreshRelease)
+	// Run the due probe directly in the test; the production recovery loop
+	// dispatches the same request once the cooldown deadline is reached.
+	blocked, _ = manager.GetByID(auth.ID)
+	result := manager.runLifecycleRecovery(context.Background(), authRecoveryRequest{
+		authID:            auth.ID,
+		kind:              authLifecycleRecovery,
+		generation:        AuthRecoveryGeneration(blocked),
+		rateLimitRecovery: true,
+	})
+	if result.stale || result.retry != 0 {
+		t.Fatalf("probe result = %+v", result)
+	}
 	eventuallyAuth(t, manager, auth.ID, func(current *Auth) bool {
 		return current.Status == StatusActive && !current.Unavailable && AuthRecoveryState(current) == RecoveryStateReady
 	})
 	if got := executor.refreshCalls.Load(); got != 1 {
-		t.Fatalf("refresh calls = %d, want 1", got)
+		t.Fatalf("refresh calls = %d, want 1 after cooldown", got)
 	}
 	if got := executor.quotaCalls.Load(); got != 1 {
 		t.Fatalf("quota calls = %d, want 1", got)
 	}
 	if got, _ := executor.quotaToken.Load().(string); got != "new-access-token" {
-		t.Fatalf("quota token = %q, want refreshed token", got)
+		t.Fatalf("quota token = %q, want refreshed access token", got)
 	}
 	restored, _ := manager.GetByID(auth.ID)
 	if len(restored.ModelStates) != 0 || restored.LastError != nil || restored.Quota.Exceeded {
@@ -279,6 +333,19 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 		Error:  &Error{Code: "rate_limit_exceeded", Message: "Rate limit exceeded", HTTPStatus: http.StatusTooManyRequests},
 	})
 
+	// Run the due probe directly in the test; the production loop waits for
+	// the account-wide cooldown before dispatching it.
+	live, _ := manager.GetByID("canonical-a")
+	result := manager.runLifecycleRecovery(context.Background(), authRecoveryRequest{
+		authID:            "canonical-a",
+		kind:              authLifecycleRecovery,
+		generation:        AuthRecoveryGeneration(live),
+		rateLimitRecovery: true,
+	})
+	if result.stale || result.retry != 0 {
+		t.Fatalf("canonical probe result = %+v", result)
+	}
+
 	for _, id := range []string{"canonical-a", "canonical-b"} {
 		eventuallyAuth(t, manager, id, func(current *Auth) bool {
 			token, _ := current.Metadata["access_token"].(string)
@@ -291,7 +358,10 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 		}
 	}
 	if got := executor.refreshCalls.Load(); got != 1 {
-		t.Fatalf("canonical refresh calls = %d, want 1", got)
+		t.Fatalf("canonical refresh calls = %d, want 1 after cooldown", got)
+	}
+	if got := executor.quotaCalls.Load(); got != 1 {
+		t.Fatalf("canonical quota calls = %d, want 1", got)
 	}
 }
 
