@@ -143,8 +143,8 @@ func TestRateLimitProbeFailureDoesNotDisableCredential(t *testing.T) {
 	if updated.Disabled || updated.Status == StatusDisabled {
 		t.Fatalf("probe failure disabled credential: %+v", updated)
 	}
-	if got := executor.refreshCalls.Load(); got != 1 {
-		t.Fatalf("refresh calls = %d, want 1", got)
+	if got := executor.refreshCalls.Load(); got != 0 {
+		t.Fatalf("refresh calls = %d, want 0 for a 429 recovery", got)
 	}
 	if got := executor.probeCalls.Load(); got != 0 {
 		t.Fatalf("probe calls = %d, want 0 after quota failure", got)
@@ -252,7 +252,7 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 	case <-time.After(250 * time.Millisecond):
 	}
 	blocked, ok := manager.GetByID(auth.ID)
-	if !ok || blocked.Status != StatusRecoveringToken || !blocked.Unavailable || !IsAuthRecoveryBlocking(blocked) {
+	if !ok || blocked.Status != StatusProbingUsage || !blocked.Unavailable || !IsAuthRecoveryBlocking(blocked) {
 		t.Fatalf("blocked auth = %+v", blocked)
 	}
 	if _, err := manager.pickNextIndexed(context.Background(), "codex", []string{"codex"}, "gpt-5.3-codex", cliproxyexecutor.Options{}, nil); err == nil {
@@ -274,27 +274,22 @@ func TestManagerRateLimitExceededQueuesRecoveryAndRestoresAuth(t *testing.T) {
 	eventuallyAuth(t, manager, auth.ID, func(current *Auth) bool {
 		return current.Status == StatusActive && !current.Unavailable && AuthRecoveryState(current) == RecoveryStateReady
 	})
-	if got := executor.refreshCalls.Load(); got != 1 {
-		t.Fatalf("refresh calls = %d, want 1 after cooldown", got)
+	if got := executor.refreshCalls.Load(); got != 0 {
+		t.Fatalf("refresh calls = %d, want 0 after cooldown", got)
 	}
 	if got := executor.quotaCalls.Load(); got != 1 {
 		t.Fatalf("quota calls = %d, want 1", got)
 	}
-	if got, _ := executor.quotaToken.Load().(string); got != "new-access-token" {
-		t.Fatalf("quota token = %q, want refreshed access token", got)
+	if got, _ := executor.quotaToken.Load().(string); got != "old-access-token" {
+		t.Fatalf("quota token = %q, want existing access token", got)
 	}
 	if got := executor.probeCalls.Load(); got != 1 {
 		t.Fatalf("probe calls = %d, want 1", got)
 	}
-	if got, _ := executor.probeToken.Load().(string); got != "new-access-token" {
-		t.Fatalf("probe token = %q, want current access token", got)
+	if got, _ := executor.probeToken.Load().(string); got != "old-access-token" {
+		t.Fatalf("probe token = %q, want existing access token", got)
 	}
-	wantStates := []RecoveryState{
-		RecoveryStateRefreshingToken,
-		RecoveryStateRefreshingQuota,
-		RecoveryStateProbingUsage,
-		RecoveryStateReady,
-	}
+	wantStates := []RecoveryState{RecoveryStateProbingUsage, RecoveryStateReady}
 	gotStates := hook.snapshot()
 	if len(gotStates) != len(wantStates) {
 		t.Fatalf("recovery states = %v, want %v", gotStates, wantStates)
@@ -366,7 +361,7 @@ func TestRateLimitRecoveryClassificationExcludesQuotaAndWebsocketLimits(t *testi
 	}
 }
 
-func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
+func TestRateLimitRecoveryProbesCanonicalCredentialOnce(t *testing.T) {
 	executor := &recoveryTestExecutor{}
 	manager := NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
@@ -416,7 +411,7 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 	for _, id := range []string{"canonical-a", "canonical-b"} {
 		eventuallyAuth(t, manager, id, func(current *Auth) bool {
 			token, _ := current.Metadata["access_token"].(string)
-			return current.Status == StatusActive && !current.Unavailable && token == "new-access-token"
+			return current.Status == StatusActive && !current.Unavailable && token == "shared-old-access"
 		})
 		restored, _ := manager.GetByID(id)
 		now := time.Now()
@@ -424,11 +419,11 @@ func TestRateLimitRecoveryRefreshesCanonicalCredentialOnce(t *testing.T) {
 			t.Fatalf("canonical peer %s did not retain Retry-After: blocked=%t reason=%v retryAt=%v", id, blocked, reason, retryAt)
 		}
 	}
-	if got := executor.refreshCalls.Load(); got != 1 {
-		t.Fatalf("canonical refresh calls = %d, want 1 after cooldown", got)
+	if got := executor.refreshCalls.Load(); got != 0 {
+		t.Fatalf("canonical refresh calls = %d, want 0 after cooldown", got)
 	}
 	if got := executor.quotaCalls.Load(); got != 1 {
-		t.Fatalf("canonical quota calls = %d, want 1", got)
+		t.Fatalf("canonical quota calls = %d, want 1 usage probe", got)
 	}
 	if got := executor.probeCalls.Load(); got != 1 {
 		t.Fatalf("canonical probe calls = %d, want 1", got)
